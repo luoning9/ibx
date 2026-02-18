@@ -27,3 +27,49 @@ graph LR
     B --> C[IB Gateway / Docker]
     C --> D[IBKR Server]
     D --> E((Global Markets))
+```
+
+## ✅ 网关健康检查
+
+启动网关后，可用以下命令快速验证网关是否正常：
+
+```bash
+make check
+```
+
+该检查会执行两步：
+
+- TCP 连通性检查（默认端口 `4002,4001`）
+- IB API 最小握手检查（默认端口 `4002`）
+
+也可以直接运行脚本并自定义参数：
+
+```bash
+python3 scripts/check_ib_gateway.py --host 127.0.0.1 --ports 4002,4001 --api-port 4002
+```
+
+如果只想看端口是否打开（跳过 API 握手）：
+
+```bash
+python3 scripts/check_ib_gateway.py --skip-api
+```
+
+## 📊 查看当前资产组合
+
+在网关正常可用后，执行：
+
+```bash
+make portfolio
+```
+
+或直接运行：
+
+```bash
+python3 scripts/list_portfolio.py --host 127.0.0.1 --port 4002 --client-id 99
+```
+
+常用参数：
+
+- `--json`：以 JSON 输出，便于接入自动化流程
+- `--account <账户号>`：只查看指定账户持仓
+- `--port 4001`：查看实盘账户（`TRADING_MODE=live`）
