@@ -12,9 +12,12 @@ services:
     environment:
       - TWS_USERID=${IB_ACCOUNT}
       - TWS_PASSWORD=${IB_PASSWORD}
-      - TRADING_MODE=${TRADING_MODE:-paper} # 默认为模拟盘
+      - TWS_USERID_PAPER=${IB_ACCOUNT_PAPER:-}
+      - TWS_PASSWORD_PAPER=${IB_PASSWORD_PAPER:-}
+      - TRADING_MODE=${TRADING_MODE:-paper} # 支持 paper/live/both
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-123456}
       - TWS_ACCEPT_EULA=yes
+      - TWOFA_DEVICE=IB Key
       - TWS_SETTINGS_PATH=/home/ibgateway/conf
       - TWS_ACCEPT_INCOMING=accept
       - TRUSTED_IPS=${TRUSTED_IPS:-127.0.0.1}
