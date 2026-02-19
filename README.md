@@ -54,6 +54,38 @@ python3 scripts/check_ib_gateway.py --host 127.0.0.1 --ports 4002,4001 --api-por
 python3 scripts/check_ib_gateway.py --skip-api
 ```
 
+## 🔧 SSH Tunnel 常见问题（本机连 NAS 上的 IB Gateway）
+
+当 NAS 本机检查正常，但本机通过 SSH 隧道访问失败时，可能看到这种现象：
+
+- `tcp:4002` 显示 `PASS`
+- `api:4002` 显示 `Connection reset by peer`
+- SSH `-v` 日志出现 `open failed: administratively prohibited`
+
+这通常不是 IB Gateway 本身故障，而是 **NAS 的 SSH 服务端策略禁止端口转发（direct-tcpip）**。
+
+建议排查与修复：
+
+1. 本机前台启动隧道并看调试日志：
+```bash
+ssh -v -N -L 127.0.0.1:4002:127.0.0.1:4002 <user>@<nas_ip>
+```
+2. 若出现 `administratively prohibited`，在 NAS 检查 SSH 配置：
+```bash
+sudo grep -nE 'AllowTcpForwarding|PermitOpen|Match|ForceCommand' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* 2>/dev/null
+```
+3. 确保配置允许转发（全局或对应 `Match User` 内）：
+```conf
+AllowTcpForwarding yes
+PermitOpen any
+```
+4. 重启 NAS 的 SSH 服务后重试隧道。
+
+隧道建立成功后（日志应包含 `Local forwarding listening on 127.0.0.1 port 4002`），本机连接参数使用：
+
+- `IB_HOST=127.0.0.1`
+- `IB_PORT=4002`
+
 ## 📊 查看当前资产组合
 
 在网关正常可用后，执行：
