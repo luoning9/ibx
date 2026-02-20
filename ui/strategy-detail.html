@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="zh-CN" data-bs-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IBX Console - 策略详情</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+      crossorigin="anonymous"
+    />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <nav class="navbar navbar-expand-lg border-bottom sticky-top navbar-dark bg-dark">
+      <div class="container">
+        <a class="navbar-brand fw-semibold" href="./index.html">IBX Console</a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#topNav" aria-controls="topNav" aria-expanded="false" aria-label="Toggle navigation">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="topNav">
+          <ul class="navbar-nav ms-auto mb-2 mb-lg-0">
+            <li class="nav-item"><a class="nav-link" href="./strategies.html">策略列表</a></li>
+            <li class="nav-item"><a class="nav-link" href="./events.html">运行事件</a></li>
+            <li class="nav-item"><a class="nav-link" href="./verification.html">交易日志</a></li>
+          </ul>
+        </div>
+      </div>
+    </nav>
+
+    <main class="container py-4">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <div>
+          <h1 class="h4 mb-1" id="detailStrategyTitle">策略详情：S1</h1>
+          <p class="text-muted mb-0" id="detailStrategyDescription">若 SLV 相对激活后最高价回撤达到 10%，卖出 100 股，并激活 S2。</p>
+        </div>
+        <a class="btn btn-outline-light btn-sm" href="./strategies.html">返回列表</a>
+      </div>
+
+      <div class="row g-3">
+        <div class="col-12">
+          <section class="card shadow-sm bg-body-tertiary border-secondary">
+            <div class="card-body p-0">
+              <div class="table-responsive">
+                <table class="table table-sm table-dark align-middle mb-0">
+                  <thead class="table-secondary">
+                    <tr>
+                      <th style="width: 180px">时间</th>
+                      <th style="width: 140px">事件类型</th>
+                      <th>详情</th>
+                    </tr>
+                  </thead>
+                  <tbody id="eventLogBody">
+                    <tr>
+                      <td>2026-02-19 10:01:22</td>
+                      <td><span class="badge text-bg-info">ACTIVATED</span></td>
+                      <td>由上游策略 S0 激活，写入 <code>anchor_price=101.24</code></td>
+                    </tr>
+                    <tr>
+                      <td>2026-02-19 10:14:05</td>
+                      <td><span class="badge text-bg-warning">TRIGGERED</span></td>
+                      <td>条件命中：<code>drawdown_pct(SLV,HIGHEST)=0.103 &gt;= 0.1</code></td>
+                    </tr>
+                    <tr>
+                      <td>2026-02-19 10:14:05</td>
+                      <td><span class="badge text-bg-secondary">VERIFIED</span></td>
+                      <td>核验通过：<code>trade_id=T-20260219-00029</code>，<code>max_notional_usd</code> / <code>allowed_order_types</code></td>
+                    </tr>
+                    <tr>
+                      <td>2026-02-19 10:14:06</td>
+                      <td><span class="badge text-bg-primary">ORDER_SUBMITTED</span></td>
+                      <td>已发送 IB 订单：<code>trade_id=T-20260219-00029</code>，<code>broker_order_id=2812</code>，SELL 100 MKT</td>
+                    </tr>
+                    <tr>
+                      <td>2026-02-19 10:14:06</td>
+                      <td><span class="badge text-bg-info">CHAIN_NEXT</span></td>
+                      <td>已激活下游策略：<a class="link-light" href="./strategy-detail.html?id=S2">S2</a></td>
+                    </tr>
+                    <tr>
+                      <td>2026-02-19 10:14:07</td>
+                      <td><span class="badge text-bg-success">FILLED</span></td>
+                      <td>成交完成：<code>trade_id=T-20260219-00029</code>，<code>filled_qty=100</code>，<code>avg_price=90.85</code></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="col-12">
+          <section class="card shadow-sm bg-body-tertiary border-secondary h-100">
+            <div class="card-header border-secondary"><strong>基础信息</strong></div>
+            <div class="card-body small">
+              <div class="row g-3">
+                <div class="col-lg-8">
+                  <div class="row g-2">
+                    <div class="col-6"><span class="text-muted">sec_type</span><div id="secTypeValue">STK</div></div>
+                    <div class="col-6"><span class="text-muted">symbol</span><div id="symbolValue">SLV</div></div>
+                    <div class="col-6"><span class="text-muted">currency</span><div id="currencyValue">USD</div></div>
+                    <div class="col-6"><span class="text-muted">upstream_only_activation</span><div id="upstreamOnlyValue">true</div></div>
+                    <div class="col-6"><span class="text-muted">activated_at</span><div id="activatedAtValue">2026-02-19T10:01:22-05:00</div></div>
+                    <div class="col-6"><span class="text-muted">expire_in_seconds</span><div id="expireInSecondsValue">172800</div></div>
+                    <div class="col-6"><span class="text-muted">expire_at</span><div id="expireAtValue">2026-02-21T10:01:22-05:00</div></div>
+                  </div>
+                </div>
+                <div class="col-lg-4">
+                  <div class="p-2 rounded border border-secondary-subtle bg-dark-subtle h-100">
+                    <div class="mb-2">
+                      <div class="text-muted">当前状态</div>
+                      <div id="statusValue">ACTIVE</div>
+                    </div>
+                    <div class="text-muted mb-2">策略操作</div>
+                    <div class="d-flex flex-wrap gap-2">
+                      <button
+                        class="btn btn-outline-danger action-icon-btn"
+                        type="button"
+                        id="cancelStrategyBtn"
+                        title="取消执行"
+                        aria-label="取消执行"
+                      >
+                        <i class="bi bi-x-lg"></i>
+                      </button>
+                      <button
+                        class="btn btn-outline-warning action-icon-btn"
+                        type="button"
+                        id="pauseStrategyBtn"
+                        title="暂停执行"
+                        aria-label="暂停执行"
+                      >
+                        <i class="bi bi-pause-fill"></i>
+                      </button>
+                      <button
+                        class="btn btn-outline-info action-icon-btn"
+                        type="button"
+                        id="resumeStrategyBtn"
+                        title="恢复执行"
+                        aria-label="恢复执行"
+                      >
+                        <i class="bi bi-play-fill"></i>
+                      </button>
+                      <button
+                        class="btn btn-outline-success action-icon-btn"
+                        type="button"
+                        id="activateStrategyBtn"
+                        title="激活策略"
+                        aria-label="激活策略"
+                      >
+                        <i class="bi bi-lightning-charge-fill"></i>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="col-12">
+          <section class="card shadow-sm bg-body-tertiary border-secondary">
+            <div class="card-header border-secondary">
+              <div class="row g-2 align-items-center">
+                <div class="col-4">
+                  <strong>触发条件</strong>
+                </div>
+                <div class="col-4 text-center">
+                  <span class="small text-muted" id="triggerGroupStatusText">条件组状态：已触发</span>
+                </div>
+                <div class="col-4 text-end">
+                  <a class="btn btn-sm btn-outline-light" id="conditionEditButton" href="./strategy-editor-conditions.html">编辑</a>
+                </div>
+              </div>
+            </div>
+            <div class="card-body" id="conditionsConfiguredBody">
+              <div class="d-flex align-items-center gap-2 mb-3">
+                <span class="text-muted small">条件逻辑</span>
+                <span class="badge text-bg-secondary">AND</span>
+              </div>
+
+              <div class="vstack gap-2">
+                <div class="condition-view-card p-3 rounded border">
+                  <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
+                    <div class="small">
+                      <span class="text-muted">规则表达式：</span>
+                      <code>drawdown_pct(SLV, HIGHEST_SINCE_ACTIVATION) &gt;= 0.1</code>
+                    </div>
+                    <span class="condition-state is-true">已满足</span>
+                  </div>
+                  <div class="small">
+                    <span class="text-muted">自然语言：</span>
+                    当 <code>SLV</code> 相对激活后最高价回撤达到 <code>10%</code> 时触发。
+                  </div>
+                  <div class="condition-meta d-flex flex-wrap gap-2 mt-2">
+                    <span class="meta-pill">ID: c1</span>
+                    <span class="meta-pill">单产品</span>
+                    <span class="meta-pill">DRAWDOWN_PCT</span>
+                    <span class="meta-pill">LEVEL</span>
+                    <span class="meta-pill">window: 5m</span>
+                    <span class="meta-pill">price_basis: CLOSE</span>
+                  </div>
+                </div>
+
+                <div class="text-center small text-muted py-1">AND</div>
+
+                <div class="condition-view-card p-3 rounded border">
+                  <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
+                    <div class="small">
+                      <span class="text-muted">规则表达式：</span>
+                      <code>liquidity(SLV) / liquidity(GLD) &gt;= 1.2</code>
+                    </div>
+                    <span class="condition-state is-false">未满足</span>
+                  </div>
+                  <div class="small">
+                    <span class="text-muted">自然语言：</span>
+                    当 <code>SLV</code> 的流动性至少是 <code>GLD</code> 的 <code>1.2</code> 倍时满足该条件。
+                  </div>
+                  <div class="condition-meta d-flex flex-wrap gap-2 mt-2">
+                    <span class="meta-pill">ID: c2</span>
+                    <span class="meta-pill">双产品</span>
+                    <span class="meta-pill">LIQUIDITY_RATIO</span>
+                    <span class="meta-pill">LEVEL</span>
+                    <span class="meta-pill">window: 1m</span>
+                    <span class="meta-pill">price_basis: CLOSE</span>
+                  </div>
+                </div>
+
+                <div class="text-center small text-muted py-1">AND</div>
+
+                <div class="condition-view-card p-3 rounded border">
+                  <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
+                    <div class="small">
+                      <span class="text-muted">规则表达式：</span>
+                      <code>price(SLV) &lt;= 88.5</code>
+                    </div>
+                    <span class="condition-state is-waiting">等待中</span>
+                  </div>
+                  <div class="small">
+                    <span class="text-muted">自然语言：</span>
+                    当 <code>SLV</code> 从上向下跌破 <code>88.5</code> 时触发该条件。
+                  </div>
+                  <div class="condition-meta d-flex flex-wrap gap-2 mt-2">
+                    <span class="meta-pill">ID: c3</span>
+                    <span class="meta-pill">单产品</span>
+                    <span class="meta-pill">PRICE</span>
+                    <span class="meta-pill">CROSS_DOWN</span>
+                    <span class="meta-pill">window: 1m</span>
+                    <span class="meta-pill">price_basis: CLOSE</span>
+                  </div>
+                </div>
+              </div>
+
+              <hr />
+
+              <details class="small">
+                <summary class="text-muted">查看原始条件 JSON</summary>
+                <pre class="mt-2 mb-0"><code>[
+  {
+    "condition_id": "c1",
+    "condition_nl": "当 SLV 相对激活后最高价回撤达到 10% 时触发。",
+    "condition_type": "SINGLE_PRODUCT",
+    "metric": "DRAWDOWN_PCT",
+    "trigger_mode": "LEVEL",
+    "evaluation_window": "5m",
+    "window_price_basis": "CLOSE",
+    "operator": ">=",
+    "value": 0.1,
+    "product": "SLV",
+    "price_reference": "HIGHEST_SINCE_ACTIVATION"
+  },
+  {
+    "condition_id": "c2",
+    "condition_nl": "当 SLV 的流动性至少是 GLD 的 1.2 倍时满足该条件。",
+    "condition_type": "PAIR_PRODUCTS",
+    "metric": "LIQUIDITY_RATIO",
+    "trigger_mode": "LEVEL",
+    "evaluation_window": "1m",
+    "window_price_basis": "CLOSE",
+    "operator": ">=",
+    "value": 1.2,
+    "product_a": "SLV",
+    "product_b": "GLD"
+  },
+  {
+    "condition_id": "c3",
+    "condition_nl": "当 SLV 从上向下跌破 88.5 时触发该条件。",
+    "condition_type": "SINGLE_PRODUCT",
+    "metric": "PRICE",
+    "trigger_mode": "CROSS_DOWN",
+    "evaluation_window": "1m",
+    "window_price_basis": "CLOSE",
+    "operator": "&lt;=",
+    "value": 88.5,
+    "product": "SLV"
+  }
+]</code></pre>
+              </details>
+            </div>
+            <div class="card-body d-none text-center" id="conditionsEmptyBody">
+              <div class="text-muted small">尚未设置触发条件</div>
+            </div>
+          </section>
+        </div>
+
+        <div class="col-12">
+          <section class="card shadow-sm bg-body-tertiary border-secondary h-100">
+            <div class="card-header border-secondary">
+              <div class="row g-2 align-items-center">
+                <div class="col-4">
+                  <strong>后续动作</strong>
+                </div>
+                <div class="col-4 text-center">
+                  <span class="small text-muted" id="followupStatusText">后续动作状态：已执行</span>
+                </div>
+                <div class="col-4 text-end">
+                  <a class="btn btn-sm btn-outline-light" id="followupEditButton" href="./strategy-editor-actions.html">编辑</a>
+                </div>
+              </div>
+            </div>
+            <div class="card-body small" id="followupConfiguredBody">
+              <div class="row g-3">
+                <div class="col-lg-5">
+                  <div class="p-2 rounded border border-secondary-subtle bg-dark-subtle h-100">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                      <div class="text-muted">后续策略</div>
+                      <span class="badge text-bg-success">ACTIVE</span>
+                    </div>
+                    <div class="mb-2">
+                      <div class="text-muted">策略ID</div>
+                      <div><a class="link-light" href="./strategy-detail.html?id=S2">S2</a></div>
+                    </div>
+                    <div class="mb-2">
+                      <div class="text-muted">说明</div>
+                      <div>SLV 回撤达到 20% 时再卖出 100 股。</div>
+                    </div>
+                  </div>
+                </div>
+                <div class="col-lg-7">
+                  <div class="p-2 rounded border border-secondary-subtle bg-dark-subtle h-100">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                      <div class="text-muted">交易指令</div>
+                      <span class="badge text-bg-success">FILLED（已成交）</span>
+                    </div>
+                    <div class="mb-2 fw-semibold">卖出 100 股 SLV（市价单）</div>
+                    <div class="row g-2">
+                      <div class="col-6">
+                        <div class="text-muted">动作类型</div>
+                        <div>股票买卖（STOCK_TRADE）</div>
+                      </div>
+                      <div class="col-6">
+                        <div class="text-muted">方向</div>
+                        <div>卖出（SELL）</div>
+                      </div>
+                      <div class="col-6">
+                        <div class="text-muted">订单类型</div>
+                        <div>市价（MKT）</div>
+                      </div>
+                      <div class="col-6">
+                        <div class="text-muted">TIF</div>
+                        <div>DAY</div>
+                      </div>
+                      <div class="col-6">
+                        <div class="text-muted">隔夜交易</div>
+                        <div>false</div>
+                      </div>
+                      <div class="col-6">
+                        <div class="text-muted">下单数量</div>
+                        <div>100 股</div>
+                      </div>
+                      <div class="col-12">
+                        <div class="text-muted">限价</div>
+                        <div>不适用（仅限价单 LMT 需要）</div>
+                      </div>
+                      <div class="col-12">
+                        <div class="text-muted">到期撤单</div>
+                        <div>false（缺省值）</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="card-body d-none text-center" id="followupEmptyBody">
+              <div class="text-muted small">尚未设置后续动作</div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const strategyId = params.get("id") || "S1";
+      const isDraft = params.get("draft") === "1";
+      const hasConditions = params.get("conditions") === "1";
+      const hasActions = params.get("actions") === "1";
+      const statusParam = (params.get("status") || "").trim().toUpperCase();
+
+      const detailParams = new URLSearchParams(params);
+      detailParams.set("id", strategyId);
+      if (isDraft) {
+        detailParams.set("draft", "1");
+        if (!detailParams.has("conditions")) detailParams.set("conditions", hasConditions ? "1" : "0");
+        if (!detailParams.has("actions")) detailParams.set("actions", hasActions ? "1" : "0");
+      }
+      const sharedQuery = detailParams.toString();
+
+      const title = document.getElementById("detailStrategyTitle");
+      const description = document.getElementById("detailStrategyDescription");
+      title.textContent = `策略详情：${strategyId}`;
+      if (params.get("desc")) {
+        description.textContent = params.get("desc");
+      }
+      if (!isDraft && statusParam) {
+        document.getElementById("statusValue").textContent = statusParam;
+      }
+
+      document.getElementById("conditionEditButton").href = `./strategy-editor-conditions.html?${sharedQuery}`;
+      document.getElementById("followupEditButton").href = `./strategy-editor-actions.html?${sharedQuery}`;
+
+      function applyEditPermissionByStatus() {
+        const editableStatuses = new Set(["PENDING_ACTIVATION", "PAUSED"]);
+        const currentStatus = (document.getElementById("statusValue").textContent || "").trim().toUpperCase();
+        const canEdit = editableStatuses.has(currentStatus);
+        const lockReason = "仅 PENDING_ACTIVATION / PAUSED 可编辑；ACTIVE 请先暂停。";
+        const editLinks = [
+          document.getElementById("conditionEditButton"),
+          document.getElementById("followupEditButton"),
+        ];
+
+        editLinks.forEach((link) => {
+          if (!link) return;
+          if (canEdit) {
+            link.classList.remove("disabled");
+            link.removeAttribute("aria-disabled");
+            link.removeAttribute("tabindex");
+            link.removeAttribute("title");
+            return;
+          }
+          link.classList.add("disabled");
+          link.setAttribute("aria-disabled", "true");
+          link.setAttribute("tabindex", "-1");
+          link.setAttribute("title", lockReason);
+        });
+      }
+
+      if (isDraft) {
+        const secType = params.get("sec_type");
+        const symbol = params.get("symbol");
+        const upstreamOnly = params.get("upstream_only_activation");
+        const expireMode = params.get("expire_mode");
+        const expireInSeconds = params.get("expire_in_seconds");
+        const expireAt = params.get("expire_at");
+
+        document.getElementById("statusValue").textContent = "PENDING_ACTIVATION";
+        if (secType) document.getElementById("secTypeValue").textContent = secType;
+        if (symbol) document.getElementById("symbolValue").textContent = symbol;
+        if (upstreamOnly) document.getElementById("upstreamOnlyValue").textContent = upstreamOnly;
+        document.getElementById("activatedAtValue").textContent = "--";
+
+        if (expireMode === "relative") {
+          document.getElementById("expireInSecondsValue").textContent = expireInSeconds || "172800";
+          document.getElementById("expireAtValue").textContent = "--（激活后计算）";
+        } else {
+          document.getElementById("expireInSecondsValue").textContent = "--";
+          document.getElementById("expireAtValue").textContent = expireAt || "--";
+        }
+
+        document.getElementById("eventLogBody").innerHTML =
+          '<tr><td colspan="3" class="text-center text-muted small py-3">暂无事件</td></tr>';
+
+        const triggerGroupStatusText = document.getElementById("triggerGroupStatusText");
+        const conditionEditButton = document.getElementById("conditionEditButton");
+        const conditionsConfiguredBody = document.getElementById("conditionsConfiguredBody");
+        const conditionsEmptyBody = document.getElementById("conditionsEmptyBody");
+        const followupStatusText = document.getElementById("followupStatusText");
+        const followupEditButton = document.getElementById("followupEditButton");
+        const followupConfiguredBody = document.getElementById("followupConfiguredBody");
+        const followupEmptyBody = document.getElementById("followupEmptyBody");
+
+        if (hasConditions) {
+          triggerGroupStatusText.classList.remove("d-none");
+          triggerGroupStatusText.textContent = "条件组状态：监测中";
+          conditionEditButton.classList.remove("d-none");
+          conditionEditButton.textContent = "编辑";
+          conditionsConfiguredBody.classList.remove("d-none");
+          conditionsEmptyBody.classList.add("d-none");
+        } else {
+          triggerGroupStatusText.classList.add("d-none");
+          conditionEditButton.classList.remove("d-none");
+          conditionEditButton.textContent = "设置触发条件";
+          conditionsConfiguredBody.classList.add("d-none");
+          conditionsEmptyBody.classList.remove("d-none");
+        }
+
+        if (hasActions) {
+          followupStatusText.textContent = "后续动作状态：已执行";
+          followupEditButton.textContent = "编辑";
+          followupConfiguredBody.classList.remove("d-none");
+          followupEmptyBody.classList.add("d-none");
+        } else {
+          followupStatusText.textContent = "后续动作状态：未设置";
+          followupEditButton.textContent = "设置后续动作";
+          followupConfiguredBody.classList.add("d-none");
+          followupEmptyBody.classList.remove("d-none");
+        }
+      }
+
+      applyEditPermissionByStatus();
+    </script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+      integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+      crossorigin="anonymous"
+    ></script>
+  </body>
+</html>

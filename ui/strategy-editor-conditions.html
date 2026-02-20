@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN" data-bs-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IBX Console - 触发条件编辑</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+      crossorigin="anonymous"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <nav class="navbar navbar-expand-lg border-bottom sticky-top navbar-dark bg-dark">
+      <div class="container">
+        <a class="navbar-brand fw-semibold" href="./index.html">IBX Console</a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#topNav" aria-controls="topNav" aria-expanded="false" aria-label="Toggle navigation">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="topNav">
+          <ul class="navbar-nav ms-auto mb-2 mb-lg-0">
+            <li class="nav-item"><a class="nav-link" href="./strategies.html">策略列表</a></li>
+            <li class="nav-item"><a class="nav-link" href="./events.html">运行事件</a></li>
+            <li class="nav-item"><a class="nav-link" href="./verification.html">交易日志</a></li>
+          </ul>
+        </div>
+      </div>
+    </nav>
+
+    <main class="container py-4">
+      <section class="card shadow-sm bg-body-tertiary border-secondary">
+        <div class="card-header border-secondary d-flex justify-content-between align-items-center">
+          <strong>触发条件编辑：<span data-strategy-id>S-NEW</span></strong>
+          <a id="cancelConditionsLink" class="btn btn-sm btn-outline-light" href="./strategy-detail.html">返回策略详情</a>
+        </div>
+        <div class="card-body">
+          <div class="small text-muted mb-3">
+            编辑规则：第一行固定 <code>condition_id / type(单选) / product / evaluation_window / window_price_basis</code>；第二行设置 <code>指标（含基准） / 触发判定 / value</code>；<code>condition_id</code> 自动生成，<code>window_price_basis</code> 缺省为收盘价。
+          </div>
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <strong>conditions</strong>
+            <div>
+              <select id="conditionLogic" class="form-select form-select-sm d-inline-block w-auto">
+                <option>AND</option>
+                <option>OR</option>
+              </select>
+              <button id="addCondition" class="btn btn-sm btn-outline-light ms-2">+ 条件</button>
+            </div>
+          </div>
+          <div id="conditionsContainer" class="vstack gap-2"></div>
+
+          <div class="mt-4 d-flex gap-2">
+            <button id="saveConditionsBtn" class="btn btn-primary">保存触发条件</button>
+            <a id="backFromConditionsLink" class="btn btn-outline-secondary" href="./strategy-detail.html">取消</a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+      integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+      crossorigin="anonymous"
+    ></script>
+  </body>
+</html>
