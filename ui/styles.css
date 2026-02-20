@@ -1,0 +1,151 @@
+body {
+  background: #0f1318;
+  color: #e6edf3;
+}
+
+.card {
+  border: 1px solid #2b3440;
+  background: #151b23;
+}
+
+.card-header {
+  background: #1b2430;
+}
+
+.condition-row {
+  background: #111821;
+}
+
+.form-control, .form-select {
+  background-color: #0f1318;
+  border-color: #2b3440;
+  color: #e6edf3;
+}
+
+.form-control:focus, .form-select:focus {
+  border-color: #4b9fff;
+  box-shadow: 0 0 0 .2rem rgba(75,159,255,.2);
+}
+
+.input-group-text {
+  background-color: #0f1318;
+  border-color: #2b3440;
+  color: #9fb0c3;
+}
+
+.table-secondary {
+  --bs-table-bg: #202a35;
+  --bs-table-color: #e6edf3;
+}
+
+.navbar .nav-link.active {
+  font-weight: 600;
+}
+
+.text-muted {
+  color: #9fb0c3 !important;
+}
+
+.clickable-row {
+  cursor: pointer;
+}
+
+.clickable-row:hover td {
+  background: #1a2532;
+}
+
+pre {
+  background: #0f1318;
+  border: 1px solid #2b3440;
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+}
+
+.condition-view-card {
+  background: #111821;
+  border-color: #2b3440 !important;
+}
+
+.condition-meta {
+  font-size: 0.74rem;
+  color: #9fb0c3;
+  font-weight: 400;
+}
+
+.meta-pill {
+  display: inline-block;
+  padding: 0.08rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid #2b3440;
+  background: #1b2430;
+  color: #9fb0c3;
+  font-weight: 400;
+}
+
+.condition-state {
+  font-size: 0.72rem;
+  font-weight: 400;
+  border-radius: 999px;
+  padding: 0.08rem 0.5rem;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.condition-state.is-true {
+  color: #7ee787;
+  border-color: #2d5a36;
+  background: rgba(46, 160, 67, 0.18);
+}
+
+.condition-state.is-false {
+  color: #ffa198;
+  border-color: #703137;
+  background: rgba(248, 81, 73, 0.18);
+}
+
+.condition-state.is-waiting {
+  color: #d2a8ff;
+  border-color: #4c3569;
+  background: rgba(163, 113, 247, 0.18);
+}
+
+.trigger-group-status {
+  font-size: 0.75rem;
+  font-weight: 400;
+  border-radius: 999px;
+  padding: 0.12rem 0.55rem;
+  border: 1px solid transparent;
+}
+
+.trigger-group-status.is-triggered {
+  color: #7ee787;
+  border-color: #2d5a36;
+  background: rgba(46, 160, 67, 0.18);
+}
+
+.trigger-group-status.is-monitoring {
+  color: #d2a8ff;
+  border-color: #4c3569;
+  background: rgba(163, 113, 247, 0.18);
+}
+
+.trigger-group-status.is-expired {
+  color: #ffa198;
+  border-color: #703137;
+  background: rgba(248, 81, 73, 0.18);
+}
+
+.action-icon-btn {
+  width: 3rem;
+  height: 3rem;
+  padding: 0;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.action-icon-btn .bi {
+  font-size: 1.4rem;
+  line-height: 1;
+}

@@ -105,3 +105,26 @@ python3 scripts/list_portfolio.py --host 127.0.0.1 --port 4002 --client-id 99
 - `--json`：以 JSON 输出，便于接入自动化流程
 - `--account <账户号>`：只查看指定账户持仓
 - `--port 4001`：查看实盘账户（`TRADING_MODE=live`）
+
+## 🖥 静态控制台 UI（Bootstrap 5）
+
+仓库已提供静态控制台原型：
+
+- `ui/index.html`
+- `ui/app.js`
+- `ui/styles.css`
+- `ui/strategies.html`
+- `ui/strategy-detail.html`
+- `ui/strategy-editor.html`（兼容跳转）
+- `ui/strategy-editor-basic.html`
+- `ui/strategy-editor-conditions.html`
+- `ui/strategy-editor-actions.html`
+- `ui/events.html`
+- `ui/verification.html`
+
+特点：
+- 采用 Bootstrap 5（CDN，无需构建）
+- 多页面单职责，顶部菜单切换功能（移动端可折叠）
+- 策略编辑拆分为“基本信息/触发条件/后续动作”三段式流程
+- 覆盖策略列表、策略详情、运行事件、交易日志
+- 用于先确定交互和字段，再对接 API
