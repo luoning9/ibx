@@ -120,11 +120,12 @@ python3 scripts/list_portfolio.py --host 127.0.0.1 --port 4002 --client-id 99
 - `ui/strategy-editor-conditions.html`
 - `ui/strategy-editor-actions.html`
 - `ui/events.html`
-- `ui/verification.html`
+- `ui/positions.html`
+- `ui/trade-instructions.html`
 
 特点：
 - 采用 Bootstrap 5（CDN，无需构建）
 - 多页面单职责，顶部菜单切换功能（移动端可折叠）
 - 策略编辑拆分为“基本信息/触发条件/后续动作”三段式流程
-- 覆盖策略列表、策略详情、运行事件、交易日志
+- 覆盖策略列表、策略详情、运行事件、持仓情况、交易指令
 - 用于先确定交互和字段，再对接 API
