@@ -67,12 +67,25 @@ flowchart LR
 ## 4. 核心模块
 
 ### 4.1 Strategy API
-- `POST /v1/strategies`：创建策略（R4.1）。
-- `GET /v1/strategies` / `GET /v1/strategies/{id}`：查询（R4.2）。
-- `POST /v1/strategies/{id}/cancel`：取消（R4.2）。
-- `POST /v1/strategies/{id}/activate`：手动激活（仅 `upstream_only_activation=false` 时允许，R4.2, R4.10）。
-- `POST /v1/strategies/{id}/pause`：暂停（仅 `ACTIVE` 时允许，R4.2）。
-- `POST /v1/strategies/{id}/resume`：恢复（仅 `PAUSED` 时允许，R4.2）。
+- 创建与查询：
+  - `POST /v1/strategies`：创建策略（R4.1）。
+  - `GET /v1/strategies` / `GET /v1/strategies/{id}`：查询（R4.2, R4.13）。
+- 三段编辑（对应 UI 三页，R4.13）：
+  - `PATCH /v1/strategies/{id}/basic`：更新基本信息。
+  - `PUT /v1/strategies/{id}/conditions`：更新触发条件列表与 `condition_logic`。
+  - `PUT /v1/strategies/{id}/actions`：更新 `trade_action_json` 与 `next_strategy_id`。
+- 控制操作：
+  - `POST /v1/strategies/{id}/cancel`：取消（R4.2）。
+  - `POST /v1/strategies/{id}/activate`：手动激活（仅 `upstream_only_activation=false` 时允许，R4.2, R4.10）。
+  - `POST /v1/strategies/{id}/pause`：暂停（仅 `ACTIVE` 时允许，R4.2）。
+  - `POST /v1/strategies/{id}/resume`：恢复（仅 `PAUSED` 时允许，R4.2）。
+- 日志与辅助查询：
+  - `GET /v1/strategies/{id}/events`：单策略事件日志。
+  - `GET /v1/events`：全局运行事件。
+  - `GET /v1/trade-instructions/active`：当前有效交易指令（未终态）。
+  - `GET /v1/trade-logs`：交易指令日志（核验 + 执行，含 `trade_id`）。
+  - `GET /v1/portfolio-summary`：账户持仓总览。
+  - `GET /v1/positions`：持仓明细（支持 `sec_type/symbol` 过滤；编辑页可按产品精确查询持仓提示）。
 
 ### 4.2 Scheduler/Worker
 - 周期拉取 `ACTIVE` 策略（含已激活上下文）评估触发（R4.3, R4.10）。
@@ -132,9 +145,9 @@ flowchart LR
 
 ### 5.1 `strategies`
 关键字段（与 R4.1 对齐）：
-- `id`, `idempotency_key`, `sec_type`, `symbol`, `currency`
+- `id`, `idempotency_key`, `description`, `sec_type`, `symbol`, `currency`
 - `conditions_json`, `condition_logic`
-- `trade_action_json`, `next_strategy_id`, `anchor_price`
+- `trade_action_json`, `next_strategy_id`, `next_strategy_note`, `anchor_price`
 - `upstream_only_activation`, `activated_at`, `logical_activated_at`, `expire_in_seconds`
 - `expire_at`, `status`, `created_at`, `updated_at`
 
@@ -196,6 +209,11 @@ flowchart LR
 ### 5.5 `strategy_runs`
 - `id`, `strategy_id`, `evaluated_at`, `condition_met`, `decision_reason`, `metrics_json`
 
+### 5.8 `condition_states`（读模型，可选）
+- `id`, `strategy_id`, `condition_id`, `state`, `last_value`, `last_evaluated_at`, `updated_at`
+- `state`：`TRUE` / `FALSE` / `WAITING` / `NOT_EVALUATED`
+- 用于详情页“条件是否满足”与“条件组状态”快速读取（R4.13）
+
 ---
 
 ## 6. 状态机
@@ -235,14 +253,32 @@ flowchart LR
 
 ### 7.2 激活策略
 1. 手动激活请求到达时，若 `upstream_only_activation=true` 则拒绝（R4.2, R4.10）。
-2. 激活时写入 `activated_at`。
-3. 若使用 `expire_in_seconds`，计算 `expire_at = activated_at + expire_in_seconds`（R4.1, R4.5）。
-4. 状态转为 `ACTIVE`。
+2. 激活前完整性校验：
+- `conditions_json` 至少 1 条；
+- `trade_action_json` 与 `next_strategy_id` 至少存在一个（避免空动作激活）。
+3. 激活时写入 `activated_at`。
+4. 若使用 `expire_in_seconds`，计算 `expire_at = activated_at + expire_in_seconds`（R4.1, R4.5）。
+5. 状态转为 `ACTIVE`。
 
 ### 7.2A 暂停与恢复策略
 1. `pause`：仅 `ACTIVE` 允许，状态转 `PAUSED`（R4.2）。
 2. `resume`：仅 `PAUSED` 允许，状态转 `ACTIVE`（R4.2）。
 3. 暂停不影响已提交订单回报跟踪（`ORDER_SUBMITTED` 不可 pause/resume）。
+
+### 7.2B 三段编辑保存
+1. 编辑门控：`PATCH basic`、`PUT conditions`、`PUT actions` 仅 `PENDING_ACTIVATION/PAUSED` 允许（R4.13）。
+2. 若状态不允许编辑，返回 `409`，附 `editable=false` 与原因文案。
+3. `PUT conditions`：
+- 校验 `len(conditions) <= MAX_CONDITIONS_PER_STRATEGY`；
+- 自动生成/更新 `condition_nl`；
+- 若 `condition_id` 缺失则服务端生成稳定 ID。
+4. `PUT actions`：
+- 校验 `sec_type` 与 `action_type` 匹配；
+- `order_type=LMT` 时对应限价必填；
+- 同时支持“仅交易”“仅激活下游”“交易+激活下游”。
+5. `PATCH basic`：
+- 支持更新 `description`、过期方式、`upstream_only_activation` 等；
+- `expire_in_seconds` 相对时间仍以“激活时”计算绝对到期（R4.5）。
 
 ### 7.3 监测与触发
 1. 每 `MONITOR_INTERVAL_SECONDS` 扫描策略（R4.3）。
@@ -303,13 +339,14 @@ flowchart LR
 本节对齐当前静态 UI 页面（`/Users/jason/Documents/GitHub/ibx/ui`），约束 API 输出字段与页面职责（对齐 R4.13）。
 
 ### 9.1 主菜单与入口
-- 主菜单：`策略列表`、`运行事件`、`交易日志`
+- 主菜单：`策略列表`、`运行事件`、`持仓情况`、`交易指令`
 - `策略编辑` 不在主菜单，入口来自策略列表“新建策略”按钮
 
 ### 9.2 页面职责
 1. 策略列表页（`strategies.html`）：
 - 仅显示摘要字段：`id`、`status`、`description`、`updated_at`、`expire_at`
 - 不返回 `conditions_json`、`trade_action_json` 明细到列表组件
+- 返回 `capabilities`（如 `can_activate/can_cancel`）用于按钮可用性控制
 
 2. 策略详情页（`strategy-detail.html`）：
 - 已配置策略：返回完整结构 `conditions_json`、`trade_action_json`、`next_strategy_id`、`anchor_price`
@@ -319,10 +356,15 @@ flowchart LR
 - 基础信息区返回并展示策略控制能力：`cancel/pause/resume/activate` 的可用性
 - 编辑门控：仅 `PENDING_ACTIVATION` / `PAUSED` 状态允许进入 `触发条件编辑` 与 `后续动作编辑`
 - 其它状态返回 `editable=false`，前端禁用编辑入口并提示“ACTIVE 请先暂停”
+- 返回条件运行态：
+  - `trigger_group_status`（`NOT_CONFIGURED/MONITORING/TRIGGERED/EXPIRED`）
+  - `conditions_runtime[*]`：`condition_id`、`state(TRUE/FALSE/WAITING/NOT_EVALUATED)`、`last_value`、`last_evaluated_at`
 - 布局约束：
 - `触发条件`在上，`后续动作`在下。
 - `后续动作`合并展示 `next_strategy` 与 `trade_action`，不再拆分为两张卡片。
 - `trade_action` 以可读字段展示，并在小区域标题处显示交易状态。
+- `next_strategy` 返回对象投影：`id`、`description`、`status`（满足链式控制卡片展示）
+- `trade_action` 返回交易运行态：`trade_status`、`trade_id`、`last_error`（用于标题状态与详情）
 - `触发条件`与`后续动作`表头使用统一结构（标题/状态/编辑）。
 - `后续动作`与`触发条件`均使用单一头部编辑按钮，按钮文案按配置状态动态切换。
 - 返回该策略事件日志：`timestamp`、`event_type`、`detail`
@@ -341,21 +383,84 @@ flowchart LR
 
 - 后续动作编辑页（`strategy-editor-actions.html`）：
 - 支持编辑 `trade_action_json` 与 `next_strategy_id`
+- 支持按 `sec_type/symbol` 查询持仓提示（`GET /v1/positions`）
 
 4. 运行事件页（`events.html`）：
 - 返回全局事件流，字段与详情页事件日志一致
 - 额外包含：`strategy_id`
 
-5. 交易日志页（`verification.html`）：
+5. 持仓情况页（`positions.html`）：
+- 返回账户总览：`net_liquidation`、`available_funds`、`daily_pnl`、`updated_at`
+- 返回持仓明细：`sec_type`、`symbol`、`position_qty`、`avg_price`、`last_price`、`market_value`、`unrealized_pnl`
+
+6. 交易指令页（`trade-instructions.html`）：
+- 返回“当前有效交易指令”（未终态）列表
 - 返回核验 + 执行合并日志
-- 关键字段：`timestamp`、`strategy_id`、`trade_id`、`stage`、`result`、`detail`
+- 有效指令关键字段：`updated_at`、`strategy_id`、`trade_id`、`instruction_summary`、`status`、`expire_at`
+- 日志关键字段：`timestamp`、`strategy_id`、`trade_id`、`stage`、`result`、`detail`
 
 ### 9.3 API 投影建议
 - `GET /v1/strategies`：列表摘要投影（避免大字段）
 - `GET /v1/strategies/{id}`：详情全量结构
+- `PATCH /v1/strategies/{id}/basic`：保存基本信息
+- `PUT /v1/strategies/{id}/conditions`：保存触发条件
+- `PUT /v1/strategies/{id}/actions`：保存后续动作
 - `GET /v1/strategies/{id}/events`：单策略事件日志
 - `GET /v1/events`：全局事件日志
+- `GET /v1/trade-instructions/active`：有效交易指令列表
 - `GET /v1/trade-logs`：交易日志（核验+执行，含 `trade_id`）
+- `GET /v1/portfolio-summary`：持仓页总览
+- `GET /v1/positions`：持仓页明细（支持 `sec_type/symbol` 过滤）；编辑页可按 `sec_type/symbol` 精确查询
+
+### 9.4 API 契约（最小）
+1. `GET /v1/strategies`（列表页）
+- 返回数组项最小字段：
+  - `id`、`status`、`description`、`updated_at`、`expire_at`
+  - `capabilities.can_activate`、`capabilities.can_cancel`
+
+2. `GET /v1/strategies/{id}`（详情页）
+- 最小字段：
+  - 基本信息：`id`、`description`、`sec_type`、`symbol`、`currency`、`upstream_only_activation`、`activated_at`、`expire_in_seconds`、`expire_at`、`status`
+  - 编辑与操作能力：`editable`、`editable_reason`、`capabilities(can_activate/can_pause/can_resume/can_cancel)`、`capability_reasons`
+  - `can_activate=false` 的典型原因：`upstream_only_activation=true`、条件未配置、后续动作未配置
+  - 触发条件：`condition_logic`、`conditions_json[*]`（含 `condition_nl`）
+  - 条件运行态：`trigger_group_status`、`conditions_runtime[*]`
+  - 后续动作：`trade_action_json`、`trade_action_runtime(trade_status/trade_id/last_error)`、`next_strategy(id/description/status)`
+  - 事件日志：`events[*]`（`timestamp`、`event_type`、`detail`）
+
+3. `PATCH /v1/strategies/{id}/basic`
+- 请求体：`description`、`upstream_only_activation`、`expire_mode`、`expire_in_seconds|expire_at`、`sec_type`、`symbol`
+- 响应体：更新后的策略摘要 + `editable/capabilities`
+
+4. `PUT /v1/strategies/{id}/conditions`
+- 请求体：
+  - `condition_logic`
+  - `conditions[]`（项字段：`condition_id?`、`condition_type`、`metric`、`trigger_mode`、`evaluation_window`、`window_price_basis`、`operator`、`value`、`product|product_a+product_b`）
+- 响应体：`condition_logic`、`conditions_json`（含后端生成 `condition_nl` 与补齐的 `condition_id`）
+
+5. `PUT /v1/strategies/{id}/actions`
+- 请求体：`trade_action_json?`、`next_strategy_id?`、`next_strategy_note?`
+- 响应体：`trade_action_json`、`next_strategy(id/description/status)`、`action_configured=true/false`
+
+6. `GET /v1/portfolio-summary`
+- 响应体：`net_liquidation`、`available_funds`、`daily_pnl`、`updated_at`
+
+7. `GET /v1/positions?sec_type=STK|FUT&symbol=...`（查询参数均可选）
+- 响应体：`items[]`
+  - `sec_type`、`symbol`、`position_qty`、`position_unit`（股/手）
+  - `avg_price`、`last_price`、`market_value`、`unrealized_pnl`
+  - `updated_at`
+
+8. `GET /v1/trade-instructions/active`
+- 响应体：`items[]`
+  - `updated_at`、`strategy_id`、`trade_id`
+  - `instruction_summary`
+  - `status`（如 `PENDING_SUBMIT/ORDER_SUBMITTED/PARTIAL_FILL`）
+  - `expire_at`
+
+9. `GET /v1/trade-logs`
+- 响应体：`items[]`
+  - `timestamp`、`strategy_id`、`trade_id`、`stage`、`result`、`detail`
 
 ---
 
@@ -431,7 +536,7 @@ app/
 ## 13. 验证计划（对齐 DoD）
 
 - 按 R8 的 19 条 DoD 编写测试：
-  - API 用例（创建/查询/取消）。
+  - API 用例（创建/查询/三段编辑/取消/激活/暂停/恢复/持仓查询）。
   - 条件触发用例（绝对价、回撤、上涨、流动性、双产品）。
   - 链式下游激活用例。
   - 展期用例。
