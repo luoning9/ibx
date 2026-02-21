@@ -129,3 +129,56 @@ python3 scripts/list_portfolio.py --host 127.0.0.1 --port 4002 --client-id 99
 - 策略编辑拆分为“基本信息/触发条件/后续动作”三段式流程
 - 覆盖策略列表、策略详情、运行事件、持仓情况、交易指令
 - 用于先确定交互和字段，再对接 API
+
+---
+
+## 🚀 FastAPI API 骨架
+
+仓库已补充后端 API 骨架（`app/`）：
+
+- `app/main.py`：FastAPI 应用入口
+- `app/api.py`：`/v1` 路由定义
+- `app/models.py`：Pydantic 请求/响应模型
+- `app/store.py`：内存态示例存储（便于前后端联调）
+- `requirements.txt`：后端依赖
+
+### 启动方式
+
+```bash
+conda activate ibx
+cd /Users/jason/Documents/GitHub/ibx
+pip install -r requirements.txt
+make init-db
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+`make init-db` 会执行 `app/sql/schema_v1.sql`，初始化 SQLite 表结构（默认路径 `data/ibx.sqlite3`，可通过 `IBX_DB_PATH` 覆盖）。
+
+运行时数据目录约定：
+- 数据库：`data/ibx.sqlite3`
+- 应用日志：`data/logs/ibx.log`
+
+可选覆盖：
+- `IBX_DATA_DIR`：统一修改运行时根目录（默认项目内 `data/`）
+- `IBX_DB_PATH`：仅覆盖数据库文件路径
+- `IBX_LOG_PATH`：仅覆盖日志文件路径
+
+### 已实现的 `/v1` 路由骨架
+
+- `POST /v1/strategies`
+- `GET /v1/strategies`
+- `GET /v1/strategies/{id}`
+- `PATCH /v1/strategies/{id}/basic`
+- `PUT /v1/strategies/{id}/conditions`
+- `PUT /v1/strategies/{id}/actions`
+- `POST /v1/strategies/{id}/activate`
+- `POST /v1/strategies/{id}/pause`
+- `POST /v1/strategies/{id}/resume`
+- `POST /v1/strategies/{id}/cancel`
+- `GET /v1/strategies/{id}/events`
+- `GET /v1/events`
+- `GET /v1/trade-instructions/active`
+- `GET /v1/trade-logs`
+- `GET /v1/portfolio-summary`
+- `GET /v1/positions`
+- `GET /v1/healthz`
