@@ -19,8 +19,8 @@
 - 单用户。
 - 单 IB 账户（固定，不支持多账户）。
 - 条件类型：
-  - 单产品条件（价格、流动性、回撤比例、上涨比例）。
-  - 双产品组合条件（任意两个产品之间的流动性与价差关系）。
+  - 单产品条件（价格、回撤比例、上涨比例）。
+  - 双产品组合条件（任意两个产品之间的成交量比值、成交额比值与价差关系）。
 - 下单类型：支持市价单（`MKT`）和限价单（`LMT`）。
 - 下单数量统一按 `QUANTITY`（不再支持 `NOTIONAL_USD`）。
 - 到期机制：到期未触发自动 `EXPIRED`（支持绝对时间与相对时间，最长 1 周）。
@@ -59,6 +59,7 @@
 - `trade_action`（交易动作对象，结构见 4.12）
 - `expire_at` 或 `expire_in_seconds`（二选一）
 - `next_strategy_id`（可选，下游策略 ID；为空表示无后续策略）
+- `upstream_strategy_id`（只读，系统反向维护的上游策略 ID）
 - `upstream_only_activation`（`true` 表示禁止手动激活，仅允许由上游策略激活）
 
 `symbols` 列表项结构：
@@ -79,13 +80,15 @@
 - `condition_id`：条件唯一标识（用于日志与审计追踪）
 - `condition_nl`：条件自然语言描述（系统生成，只读；创建请求可省略）
 - `condition_type`：`SINGLE_PRODUCT` 或 `PAIR_PRODUCTS`
-- `metric`：例如 `PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `LIQUIDITY_RATIO` / `SPREAD`
+- `metric`：例如 `PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `VOLUME_RATIO` / `AMOUNT_RATIO` / `SPREAD`
 - `trigger_mode`：`LEVEL` / `CROSS_UP` / `CROSS_DOWN`
-- `evaluation_window`：滚动评估窗口（最小 `1m`，如 `1m` / `2m` / `5m`）
+- `evaluation_window`：滚动评估窗口（按 `metric` 约束）
+- 分钟级（`1m` / `2m` / `5m`）：`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `SPREAD`
+- 小时/天级（`1h` / `2h` / `4h` / `1d` / `2d` / `5d`）：`VOLUME_RATIO` / `AMOUNT_RATIO`
 - `window_price_basis`：窗口价格基准（`CLOSE` / `HIGH` / `LOW` / `AVG`，默认 `CLOSE`）
 - `operator`：`<=` / `>=` / `<` / `>` / `==`
 - `value`：阈值
-- `value` 类型由 `metric` 决定：`PRICE/SPREAD` 使用美元值，`DRAWDOWN_PCT/RALLY_PCT/LIQUIDITY_RATIO` 使用比例值
+- `value` 类型由 `metric` 决定：`PRICE/SPREAD` 使用美元值，`DRAWDOWN_PCT/RALLY_PCT/VOLUME_RATIO/AMOUNT_RATIO` 使用比例值
 
 当 `condition_type=SINGLE_PRODUCT`：
 - `metric` 仅允许：`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT`
@@ -95,9 +98,12 @@
 - `RALLY_PCT` -> `LOWEST_SINCE_ACTIVATION`
 
 当 `condition_type=PAIR_PRODUCTS`：
-- `metric` 仅允许：`LIQUIDITY_RATIO` / `SPREAD`
+- `metric` 仅允许：`VOLUME_RATIO` / `AMOUNT_RATIO` / `SPREAD`
 - `product_a`（产品 A 标识）
 - `product_b`（产品 B 标识）
+- 比值定义：
+- `VOLUME_RATIO = volume(product_a) / volume(product_b)`
+- `AMOUNT_RATIO = amount(product_a) / amount(product_b)`（成交额比值）
 
 过期时间规则：
 - 支持绝对时间：`expire_at`（ISO 8601，带时区）
@@ -111,6 +117,12 @@
 系统必须支持：
 - 查询策略列表与详情。
 - 手动取消尚未终态的策略。
+- 删除策略（假删除：设置删除标识，不做物理删除）。
+- 删除策略限制：
+- `ACTIVE` 状态不可删除。
+- `PAUSED` 状态不可删除。
+- 若存在上游策略（`upstream_strategy_id` 非空），不可删除。
+- 若存在未终止交易（如仍有活动中的交易指令），不可删除。
 - 手动激活策略（仅当 `upstream_only_activation=false` 时允许）。
 - 手动暂停策略（仅 `ACTIVE` 可暂停，暂停后转 `PAUSED`）。
 - 手动恢复策略（仅 `PAUSED` 可恢复，恢复后转 `ACTIVE`）。
@@ -169,6 +181,10 @@
 - `trade_action` 为空时，表示该策略仅负责激活下游策略。
 - `trade_action` 不为空时，表示触发后先执行交易动作。
 - 当同时配置 `trade_action` 和 `next_strategy_id` 时，允许“执行交易 + 激活下游策略”。
+- 策略链路必须满足“唯一上游”约束：每个策略最多只能被一个上游策略引用。
+- `next_strategy_id` 与 `upstream_strategy_id` 必须双向一致（A.next=B 时，B.upstream=A）。
+- 删除任一策略时，使用假删除（`is_deleted=true`）；默认查询不返回已删除策略。
+- 删除任一策略时，关联策略中的 `next_strategy_id` / `upstream_strategy_id` 需自动清空为 `null`。
 - 触发语义固定为 `ONCE`（本系统不提供 `on_trigger` 配置）。
 - 当前版本仅发送 `TIF=DAY` 订单。
 - `trade_type in {buy,sell,switch}` 仅允许 `action_type=STOCK_TRADE`。
@@ -178,7 +194,7 @@
 - `MAX_CONDITIONS_PER_STRATEGY`：单策略最大条件数（全局配置，默认建议 `5`）。
 - 创建/更新策略时，`len(conditions)` 不得超过 `MAX_CONDITIONS_PER_STRATEGY`。
 - `evaluation_window` 采用滚动窗口语义（每次评估时按“当前时刻向前 N 时间”取数据）。
-- `evaluation_window` 最小值为 `1m`。
+- `evaluation_window` 按 `metric` 约束：价格与价差类使用分钟级；成交量/成交额比值使用小时或天级窗口。
 
 ### 4.13 UI 页面与信息展示要求
 主菜单仅包含：
@@ -286,9 +302,9 @@ verification:
 
 展期触发条件（至少支持以下组合）：
 - 到期驱动：距离到期日小于等于 `ROLL_DAYS_BEFORE_EXPIRY`。
-- 流动性驱动：目标合约间流动性比达到阈值（可配置）。
+- 比值驱动：目标合约间成交量比值或成交额比值达到阈值（可配置）。
 - 点差驱动：目标合约间价差达到阈值（可配置）。
-- 组合关系：支持流动性条件与价差条件按 `AND/OR` 组合。
+- 组合关系：支持比值条件与价差条件按 `AND/OR` 组合。
 
 展期执行要求：
 - 支持配置展期时间窗口（交易时段内）。
@@ -368,8 +384,8 @@ verification:
 5. 重启后 `ACTIVE` 策略继续监测，状态不丢失。
 6. paper 环境下至少一条端到端用例通过。
 7. 至少一条期货自动展期用例通过（满足条件后完成“平近开远”且无重复执行）。
-8. 至少一条“双产品组合条件”用例通过（任意两产品的流动性+价差按 `AND/OR` 触发正确）。
-9. 至少一条“单产品流动性条件”用例通过（阈值触发正确）。
+8. 至少一条“双产品组合条件”用例通过（任意两产品的成交量/成交额比值+价差按 `AND/OR` 触发正确）。
+9. 至少一条“双产品比值条件”用例通过（分别覆盖成交量比值与成交额比值阈值触发正确）。
 10. 至少一条“链式触发 + 回撤比例执行”用例通过（上游激活后，下游按比例条件执行正确）。
 11. 至少一条“下游激活”用例通过（上游触发后下游被正确激活且无重复触发）。
 12. 至少一条“回撤比例触发”与一条“上涨比例触发”用例通过。
@@ -378,7 +394,7 @@ verification:
 15. 至少一条“相对过期时间”用例通过（`expire_in_seconds` 从激活时刻开始计时）。
 16. 至少一条“已发单到期”用例通过（`ORDER_SUBMITTED` 到期不转 `EXPIRED`，按收尾策略处理）。
 17. UI 展示符合页面职责：列表仅展示摘要，详情展示完整结构；全局事件字段齐全；交易指令页同时覆盖“有效指令列表 + 指令日志”（含 `strategy_id` / `trade_id`）。
-18. 至少一条“窗口评估”用例通过（`evaluation_window=5m` 且 `MONITOR_INTERVAL_SECONDS=20` 时按滚动窗口计算）。
+18. 至少一条“窗口评估”用例通过（分钟级指标 `evaluation_window=5m`，以及比值指标 `evaluation_window=1d`，均按滚动窗口计算）。
 19. 至少一条“条件数量上限”用例通过（超过 `MAX_CONDITIONS_PER_STRATEGY` 被拒绝）。
 20. 至少一条“链式延迟激活补偿”用例通过（如下游延迟 1s 激活时，`HIGHEST_SINCE_ACTIVATION` 仍包含该 1s 内真实高点）。
 21. 至少一条“暂停/恢复”用例通过（`ACTIVE->PAUSED->ACTIVE` 且暂停期间不触发新下单）。
@@ -387,7 +403,7 @@ verification:
 
 ## 9. 里程碑建议
 1. M1：策略 CRUD + 监测 + 触发下单 + 到期中止 + 持久化恢复。
-2. M2：期货支持与自动展期（含到期/流动性触发）。
+2. M2：期货支持与自动展期（含到期/成交量或成交额比值触发）。
 3. M3：增强风控、通知与更高级订单能力。
 
 ---
@@ -432,7 +448,7 @@ verification:
 - `product_a=SPY`
 - `product_b=QQQ`
 - 条件逻辑：`AND`
-- 条件 1：`liquidity(QQQ) / liquidity(SPY) >= 1.1`
+- 条件 1：`volume(QQQ) / volume(SPY) >= 1.1`（或 `amount(QQQ) / amount(SPY) >= 1.1`）
 - 条件 2：`price(QQQ) - price(SPY) <= -120`
 - 动作：卖出 `SPY` 固定数量并买入 `QQQ` 固定数量
 - 订单：`MKT` 或 `LMT`
@@ -445,7 +461,7 @@ verification:
 - 目标合约：`product_b`
 - 触发可组合：
   - 到期天数条件（`ROLL_DAYS_BEFORE_EXPIRY`）
-  - 流动性比条件
+  - 成交量比条件 / 成交额比条件
   - 价差条件
 - 动作：先平待切换合约，再开目标合约（受风控约束）
 

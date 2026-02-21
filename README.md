@@ -149,6 +149,7 @@ conda activate ibx
 cd /Users/jason/Documents/GitHub/ibx
 pip install -r requirements.txt
 make init-db
+make seed-sample
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -162,6 +163,10 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 - `IBX_DATA_DIR`：统一修改运行时根目录（默认项目内 `data/`）
 - `IBX_DB_PATH`：仅覆盖数据库文件路径
 - `IBX_LOG_PATH`：仅覆盖日志文件路径
+
+样本数据：
+- `make seed-sample` 会先清空运行时业务数据，再灌入干净的 `SMP-*` 样本（策略、事件、交易、持仓与组合快照）。
+- 如需只刷新 `SMP-*` 而保留其它数据，可执行：`python3 scripts/seed_sample_data.py --keep-non-sample`
 
 ### 已实现的 `/v1` 路由骨架
 

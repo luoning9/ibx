@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any
@@ -8,19 +9,18 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from .db import get_connection, init_db
 from .models import (
     ActiveTradeInstructionOut,
     Capabilities,
     CapabilityReasons,
     ConditionItem,
     ConditionRuntimeItem,
-    ConditionState,
     ControlResponse,
     EventLogItem,
     NextStrategyProjection,
     PortfolioSummaryOut,
     PositionItemOut,
-    StrategySymbolItem,
     StrategyActionsPutIn,
     StrategyBasicPatchIn,
     StrategyConditionsPutIn,
@@ -28,6 +28,7 @@ from .models import (
     StrategyDetailOut,
     StrategyStatus,
     StrategySummaryOut,
+    StrategySymbolItem,
     TradeActionRuntime,
     TradeLogOut,
     TriggerGroupStatus,
@@ -37,11 +38,27 @@ from .models import (
 TERMINAL_STATUSES: set[str] = {"FILLED", "EXPIRED", "CANCELLED", "FAILED"}
 EDITABLE_STATUSES: set[str] = {"PENDING_ACTIVATION", "PAUSED"}
 STOCK_TRADE_TYPES: set[str] = {"buy", "sell", "switch"}
-FUT_TRADE_TYPES: set[str] = {"open", "close", "spread"}
+ACTIVE_STRATEGIES_SOURCE = "v_strategies_active"
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def to_iso(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def dumps_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _generate_condition_nl(condition: ConditionItem) -> str:
@@ -53,37 +70,6 @@ def _generate_condition_nl(condition: ConditionItem) -> str:
         f"当 {subject} 的 {condition.metric} 在 {condition.evaluation_window} 窗口满足 "
         f"{condition.trigger_mode} {condition.operator} {condition.value} 时触发。"
     )
-
-
-@dataclass
-class StrategyRecord:
-    id: str
-    description: str
-    trade_type: str
-    symbols: list[StrategySymbolItem]
-    currency: str
-    upstream_only_activation: bool
-    expire_mode: str
-    expire_in_seconds: int | None
-    expire_at: datetime | None
-    status: StrategyStatus
-    created_at: datetime
-    updated_at: datetime
-    activated_at: datetime | None = None
-    logical_activated_at: datetime | None = None
-    idempotency_key: str | None = None
-
-    condition_logic: str = "AND"
-    conditions_json: list[ConditionItem] = field(default_factory=list)
-    conditions_runtime: list[ConditionRuntimeItem] = field(default_factory=list)
-
-    trade_action_json: dict[str, Any] | None = None
-    trade_action_runtime: TradeActionRuntime = field(
-        default_factory=lambda: TradeActionRuntime(trade_status="NOT_SET")
-    )
-    next_strategy_id: str | None = None
-    next_strategy_note: str | None = None
-    anchor_price: float | None = None
 
 
 def _is_stock_trade_type(trade_type: str) -> bool:
@@ -110,544 +96,1082 @@ def _validate_trade_action_compatibility(
         )
 
 
-class InMemoryStore:
+def _normalize_strategy_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().upper()
+    return normalized or None
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _editable(status: str) -> tuple[bool, str | None]:
+    if status in EDITABLE_STATUSES:
+        return True, None
+    return False, "仅 PENDING_ACTIVATION / PAUSED 可编辑；ACTIVE 请先暂停。"
+
+
+def _capabilities(
+    *,
+    status: str,
+    upstream_only_activation: bool,
+    has_conditions: bool,
+    has_actions: bool,
+    has_active_trade_instruction: bool,
+    has_upstream_strategy: bool,
+) -> tuple[Capabilities, CapabilityReasons]:
+    can_activate = status == "PENDING_ACTIVATION"
+    activate_reason = None
+    if upstream_only_activation:
+        can_activate = False
+        activate_reason = "upstream_only_activation=true"
+    elif not has_conditions:
+        can_activate = False
+        activate_reason = "触发条件未配置"
+    elif not has_actions:
+        can_activate = False
+        activate_reason = "后续动作未配置"
+
+    can_pause = status == "ACTIVE"
+    can_resume = status == "PAUSED"
+    can_cancel = status not in TERMINAL_STATUSES
+    can_delete, delete_reason = _delete_capability(
+        status=status,
+        has_active_trade_instruction=has_active_trade_instruction,
+        has_upstream_strategy=has_upstream_strategy,
+    )
+
+    caps = Capabilities(
+        can_activate=can_activate,
+        can_pause=can_pause,
+        can_resume=can_resume,
+        can_cancel=can_cancel,
+        can_delete=can_delete,
+    )
+    reasons = CapabilityReasons(
+        can_activate=activate_reason,
+        can_pause=None if can_pause else "仅 ACTIVE 可暂停",
+        can_resume=None if can_resume else "仅 PAUSED 可恢复",
+        can_cancel=None if can_cancel else "终态策略不可取消",
+        can_delete=delete_reason,
+    )
+    return caps, reasons
+
+
+def _delete_capability(
+    *,
+    status: str,
+    has_active_trade_instruction: bool,
+    has_upstream_strategy: bool,
+) -> tuple[bool, str | None]:
+    if status == "ACTIVE":
+        return False, "ACTIVE 状态不可删除"
+    if status == "PAUSED":
+        return False, "PAUSED 状态不可删除"
+    if has_upstream_strategy:
+        return False, "存在上游策略，不可删除"
+    if has_active_trade_instruction:
+        return False, "交易未终止，不可删除"
+    return True, None
+
+
+def _trigger_group_status(status: str, has_conditions: bool) -> TriggerGroupStatus:
+    if not has_conditions:
+        return "NOT_CONFIGURED"
+    if status == "EXPIRED":
+        return "EXPIRED"
+    if status in {"TRIGGERED", "ORDER_SUBMITTED", "FILLED"}:
+        return "TRIGGERED"
+    return "MONITORING"
+
+
+class SQLiteStore:
     def __init__(self) -> None:
         self._lock = Lock()
-        self._strategies: dict[str, StrategyRecord] = {}
-        self._events_by_strategy: dict[str, list[EventLogItem]] = {}
-        self._global_events: list[EventLogItem] = []
-        self._active_trade_instructions: list[ActiveTradeInstructionOut] = []
-        self._trade_logs: list[TradeLogOut] = []
-        self._positions: list[PositionItemOut] = []
-        self._portfolio_summary: PortfolioSummaryOut | None = None
-        self._seed()
+        init_db()
 
-    def _seed(self) -> None:
-        now = utcnow()
+    def _conn(self) -> sqlite3.Connection:
+        return get_connection()
 
-        s0 = StrategyRecord(
-            id="S0",
-            description="当 SLV 价格触及 100 美元时，激活回撤 10% 卖出策略（不直接下单）。",
-            trade_type="buy",
-            symbols=[StrategySymbolItem(code="SLV", trade_type="buy")],
-            currency="USD",
-            upstream_only_activation=False,
-            expire_mode="absolute",
-            expire_in_seconds=None,
-            expire_at=now + timedelta(days=2),
-            status="PENDING_ACTIVATION",
-            created_at=now - timedelta(hours=2),
-            updated_at=now - timedelta(hours=1, minutes=30),
-        )
-        s1 = StrategyRecord(
-            id="S1",
-            description="若 SLV 相对锚定价回撤达到 10%，卖出 100 股，并激活 20% 回撤策略。",
-            trade_type="sell",
-            symbols=[StrategySymbolItem(code="SLV", trade_type="sell")],
-            currency="USD",
-            upstream_only_activation=True,
-            expire_mode="relative",
-            expire_in_seconds=172800,
-            expire_at=now + timedelta(days=2),
-            status="ACTIVE",
-            created_at=now - timedelta(hours=3),
-            updated_at=now - timedelta(minutes=45),
-            activated_at=now - timedelta(hours=1, minutes=10),
-            logical_activated_at=now - timedelta(hours=1, minutes=10),
-            condition_logic="AND",
-            trade_action_json={
-                "action_type": "STOCK_TRADE",
-                "symbol": "SLV",
-                "side": "SELL",
-                "quantity": 100,
-                "order_type": "MKT",
-                "tif": "DAY",
-                "allow_overnight": False,
-                "cancel_on_expiry": False,
-            },
-            trade_action_runtime=TradeActionRuntime(
-                trade_status="ORDER_SUBMITTED",
-                trade_id="T-20260220-00041",
-            ),
-            next_strategy_id="S2",
-            next_strategy_note="SLV 回撤达到 20% 时再卖出 100 股。",
-            anchor_price=101.24,
-        )
-
-        c1 = ConditionItem(
-            condition_id="c1",
-            condition_type="SINGLE_PRODUCT",
-            metric="DRAWDOWN_PCT",
-            trigger_mode="LEVEL",
-            evaluation_window="5m",
-            window_price_basis="CLOSE",
-            operator=">=",
-            value=0.1,
-            product="SLV",
-            price_reference="HIGHEST_SINCE_ACTIVATION",
-            condition_nl="当 SLV 相对激活后最高价回撤达到 10% 时触发。",
-        )
-        s1.conditions_json = [c1]
-        s1.conditions_runtime = [
-            ConditionRuntimeItem(
-                condition_id="c1",
-                state="FALSE",
-                last_value=0.06,
-                last_evaluated_at=now - timedelta(seconds=20),
-            )
-        ]
-
-        self._strategies[s0.id] = s0
-        self._strategies[s1.id] = s1
-        self._events_by_strategy[s0.id] = []
-        self._events_by_strategy[s1.id] = []
-        self._append_event(
-            s1.id,
-            "ACTIVATED",
-            "由上游策略 S0 激活，写入 anchor_price=101.24",
-            now - timedelta(hours=1, minutes=10),
-        )
-        self._append_event(
-            s1.id,
-            "ORDER_SUBMITTED",
-            "已发送 IB 订单：trade_id=T-20260220-00041，SELL 100 MKT",
-            now - timedelta(minutes=45),
-        )
-
-        self._active_trade_instructions = [
-            ActiveTradeInstructionOut(
-                updated_at=now - timedelta(minutes=20),
-                strategy_id="S1",
-                trade_id="T-20260220-00041",
-                instruction_summary="SELL 100 SLV LMT @ 91.20, DAY",
-                status="ORDER_SUBMITTED",
-                expire_at=now.replace(hour=16, minute=0, second=0, microsecond=0),
-            ),
-            ActiveTradeInstructionOut(
-                updated_at=now - timedelta(minutes=19),
-                strategy_id="S7",
-                trade_id="T-20260220-00042",
-                instruction_summary="ROLL SIH6 -> SIK6, qty=2",
-                status="PARTIAL_FILL",
-                expire_at=now.replace(hour=16, minute=0, second=0, microsecond=0),
-            ),
-        ]
-
-        self._trade_logs = [
-            TradeLogOut(
-                timestamp=now - timedelta(minutes=21),
-                strategy_id="S1",
-                trade_id="T-20260220-00041",
-                stage="VERIFICATION",
-                result="PASSED",
-                detail="All verification rules passed",
-            ),
-            TradeLogOut(
-                timestamp=now - timedelta(minutes=20),
-                strategy_id="S1",
-                trade_id="T-20260220-00041",
-                stage="EXECUTION",
-                result="ORDER_SUBMITTED",
-                detail="IB Order #2812, SELL 100 MKT",
-            ),
-        ]
-
-        self._portfolio_summary = PortfolioSummaryOut(
-            net_liquidation=128540.72,
-            available_funds=43228.10,
-            daily_pnl=1128.34,
-            updated_at=now - timedelta(minutes=1),
-        )
-        self._positions = [
-            PositionItemOut(
-                sec_type="STK",
-                symbol="SLV",
-                position_qty=320,
-                position_unit="股",
-                avg_price=89.37,
-                last_price=90.82,
-                market_value=29062.40,
-                unrealized_pnl=464.00,
-                updated_at=now - timedelta(minutes=1),
-            ),
-            PositionItemOut(
-                sec_type="FUT",
-                symbol="SIH6",
-                position_qty=3,
-                position_unit="手",
-                avg_price=31.26,
-                last_price=31.10,
-                market_value=466500.00,
-                unrealized_pnl=-2400.00,
-                updated_at=now - timedelta(minutes=1),
-            ),
-        ]
-
-    def _append_event(
-        self, strategy_id: str, event_type: str, detail: str, ts: datetime | None = None
-    ) -> None:
-        event = EventLogItem(
-            timestamp=ts or utcnow(),
-            event_type=event_type,
-            detail=detail,
-            strategy_id=strategy_id,
-        )
-        self._events_by_strategy.setdefault(strategy_id, []).append(event)
-        self._global_events.append(event)
-
-    def _get(self, strategy_id: str) -> StrategyRecord:
-        strategy = self._strategies.get(strategy_id)
-        if not strategy:
+    def _get_strategy_row(
+        self,
+        conn: sqlite3.Connection,
+        strategy_id: str,
+        *,
+        include_deleted: bool = False,
+    ) -> sqlite3.Row:
+        source = "strategies" if include_deleted else ACTIVE_STRATEGIES_SOURCE
+        row = conn.execute(f"SELECT * FROM {source} WHERE id = ?", (strategy_id,)).fetchone()
+        if row is None:
             raise HTTPException(status_code=404, detail=f"strategy {strategy_id} not found")
-        return strategy
+        return row
 
-    def _editable(self, status: StrategyStatus) -> tuple[bool, str | None]:
-        if status in EDITABLE_STATUSES:
-            return True, None
-        return False, "仅 PENDING_ACTIVATION / PAUSED 可编辑；ACTIVE 请先暂停。"
+    def _validate_next_strategy_target(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_id: str,
+        next_strategy_id: str | None,
+    ) -> str | None:
+        normalized = _normalize_strategy_id(next_strategy_id)
+        if normalized is None:
+            return None
+        if normalized == strategy_id:
+            raise HTTPException(status_code=422, detail="next_strategy_id cannot be self")
 
-    def _capabilities(self, s: StrategyRecord) -> tuple[Capabilities, CapabilityReasons]:
-        can_activate = s.status == "PENDING_ACTIVATION"
-        activate_reason = None
-        if s.upstream_only_activation:
-            can_activate = False
-            activate_reason = "upstream_only_activation=true"
-        elif not s.conditions_json:
-            can_activate = False
-            activate_reason = "触发条件未配置"
-        elif not s.trade_action_json and not s.next_strategy_id:
-            can_activate = False
-            activate_reason = "后续动作未配置"
+        target = conn.execute(
+            f"SELECT id, upstream_strategy_id FROM {ACTIVE_STRATEGIES_SOURCE} WHERE id = ?",
+            (normalized,),
+        ).fetchone()
+        if target is None:
+            raise HTTPException(status_code=422, detail=f"next_strategy_id {normalized} not found")
 
-        can_pause = s.status == "ACTIVE"
-        can_resume = s.status == "PAUSED"
-        can_cancel = s.status not in TERMINAL_STATUSES
-
-        caps = Capabilities(
-            can_activate=can_activate,
-            can_pause=can_pause,
-            can_resume=can_resume,
-            can_cancel=can_cancel,
-        )
-        reasons = CapabilityReasons(
-            can_activate=activate_reason,
-            can_pause=None if can_pause else "仅 ACTIVE 可暂停",
-            can_resume=None if can_resume else "仅 PAUSED 可恢复",
-            can_cancel=None if can_cancel else "终态策略不可取消",
-        )
-        return caps, reasons
-
-    def _trigger_group_status(self, s: StrategyRecord) -> TriggerGroupStatus:
-        if not s.conditions_json:
-            return "NOT_CONFIGURED"
-        if s.status == "EXPIRED":
-            return "EXPIRED"
-        if s.status in {"TRIGGERED", "ORDER_SUBMITTED", "FILLED"}:
-            return "TRIGGERED"
-        return "MONITORING"
-
-    def _to_summary(self, s: StrategyRecord) -> StrategySummaryOut:
-        caps, _ = self._capabilities(s)
-        return StrategySummaryOut(
-            id=s.id,
-            status=s.status,
-            description=s.description,
-            updated_at=s.updated_at,
-            expire_at=s.expire_at,
-            capabilities=caps,
-        )
-
-    def _to_detail(self, s: StrategyRecord) -> StrategyDetailOut:
-        editable, editable_reason = self._editable(s.status)
-        capabilities, capability_reasons = self._capabilities(s)
-
-        next_strategy = None
-        if s.next_strategy_id:
-            downstream = self._strategies.get(s.next_strategy_id)
-            next_strategy = NextStrategyProjection(
-                id=s.next_strategy_id,
-                description=(downstream.description if downstream else s.next_strategy_note),
-                status=(downstream.status if downstream else "UNKNOWN"),
+        target_upstream = _normalize_strategy_id(target["upstream_strategy_id"])
+        if target_upstream and target_upstream != strategy_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f"strategy {normalized} already has upstream {target_upstream}",
             )
+
+        conflict = conn.execute(
+            """
+            SELECT id FROM v_strategies_active
+            WHERE next_strategy_id = ? AND id <> ?
+            LIMIT 1
+            """,
+            (normalized, strategy_id),
+        ).fetchone()
+        if conflict is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"strategy {normalized} already linked by upstream {conflict['id']}",
+            )
+
+        return normalized
+
+    def _sync_downstream_upstream_link(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_id: str,
+        old_next_strategy_id: str | None,
+        new_next_strategy_id: str | None,
+        now: datetime,
+    ) -> None:
+        old_next = _normalize_strategy_id(old_next_strategy_id)
+        new_next = _normalize_strategy_id(new_next_strategy_id)
+        now_iso = to_iso(now)
+
+        if old_next and old_next != new_next:
+            conn.execute(
+                """
+                UPDATE strategies
+                SET upstream_strategy_id = NULL, updated_at = ?, version = version + 1
+                WHERE id = ? AND upstream_strategy_id = ?
+                """,
+                (now_iso, old_next, strategy_id),
+            )
+
+        if new_next:
+            conn.execute(
+                """
+                UPDATE strategies
+                SET upstream_strategy_id = ?, updated_at = ?, version = version + 1
+                WHERE id = ? AND (upstream_strategy_id IS NULL OR upstream_strategy_id <> ?)
+                """,
+                (strategy_id, now_iso, new_next, strategy_id),
+            )
+
+    def _load_symbols(self, conn: sqlite3.Connection, strategy_id: str) -> list[StrategySymbolItem]:
+        rows = conn.execute(
+            """
+            SELECT code, trade_type
+            FROM strategy_symbols
+            WHERE strategy_id = ?
+            ORDER BY position ASC
+            """,
+            (strategy_id,),
+        ).fetchall()
+        return [StrategySymbolItem(code=r["code"], trade_type=r["trade_type"]) for r in rows]
+
+    def _load_conditions(self, row: sqlite3.Row) -> list[ConditionItem]:
+        raw = row["conditions_json"] or "[]"
+        data = json.loads(raw)
+        return [ConditionItem.model_validate(item) for item in data]
+
+    def _load_conditions_runtime(
+        self,
+        conn: sqlite3.Connection,
+        strategy_id: str,
+        conditions: list[ConditionItem],
+    ) -> list[ConditionRuntimeItem]:
+        rows = conn.execute(
+            """
+            SELECT condition_id, state, last_value, last_evaluated_at
+            FROM condition_states
+            WHERE strategy_id = ?
+            """,
+            (strategy_id,),
+        ).fetchall()
+        by_id = {r["condition_id"]: r for r in rows}
+        runtime: list[ConditionRuntimeItem] = []
+        for cond in conditions:
+            cid = cond.condition_id or ""
+            hit = by_id.get(cid)
+            if hit:
+                runtime.append(
+                    ConditionRuntimeItem(
+                        condition_id=cid,
+                        state=hit["state"],
+                        last_value=hit["last_value"],
+                        last_evaluated_at=parse_iso(hit["last_evaluated_at"]),
+                    )
+                )
+            else:
+                runtime.append(ConditionRuntimeItem(condition_id=cid, state="NOT_EVALUATED"))
+        return runtime
+
+    def _load_trade_action_runtime(
+        self,
+        conn: sqlite3.Connection,
+        strategy_id: str,
+        has_trade_action: bool,
+    ) -> TradeActionRuntime:
+        if not has_trade_action:
+            return TradeActionRuntime(trade_status="NOT_SET")
+
+        row = conn.execute(
+            """
+            SELECT trade_id, status
+            FROM trade_instructions
+            WHERE strategy_id = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (strategy_id,),
+        ).fetchone()
+        if row:
+            return TradeActionRuntime(trade_status=row["status"], trade_id=row["trade_id"])
+
+        row = conn.execute(
+            """
+            SELECT id, status, error_message
+            FROM orders
+            WHERE strategy_id = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (strategy_id,),
+        ).fetchone()
+        if row:
+            return TradeActionRuntime(
+                trade_status=row["status"],
+                trade_id=row["id"],
+                last_error=row["error_message"],
+            )
+        return TradeActionRuntime(trade_status="NOT_TRIGGERED")
+
+    def _has_active_trade_instruction(self, conn: sqlite3.Connection, strategy_id: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM trade_instructions
+            WHERE strategy_id = ? AND is_active = 1
+            LIMIT 1
+            """,
+            (strategy_id,),
+        ).fetchone()
+        return row is not None
+
+    def _load_next_strategy(
+        self,
+        conn: sqlite3.Connection,
+        next_strategy_id: str | None,
+        next_strategy_note: str | None,
+    ) -> NextStrategyProjection | None:
+        if not next_strategy_id:
+            return None
+        row = conn.execute(
+            f"SELECT id, description, status FROM {ACTIVE_STRATEGIES_SOURCE} WHERE id = ?",
+            (next_strategy_id,),
+        ).fetchone()
+        if row:
+            return NextStrategyProjection(
+                id=row["id"],
+                description=row["description"],
+                status=row["status"],
+            )
+        return NextStrategyProjection(
+            id=next_strategy_id,
+            description=next_strategy_note,
+            status="UNKNOWN",
+        )
+
+    def _load_upstream_strategy(
+        self,
+        conn: sqlite3.Connection,
+        upstream_strategy_id: str | None,
+    ) -> NextStrategyProjection | None:
+        if not upstream_strategy_id:
+            return None
+        row = conn.execute(
+            f"SELECT id, description, status FROM {ACTIVE_STRATEGIES_SOURCE} WHERE id = ?",
+            (upstream_strategy_id,),
+        ).fetchone()
+        if row:
+            return NextStrategyProjection(
+                id=row["id"],
+                description=row["description"],
+                status=row["status"],
+            )
+        return NextStrategyProjection(id=upstream_strategy_id, status="UNKNOWN")
+
+    def _load_events(self, conn: sqlite3.Connection, strategy_id: str) -> list[EventLogItem]:
+        rows = conn.execute(
+            """
+            SELECT timestamp, event_type, detail, strategy_id
+            FROM strategy_events
+            WHERE strategy_id = ?
+            ORDER BY timestamp DESC, id DESC
+            """,
+            (strategy_id,),
+        ).fetchall()
+        return [
+            EventLogItem(
+                timestamp=parse_iso(r["timestamp"]) or utcnow(),
+                event_type=r["event_type"],
+                detail=r["detail"],
+                strategy_id=r["strategy_id"],
+            )
+            for r in rows
+        ]
+
+    def _effective_expire_at(self, row: sqlite3.Row) -> datetime | None:
+        explicit = parse_iso(row["expire_at"])
+        if explicit is not None:
+            return explicit
+
+        if row["expire_mode"] != "relative":
+            return None
+        if not row["expire_in_seconds"]:
+            return None
+
+        base = parse_iso(row["logical_activated_at"]) or parse_iso(row["activated_at"])
+        if base is None:
+            return None
+        return base + timedelta(seconds=int(row["expire_in_seconds"]))
+
+    def _to_detail(self, conn: sqlite3.Connection, row: sqlite3.Row) -> StrategyDetailOut:
+        strategy_id = row["id"]
+        symbols = self._load_symbols(conn, strategy_id)
+        conditions = self._load_conditions(row)
+        conditions_runtime = self._load_conditions_runtime(conn, strategy_id, conditions)
+
+        trade_action_json = (
+            json.loads(row["trade_action_json"]) if row["trade_action_json"] is not None else None
+        )
+        has_conditions = len(conditions) > 0
+        has_actions = trade_action_json is not None or row["next_strategy_id"] is not None
+
+        editable, editable_reason = _editable(row["status"])
+        capabilities, capability_reasons = _capabilities(
+            status=row["status"],
+            upstream_only_activation=bool(row["upstream_only_activation"]),
+            has_conditions=has_conditions,
+            has_actions=has_actions,
+            has_active_trade_instruction=self._has_active_trade_instruction(conn, strategy_id),
+            has_upstream_strategy=_normalize_strategy_id(row["upstream_strategy_id"]) is not None,
+        )
 
         return StrategyDetailOut(
-            id=s.id,
-            description=s.description,
-            trade_type=s.trade_type,  # type: ignore[arg-type]
-            symbols=s.symbols,
-            currency=s.currency,
-            upstream_only_activation=s.upstream_only_activation,
-            activated_at=s.activated_at,
-            logical_activated_at=s.logical_activated_at,
-            expire_in_seconds=s.expire_in_seconds,
-            expire_at=s.expire_at,
-            status=s.status,
+            id=row["id"],
+            description=row["description"],
+            trade_type=row["trade_type"],
+            symbols=symbols,
+            currency=row["currency"],
+            upstream_only_activation=bool(row["upstream_only_activation"]),
+            activated_at=parse_iso(row["activated_at"]),
+            logical_activated_at=parse_iso(row["logical_activated_at"]),
+            expire_in_seconds=row["expire_in_seconds"],
+            expire_at=self._effective_expire_at(row),
+            status=row["status"],
             editable=editable,
             editable_reason=editable_reason,
             capabilities=capabilities,
             capability_reasons=capability_reasons,
-            condition_logic=s.condition_logic,  # type: ignore[arg-type]
-            conditions_json=s.conditions_json,
-            trigger_group_status=self._trigger_group_status(s),
-            conditions_runtime=s.conditions_runtime,
-            trade_action_json=s.trade_action_json,
-            trade_action_runtime=s.trade_action_runtime,
-            next_strategy=next_strategy,
-            anchor_price=s.anchor_price,
-            events=self._events_by_strategy.get(s.id, []),
-            created_at=s.created_at,
-            updated_at=s.updated_at,
+            condition_logic=row["condition_logic"],
+            conditions_json=conditions,
+            trigger_group_status=_trigger_group_status(row["status"], has_conditions),
+            conditions_runtime=conditions_runtime,
+            trade_action_json=trade_action_json,
+            trade_action_runtime=self._load_trade_action_runtime(
+                conn, strategy_id=strategy_id, has_trade_action=trade_action_json is not None
+            ),
+            next_strategy=self._load_next_strategy(
+                conn,
+                next_strategy_id=row["next_strategy_id"],
+                next_strategy_note=row["next_strategy_note"],
+            ),
+            upstream_strategy=self._load_upstream_strategy(
+                conn,
+                upstream_strategy_id=row["upstream_strategy_id"],
+            ),
+            anchor_price=row["anchor_price"],
+            events=self._load_events(conn, strategy_id),
+            created_at=parse_iso(row["created_at"]) or utcnow(),
+            updated_at=parse_iso(row["updated_at"]) or utcnow(),
+        )
+
+    def _append_event(
+        self,
+        conn: sqlite3.Connection,
+        strategy_id: str,
+        event_type: str,
+        detail: str,
+        ts: datetime | None = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO strategy_events (strategy_id, timestamp, event_type, detail)
+            VALUES (?, ?, ?, ?)
+            """,
+            (strategy_id, to_iso(ts or utcnow()), event_type, detail),
         )
 
     def list_strategies(self) -> list[StrategySummaryOut]:
-        with self._lock:
-            return [self._to_summary(s) for s in self._strategies.values()]
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, status, description, updated_at, expire_at, expire_mode, expire_in_seconds,
+                       activated_at, logical_activated_at,
+                       upstream_only_activation, conditions_json, trade_action_json, next_strategy_id,
+                       upstream_strategy_id
+                FROM v_strategies_active
+                ORDER BY updated_at DESC, id ASC
+                """
+            ).fetchall()
+            active_trade_instruction_ids = {
+                item["strategy_id"]
+                for item in conn.execute(
+                    """
+                    SELECT DISTINCT strategy_id
+                    FROM trade_instructions
+                    WHERE is_active = 1
+                    """
+                ).fetchall()
+            }
+            out: list[StrategySummaryOut] = []
+            for row in rows:
+                conditions = json.loads(row["conditions_json"] or "[]")
+                has_conditions = len(conditions) > 0
+                has_actions = row["trade_action_json"] is not None or row["next_strategy_id"] is not None
+                caps, _ = _capabilities(
+                    status=row["status"],
+                    upstream_only_activation=bool(row["upstream_only_activation"]),
+                    has_conditions=has_conditions,
+                    has_actions=has_actions,
+                    has_active_trade_instruction=row["id"] in active_trade_instruction_ids,
+                    has_upstream_strategy=_normalize_strategy_id(row["upstream_strategy_id"]) is not None,
+                )
+                out.append(
+                    StrategySummaryOut(
+                        id=row["id"],
+                        status=row["status"],
+                        description=row["description"],
+                        updated_at=parse_iso(row["updated_at"]) or utcnow(),
+                        expire_at=self._effective_expire_at(row),
+                        capabilities=caps,
+                    )
+                )
+            return out
 
     def get_strategy(self, strategy_id: str) -> StrategyDetailOut:
-        with self._lock:
-            return self._to_detail(self._get(strategy_id))
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            return self._to_detail(conn, row)
 
     def create_strategy(self, payload: StrategyCreateIn) -> StrategyDetailOut:
-        with self._lock:
+        with self._lock, self._conn() as conn:
+            if payload.idempotency_key:
+                row = conn.execute(
+                    f"SELECT id FROM {ACTIVE_STRATEGIES_SOURCE} WHERE idempotency_key = ?",
+                    (payload.idempotency_key,),
+                ).fetchone()
+                if row:
+                    strategy = self._get_strategy_row(conn, row["id"])
+                    return self._to_detail(conn, strategy)
+
             strategy_id = payload.id or f"S-{uuid4().hex[:6].upper()}"
-            if strategy_id in self._strategies:
+            hit = conn.execute("SELECT 1 FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+            if hit:
                 raise HTTPException(status_code=409, detail=f"strategy {strategy_id} already exists")
 
+            _validate_trade_action_compatibility(payload.trade_type, payload.trade_action_json)
+            next_strategy_id = self._validate_next_strategy_target(
+                conn,
+                strategy_id=strategy_id,
+                next_strategy_id=payload.next_strategy_id,
+            )
+            next_strategy_note = _normalize_optional_text(payload.next_strategy_note)
+            if next_strategy_id is None:
+                next_strategy_note = None
+
             now = utcnow()
+            expire_at = payload.expire_at if payload.expire_mode == "absolute" else None
+
             conditions: list[ConditionItem] = []
-            runtime: list[ConditionRuntimeItem] = []
             for idx, cond in enumerate(payload.conditions, start=1):
                 condition_id = cond.condition_id or f"c{idx}"
-                cond = cond.model_copy(
-                    update={
-                        "condition_id": condition_id,
-                        "condition_nl": cond.condition_nl or _generate_condition_nl(cond),
-                    }
+                conditions.append(
+                    cond.model_copy(
+                        update={
+                            "condition_id": condition_id,
+                            "condition_nl": cond.condition_nl or _generate_condition_nl(cond),
+                        }
+                    )
                 )
-                conditions.append(cond)
-                runtime.append(ConditionRuntimeItem(condition_id=condition_id, state="NOT_EVALUATED"))
 
-            expire_at = payload.expire_at
-            if payload.expire_mode == "relative":
-                expire_at = None
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO strategies (
+                        id, idempotency_key, description, trade_type, currency, upstream_only_activation,
+                        expire_mode, expire_in_seconds, expire_at, status, condition_logic,
+                        conditions_json, trade_action_json, next_strategy_id, next_strategy_note,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        strategy_id,
+                        payload.idempotency_key,
+                        payload.description,
+                        payload.trade_type,
+                        payload.currency,
+                        int(payload.upstream_only_activation),
+                        payload.expire_mode,
+                        payload.expire_in_seconds,
+                        to_iso(expire_at),
+                        "PENDING_ACTIVATION",
+                        payload.condition_logic,
+                        dumps_json([c.model_dump(exclude_none=True) for c in conditions]),
+                        dumps_json(payload.trade_action_json)
+                        if payload.trade_action_json is not None
+                        else None,
+                        next_strategy_id,
+                        next_strategy_note,
+                        to_iso(now),
+                        to_iso(now),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
 
-            _validate_trade_action_compatibility(payload.trade_type, payload.trade_action_json)
-
-            record = StrategyRecord(
-                id=strategy_id,
-                description=payload.description,
-                trade_type=payload.trade_type,
-                symbols=payload.symbols,
-                currency=payload.currency,
-                upstream_only_activation=payload.upstream_only_activation,
-                expire_mode=payload.expire_mode,
-                expire_in_seconds=payload.expire_in_seconds,
-                expire_at=expire_at,
-                status="PENDING_ACTIVATION",
-                created_at=now,
-                updated_at=now,
-                idempotency_key=payload.idempotency_key,
-                condition_logic=payload.condition_logic,
-                conditions_json=conditions,
-                conditions_runtime=runtime,
-                trade_action_json=payload.trade_action_json,
-                trade_action_runtime=TradeActionRuntime(
-                    trade_status="NOT_SET" if not payload.trade_action_json else "NOT_TRIGGERED"
-                ),
-                next_strategy_id=payload.next_strategy_id,
-                next_strategy_note=payload.next_strategy_note,
+            self._sync_downstream_upstream_link(
+                conn,
+                strategy_id=strategy_id,
+                old_next_strategy_id=None,
+                new_next_strategy_id=next_strategy_id,
+                now=now,
             )
-            self._strategies[strategy_id] = record
-            self._events_by_strategy[strategy_id] = []
-            self._append_event(strategy_id, "CREATED", "策略创建成功")
-            return self._to_detail(record)
+
+            for idx, sym in enumerate(payload.symbols, start=1):
+                conn.execute(
+                    """
+                    INSERT INTO strategy_symbols (strategy_id, position, code, trade_type, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (strategy_id, idx, sym.code, sym.trade_type, to_iso(now)),
+                )
+
+            for cond in conditions:
+                conn.execute(
+                    """
+                    INSERT INTO condition_states (
+                        strategy_id, condition_id, state, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (strategy_id, cond.condition_id, "NOT_EVALUATED", to_iso(now)),
+                )
+
+            self._append_event(conn, strategy_id, "CREATED", "策略创建成功", now)
+            conn.commit()
+            row = self._get_strategy_row(conn, strategy_id)
+            return self._to_detail(conn, row)
 
     def patch_basic(self, strategy_id: str, payload: StrategyBasicPatchIn) -> StrategyDetailOut:
-        with self._lock:
-            s = self._get(strategy_id)
-            if s.status not in EDITABLE_STATUSES:
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            status = row["status"]
+            if status not in EDITABLE_STATUSES:
                 raise HTTPException(status_code=409, detail="strategy is not editable")
 
+            current_symbols = self._load_symbols(conn, strategy_id)
+            current_trade_action = (
+                json.loads(row["trade_action_json"]) if row["trade_action_json"] is not None else None
+            )
+
             fields_set = payload.model_fields_set
-            next_trade_type = payload.trade_type if "trade_type" in fields_set else s.trade_type
-            next_symbols = payload.symbols if "symbols" in fields_set else s.symbols
-            if not next_trade_type:
+            next_trade_type = payload.trade_type if "trade_type" in fields_set else row["trade_type"]
+            next_symbols = payload.symbols if "symbols" in fields_set else current_symbols
+            if next_trade_type is None:
                 raise HTTPException(status_code=422, detail="trade_type cannot be null")
-            if not next_symbols:
-                raise HTTPException(status_code=422, detail="symbols cannot be null/empty")
+            if next_symbols is None:
+                raise HTTPException(status_code=422, detail="symbols cannot be null")
 
             _validate_trade_symbol_combo(next_trade_type, next_symbols)
-            _validate_trade_action_compatibility(next_trade_type, s.trade_action_json)
+            _validate_trade_action_compatibility(next_trade_type, current_trade_action)
 
-            if "description" in fields_set and payload.description is not None:
-                s.description = payload.description
-            if "trade_type" in fields_set:
-                s.trade_type = next_trade_type
+            description = (
+                payload.description if "description" in fields_set and payload.description is not None else row["description"]
+            )
+            upstream_only_activation = (
+                int(payload.upstream_only_activation)
+                if "upstream_only_activation" in fields_set and payload.upstream_only_activation is not None
+                else row["upstream_only_activation"]
+            )
+            expire_mode = (
+                payload.expire_mode if "expire_mode" in fields_set and payload.expire_mode is not None else row["expire_mode"]
+            )
+            expire_in_seconds = (
+                payload.expire_in_seconds if "expire_in_seconds" in fields_set else row["expire_in_seconds"]
+            )
+            expire_at = row["expire_at"]
+            if expire_mode == "relative":
+                expire_at = None
+            elif "expire_at" in fields_set:
+                expire_at = to_iso(payload.expire_at) if payload.expire_at is not None else None
+
+            now = utcnow()
+            conn.execute(
+                """
+                UPDATE strategies
+                SET description = ?, trade_type = ?, upstream_only_activation = ?,
+                    expire_mode = ?, expire_in_seconds = ?, expire_at = ?, updated_at = ?,
+                    version = version + 1
+                WHERE id = ?
+                """,
+                (
+                    description,
+                    next_trade_type,
+                    upstream_only_activation,
+                    expire_mode,
+                    expire_in_seconds,
+                    expire_at,
+                    to_iso(now),
+                    strategy_id,
+                ),
+            )
+
             if "symbols" in fields_set:
-                s.symbols = next_symbols
-            if "upstream_only_activation" in fields_set and payload.upstream_only_activation is not None:
-                s.upstream_only_activation = payload.upstream_only_activation
-            if "expire_mode" in fields_set and payload.expire_mode is not None:
-                s.expire_mode = payload.expire_mode
-                if s.expire_mode == "relative":
-                    s.expire_at = None
-            if "expire_in_seconds" in fields_set:
-                s.expire_in_seconds = payload.expire_in_seconds
-            if "expire_at" in fields_set and s.expire_mode == "absolute":
-                s.expire_at = payload.expire_at
+                conn.execute("DELETE FROM strategy_symbols WHERE strategy_id = ?", (strategy_id,))
+                for idx, sym in enumerate(next_symbols, start=1):
+                    conn.execute(
+                        """
+                        INSERT INTO strategy_symbols (strategy_id, position, code, trade_type, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (strategy_id, idx, sym.code, sym.trade_type, to_iso(now)),
+                    )
 
-            s.updated_at = utcnow()
-            self._append_event(strategy_id, "BASIC_UPDATED", "已更新基本信息")
-            return self._to_detail(s)
+            self._append_event(conn, strategy_id, "BASIC_UPDATED", "已更新基本信息", now)
+            conn.commit()
+            row = self._get_strategy_row(conn, strategy_id)
+            return self._to_detail(conn, row)
 
     def put_conditions(
         self, strategy_id: str, payload: StrategyConditionsPutIn
     ) -> StrategyDetailOut:
-        with self._lock:
-            s = self._get(strategy_id)
-            if s.status not in EDITABLE_STATUSES:
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            if row["status"] not in EDITABLE_STATUSES:
                 raise HTTPException(status_code=409, detail="strategy is not editable")
 
             conditions: list[ConditionItem] = []
-            runtime: list[ConditionRuntimeItem] = []
             for idx, cond in enumerate(payload.conditions, start=1):
                 condition_id = cond.condition_id or f"c{idx}"
-                cond = cond.model_copy(
-                    update={
-                        "condition_id": condition_id,
-                        "condition_nl": cond.condition_nl or _generate_condition_nl(cond),
-                    }
+                conditions.append(
+                    cond.model_copy(
+                        update={
+                            "condition_id": condition_id,
+                            "condition_nl": cond.condition_nl or _generate_condition_nl(cond),
+                        }
+                    )
                 )
-                conditions.append(cond)
-                runtime.append(ConditionRuntimeItem(condition_id=condition_id, state="NOT_EVALUATED"))
 
-            s.condition_logic = payload.condition_logic
-            s.conditions_json = conditions
-            s.conditions_runtime = runtime
-            s.updated_at = utcnow()
-            self._append_event(strategy_id, "CONDITIONS_UPDATED", "已更新触发条件")
-            return self._to_detail(s)
+            now = utcnow()
+            conn.execute(
+                """
+                UPDATE strategies
+                SET condition_logic = ?, conditions_json = ?, updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (
+                    payload.condition_logic,
+                    dumps_json([c.model_dump(exclude_none=True) for c in conditions]),
+                    to_iso(now),
+                    strategy_id,
+                ),
+            )
+            conn.execute("DELETE FROM condition_states WHERE strategy_id = ?", (strategy_id,))
+            for cond in conditions:
+                conn.execute(
+                    """
+                    INSERT INTO condition_states (
+                        strategy_id, condition_id, state, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (strategy_id, cond.condition_id, "NOT_EVALUATED", to_iso(now)),
+                )
+
+            self._append_event(conn, strategy_id, "CONDITIONS_UPDATED", "已更新触发条件", now)
+            conn.commit()
+            row = self._get_strategy_row(conn, strategy_id)
+            return self._to_detail(conn, row)
 
     def put_actions(self, strategy_id: str, payload: StrategyActionsPutIn) -> StrategyDetailOut:
-        with self._lock:
-            s = self._get(strategy_id)
-            if s.status not in EDITABLE_STATUSES:
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            if row["status"] not in EDITABLE_STATUSES:
                 raise HTTPException(status_code=409, detail="strategy is not editable")
 
-            _validate_trade_action_compatibility(s.trade_type, payload.trade_action_json)
-            s.trade_action_json = payload.trade_action_json
-            s.trade_action_runtime = TradeActionRuntime(
-                trade_status="NOT_SET" if not payload.trade_action_json else "NOT_TRIGGERED"
+            _validate_trade_action_compatibility(row["trade_type"], payload.trade_action_json)
+            old_next_strategy_id = _normalize_strategy_id(row["next_strategy_id"])
+            next_strategy_id = self._validate_next_strategy_target(
+                conn,
+                strategy_id=strategy_id,
+                next_strategy_id=payload.next_strategy_id,
             )
-            s.next_strategy_id = payload.next_strategy_id
-            s.next_strategy_note = payload.next_strategy_note
-            s.updated_at = utcnow()
-            self._append_event(strategy_id, "ACTIONS_UPDATED", "已更新后续动作")
-            return self._to_detail(s)
+            next_strategy_note = _normalize_optional_text(payload.next_strategy_note)
+            if next_strategy_id is None:
+                next_strategy_note = None
+            now = utcnow()
+            try:
+                conn.execute(
+                    """
+                    UPDATE strategies
+                    SET trade_action_json = ?, next_strategy_id = ?, next_strategy_note = ?,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (
+                        dumps_json(payload.trade_action_json)
+                        if payload.trade_action_json is not None
+                        else None,
+                        next_strategy_id,
+                        next_strategy_note,
+                        to_iso(now),
+                        strategy_id,
+                    ),
+                )
+                self._sync_downstream_upstream_link(
+                    conn,
+                    strategy_id=strategy_id,
+                    old_next_strategy_id=old_next_strategy_id,
+                    new_next_strategy_id=next_strategy_id,
+                    now=now,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+
+            self._append_event(conn, strategy_id, "ACTIONS_UPDATED", "已更新后续动作", now)
+            conn.commit()
+            row = self._get_strategy_row(conn, strategy_id)
+            return self._to_detail(conn, row)
 
     def activate(self, strategy_id: str) -> ControlResponse:
-        with self._lock:
-            s = self._get(strategy_id)
-            if s.status != "PENDING_ACTIVATION":
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            if row["status"] != "PENDING_ACTIVATION":
                 raise HTTPException(status_code=409, detail="only PENDING_ACTIVATION can activate")
-            if s.upstream_only_activation:
+            if bool(row["upstream_only_activation"]):
                 raise HTTPException(status_code=409, detail="upstream_only_activation=true")
-            if not s.conditions_json:
+
+            has_conditions = len(json.loads(row["conditions_json"] or "[]")) > 0
+            has_actions = row["trade_action_json"] is not None or row["next_strategy_id"] is not None
+            if not has_conditions:
                 raise HTTPException(status_code=409, detail="conditions not configured")
-            if not s.trade_action_json and not s.next_strategy_id:
+            if not has_actions:
                 raise HTTPException(status_code=409, detail="follow-up actions not configured")
 
             now = utcnow()
-            s.activated_at = now
-            s.logical_activated_at = now
-            if s.expire_mode == "relative" and s.expire_in_seconds:
-                s.expire_at = now + timedelta(seconds=s.expire_in_seconds)
-            s.status = "ACTIVE"
-            s.updated_at = now
-            self._append_event(strategy_id, "ACTIVATED", "策略已手动激活")
+            expire_at = row["expire_at"]
+            if row["expire_mode"] == "relative" and row["expire_in_seconds"]:
+                expire_at = to_iso(now + timedelta(seconds=row["expire_in_seconds"]))
+
+            conn.execute(
+                """
+                UPDATE strategies
+                SET status = 'ACTIVE', activated_at = ?, logical_activated_at = ?,
+                    expire_at = ?, updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (to_iso(now), to_iso(now), expire_at, to_iso(now), strategy_id),
+            )
+            self._append_event(conn, strategy_id, "ACTIVATED", "策略已手动激活", now)
+            conn.commit()
             return ControlResponse(
                 strategy_id=strategy_id,
-                status=s.status,
+                status="ACTIVE",
                 message="activated",
-                updated_at=s.updated_at,
+                updated_at=now,
             )
 
     def pause(self, strategy_id: str) -> ControlResponse:
-        with self._lock:
-            s = self._get(strategy_id)
-            if s.status != "ACTIVE":
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            if row["status"] != "ACTIVE":
                 raise HTTPException(status_code=409, detail="only ACTIVE can pause")
-            s.status = "PAUSED"
-            s.updated_at = utcnow()
-            self._append_event(strategy_id, "PAUSED", "策略已暂停")
+            now = utcnow()
+            conn.execute(
+                "UPDATE strategies SET status = 'PAUSED', updated_at = ?, version = version + 1 WHERE id = ?",
+                (to_iso(now), strategy_id),
+            )
+            self._append_event(conn, strategy_id, "PAUSED", "策略已暂停", now)
+            conn.commit()
             return ControlResponse(
                 strategy_id=strategy_id,
-                status=s.status,
+                status="PAUSED",
                 message="paused",
-                updated_at=s.updated_at,
+                updated_at=now,
             )
 
     def resume(self, strategy_id: str) -> ControlResponse:
-        with self._lock:
-            s = self._get(strategy_id)
-            if s.status != "PAUSED":
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            if row["status"] != "PAUSED":
                 raise HTTPException(status_code=409, detail="only PAUSED can resume")
-            s.status = "ACTIVE"
-            s.updated_at = utcnow()
-            self._append_event(strategy_id, "RESUMED", "策略已恢复")
+            now = utcnow()
+            conn.execute(
+                "UPDATE strategies SET status = 'ACTIVE', updated_at = ?, version = version + 1 WHERE id = ?",
+                (to_iso(now), strategy_id),
+            )
+            self._append_event(conn, strategy_id, "RESUMED", "策略已恢复", now)
+            conn.commit()
             return ControlResponse(
                 strategy_id=strategy_id,
-                status=s.status,
+                status="ACTIVE",
                 message="resumed",
-                updated_at=s.updated_at,
+                updated_at=now,
             )
 
     def cancel(self, strategy_id: str) -> ControlResponse:
-        with self._lock:
-            s = self._get(strategy_id)
-            if s.status in TERMINAL_STATUSES:
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            if row["status"] in TERMINAL_STATUSES:
                 raise HTTPException(status_code=409, detail="terminal status cannot cancel")
-            s.status = "CANCELLED"
-            s.updated_at = utcnow()
-            self._append_event(strategy_id, "CANCELLED", "策略已取消")
+            now = utcnow()
+            conn.execute(
+                """
+                UPDATE strategies
+                SET status = 'CANCELLED', updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (to_iso(now), strategy_id),
+            )
+            self._append_event(conn, strategy_id, "CANCELLED", "策略已取消", now)
+            conn.commit()
             return ControlResponse(
                 strategy_id=strategy_id,
-                status=s.status,
+                status="CANCELLED",
                 message="cancelled",
-                updated_at=s.updated_at,
+                updated_at=now,
+            )
+
+    def delete_strategy(self, strategy_id: str) -> ControlResponse:
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id, include_deleted=True)
+            if bool(row["is_deleted"]):
+                return ControlResponse(
+                    strategy_id=strategy_id,
+                    status=row["status"],
+                    message="already_deleted",
+                    updated_at=parse_iso(row["updated_at"]) or utcnow(),
+                )
+
+            can_delete, delete_reason = _delete_capability(
+                status=row["status"],
+                has_active_trade_instruction=self._has_active_trade_instruction(conn, strategy_id),
+                has_upstream_strategy=_normalize_strategy_id(row["upstream_strategy_id"]) is not None,
+            )
+            if not can_delete:
+                raise HTTPException(status_code=409, detail=delete_reason or "strategy cannot be deleted")
+
+            now = utcnow()
+            now_iso = to_iso(now)
+            conn.execute(
+                """
+                UPDATE strategies
+                SET next_strategy_id = NULL, next_strategy_note = NULL, updated_at = ?, version = version + 1
+                WHERE next_strategy_id = ? AND is_deleted = 0
+                """,
+                (now_iso, strategy_id),
+            )
+            conn.execute(
+                """
+                UPDATE strategies
+                SET upstream_strategy_id = NULL, updated_at = ?, version = version + 1
+                WHERE upstream_strategy_id = ? AND is_deleted = 0
+                """,
+                (now_iso, strategy_id),
+            )
+            conn.execute(
+                """
+                UPDATE trade_instructions
+                SET is_active = 0, updated_at = ?
+                WHERE strategy_id = ? AND is_active = 1
+                """,
+                (now_iso, strategy_id),
+            )
+            conn.execute(
+                """
+                UPDATE strategies
+                SET status = 'CANCELLED',
+                    next_strategy_id = NULL,
+                    next_strategy_note = NULL,
+                    upstream_strategy_id = NULL,
+                    is_deleted = 1,
+                    deleted_at = ?,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE id = ?
+                """,
+                (now_iso, now_iso, strategy_id),
+            )
+            self._append_event(conn, strategy_id, "DELETED", "策略已删除（软删除）", now)
+            conn.commit()
+            return ControlResponse(
+                strategy_id=strategy_id,
+                status="CANCELLED",
+                message="deleted",
+                updated_at=now,
             )
 
     def strategy_events(self, strategy_id: str) -> list[EventLogItem]:
-        with self._lock:
-            self._get(strategy_id)
-            return list(self._events_by_strategy.get(strategy_id, []))
+        with self._lock, self._conn() as conn:
+            self._get_strategy_row(conn, strategy_id)
+            return self._load_events(conn, strategy_id)
 
     def global_events(self) -> list[EventLogItem]:
-        with self._lock:
-            return list(self._global_events)
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp, event_type, detail, strategy_id
+                FROM strategy_events
+                ORDER BY timestamp DESC, id DESC
+                """
+            ).fetchall()
+            return [
+                EventLogItem(
+                    timestamp=parse_iso(r["timestamp"]) or utcnow(),
+                    event_type=r["event_type"],
+                    detail=r["detail"],
+                    strategy_id=r["strategy_id"],
+                )
+                for r in rows
+            ]
 
     def active_trade_instructions(self) -> list[ActiveTradeInstructionOut]:
-        with self._lock:
-            return list(self._active_trade_instructions)
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT updated_at, strategy_id, trade_id, instruction_summary, status, expire_at
+                FROM trade_instructions
+                WHERE is_active = 1
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+            return [
+                ActiveTradeInstructionOut(
+                    updated_at=parse_iso(r["updated_at"]) or utcnow(),
+                    strategy_id=r["strategy_id"],
+                    trade_id=r["trade_id"],
+                    instruction_summary=r["instruction_summary"],
+                    status=r["status"],
+                    expire_at=parse_iso(r["expire_at"]),
+                )
+                for r in rows
+            ]
 
     def trade_logs(self) -> list[TradeLogOut]:
-        with self._lock:
-            return list(self._trade_logs)
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp, strategy_id, trade_id, stage, result, detail
+                FROM trade_logs
+                ORDER BY timestamp DESC, id DESC
+                """
+            ).fetchall()
+            return [
+                TradeLogOut(
+                    timestamp=parse_iso(r["timestamp"]) or utcnow(),
+                    strategy_id=r["strategy_id"],
+                    trade_id=r["trade_id"],
+                    stage=r["stage"],
+                    result=r["result"],
+                    detail=r["detail"],
+                )
+                for r in rows
+            ]
 
     def portfolio_summary(self) -> PortfolioSummaryOut:
-        with self._lock:
-            if not self._portfolio_summary:
+        with self._lock, self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT net_liquidation, available_funds, daily_pnl, updated_at
+                FROM portfolio_snapshots
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
                 raise HTTPException(status_code=404, detail="portfolio summary not found")
-            return self._portfolio_summary
+            return PortfolioSummaryOut(
+                net_liquidation=row["net_liquidation"],
+                available_funds=row["available_funds"],
+                daily_pnl=row["daily_pnl"],
+                updated_at=parse_iso(row["updated_at"]) or utcnow(),
+            )
 
-    def positions(self, sec_type: str | None = None, symbol: str | None = None) -> list[PositionItemOut]:
-        with self._lock:
-            items = self._positions
+    def positions(
+        self,
+        sec_type: str | None = None,
+        symbol: str | None = None,
+    ) -> list[PositionItemOut]:
+        with self._lock, self._conn() as conn:
+            sql = """
+                SELECT sec_type, symbol, position_qty, position_unit, avg_price, last_price,
+                       market_value, unrealized_pnl, updated_at
+                FROM positions
+                WHERE 1=1
+            """
+            params: list[Any] = []
             if sec_type:
-                items = [p for p in items if p.sec_type == sec_type]
+                sql += " AND sec_type = ?"
+                params.append(sec_type)
             if symbol:
-                items = [p for p in items if p.symbol == symbol.upper()]
-            return list(items)
+                sql += " AND symbol = ?"
+                params.append(symbol.upper())
+            sql += " ORDER BY symbol ASC"
+            rows = conn.execute(sql, params).fetchall()
+            return [
+                PositionItemOut(
+                    sec_type=r["sec_type"],
+                    symbol=r["symbol"],
+                    position_qty=r["position_qty"],
+                    position_unit=r["position_unit"],
+                    avg_price=r["avg_price"],
+                    last_price=r["last_price"],
+                    market_value=r["market_value"],
+                    unrealized_pnl=r["unrealized_pnl"],
+                    updated_at=parse_iso(r["updated_at"]) or utcnow(),
+                )
+                for r in rows
+            ]
 
 
-store = InMemoryStore()
+store = SQLiteStore()

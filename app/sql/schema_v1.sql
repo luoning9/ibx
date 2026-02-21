@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS strategies (
     CHECK (trade_action_json IS NULL OR json_valid(trade_action_json)),
   next_strategy_id TEXT REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE SET NULL,
   next_strategy_note TEXT,
+  upstream_strategy_id TEXT,
+  is_deleted INTEGER NOT NULL DEFAULT 0
+    CHECK (is_deleted IN (0, 1)),
+  deleted_at TEXT,
   anchor_price REAL,
   activated_at TEXT,
   logical_activated_at TEXT,
@@ -43,6 +47,8 @@ CREATE TABLE IF NOT EXISTS strategies (
   updated_at TEXT NOT NULL,
   version INTEGER NOT NULL DEFAULT 1
     CHECK (version > 0),
+  CHECK (next_strategy_id IS NULL OR next_strategy_id <> id),
+  CHECK (upstream_strategy_id IS NULL OR upstream_strategy_id <> id),
   CHECK (
     (expire_mode = "relative" AND expire_in_seconds IS NOT NULL)
     OR
