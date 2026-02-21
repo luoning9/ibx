@@ -145,11 +145,19 @@ flowchart LR
 
 ### 5.1 `strategies`
 关键字段（与 R4.1 对齐）：
-- `id`, `idempotency_key`, `description`, `sec_type`, `symbol`, `currency`
+- `id`, `idempotency_key`, `description`, `trade_type`, `symbols`, `currency`
 - `conditions_json`, `condition_logic`
 - `trade_action_json`, `next_strategy_id`, `next_strategy_note`, `anchor_price`
 - `upstream_only_activation`, `activated_at`, `logical_activated_at`, `expire_in_seconds`
 - `expire_at`, `status`, `created_at`, `updated_at`
+
+`symbols[*]` 结构：
+- `code`（产品代码）
+- `trade_type`（`buy` / `sell` / `open` / `close` / `ref`，`ref` 仅参考不下单）
+
+组合约束（与 R4.1 对齐）：
+- `trade_type in {buy,sell,switch}`：`symbols[*].trade_type` 仅允许 `buy/sell/ref`；
+- `trade_type in {open,close,spread}`：`symbols[*].trade_type` 仅允许 `open/close/ref`。
 
 ### 5.6 `trade_action_json` 结构
 - `action_type`：`STOCK_TRADE` / `FUT_POSITION` / `FUT_ROLL`
@@ -181,7 +189,7 @@ flowchart LR
 
 说明：
 - `trade_action_json` 可为空，表示该策略只负责激活下游策略（R4.12）。
-- `sec_type=STK` 仅允许 `action_type=STOCK_TRADE`；`sec_type=FUT` 仅允许 `FUT_POSITION/FUT_ROLL`（R4.12）。
+- `trade_type in {buy,sell,switch}` 仅允许 `action_type=STOCK_TRADE`；`trade_type in {open,close,spread}` 仅允许 `FUT_POSITION/FUT_ROLL`（R4.12）。
 
 ### 5.7 `conditions_json` 条件项结构
 - `condition_id`
@@ -273,7 +281,7 @@ flowchart LR
 - 自动生成/更新 `condition_nl`；
 - 若 `condition_id` 缺失则服务端生成稳定 ID。
 4. `PUT actions`：
-- 校验 `sec_type` 与 `action_type` 匹配；
+- 校验 `trade_type` 与 `action_type` 匹配；
 - `order_type=LMT` 时对应限价必填；
 - 同时支持“仅交易”“仅激活下游”“交易+激活下游”。
 5. `PATCH basic`：
@@ -420,7 +428,7 @@ flowchart LR
 
 2. `GET /v1/strategies/{id}`（详情页）
 - 最小字段：
-  - 基本信息：`id`、`description`、`sec_type`、`symbol`、`currency`、`upstream_only_activation`、`activated_at`、`expire_in_seconds`、`expire_at`、`status`
+  - 基本信息：`id`、`description`、`trade_type`、`symbols`、`currency`、`upstream_only_activation`、`activated_at`、`expire_in_seconds`、`expire_at`、`status`
   - 编辑与操作能力：`editable`、`editable_reason`、`capabilities(can_activate/can_pause/can_resume/can_cancel)`、`capability_reasons`
   - `can_activate=false` 的典型原因：`upstream_only_activation=true`、条件未配置、后续动作未配置
   - 触发条件：`condition_logic`、`conditions_json[*]`（含 `condition_nl`）
@@ -429,7 +437,7 @@ flowchart LR
   - 事件日志：`events[*]`（`timestamp`、`event_type`、`detail`）
 
 3. `PATCH /v1/strategies/{id}/basic`
-- 请求体：`description`、`upstream_only_activation`、`expire_mode`、`expire_in_seconds|expire_at`、`sec_type`、`symbol`
+- 请求体：`description`、`upstream_only_activation`、`expire_mode`、`expire_in_seconds|expire_at`、`trade_type`、`symbols`
 - 响应体：更新后的策略摘要 + `editable/capabilities`
 
 4. `PUT /v1/strategies/{id}/conditions`
@@ -528,7 +536,7 @@ app/
   - `S1: SINGLE_PRODUCT DRAWDOWN_PCT>=0.1 + trade_action + next_strategy_id=S2`
   - `S2: SINGLE_PRODUCT DRAWDOWN_PCT>=0.2 + trade_action`（需求文档 §10 示例 B）。
 - 示例 C（双产品调仓）：`PAIR_PRODUCTS(LIQUIDITY_RATIO/SPREAD) + trade_action`（需求文档 §10 示例 C）。
-- 示例 D（期货展期）：`FUT + roll handler`（需求文档 §10 示例 D）。
+- 示例 D（期货展期）：`trade_type=spread + roll handler`（需求文档 §10 示例 D）。
 - 示例 E（上涨比例）：`SINGLE_PRODUCT RALLY_PCT`（需求文档 §10 示例 E）。
 
 ---

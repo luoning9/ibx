@@ -51,8 +51,8 @@
 ### 4.1 策略创建
 系统必须支持创建策略，最小字段包括：
 - `idempotency_key`
-- `sec_type`（`STK` / `FUT`）
-- `symbol`
+- `trade_type`（`buy` / `sell` / `switch` / `open` / `close` / `spread`）
+- `symbols`（产品列表）
 - `condition_logic`（`AND` / `OR`）
 - `conditions`（触发条件列表；“仅基础信息新建”阶段可为空，激活前至少 1 项）
 - `currency`（固定为 `USD`）
@@ -60,6 +60,20 @@
 - `expire_at` 或 `expire_in_seconds`（二选一）
 - `next_strategy_id`（可选，下游策略 ID；为空表示无后续策略）
 - `upstream_only_activation`（`true` 表示禁止手动激活，仅允许由上游策略激活）
+
+`symbols` 列表项结构：
+- `code`：产品代码（如 `SLV`）
+- `trade_type`：`buy` / `sell` / `open` / `close` / `ref`（`ref` 表示仅参考，不参与买卖）
+
+策略级 `trade_type` 与 `symbols[*].trade_type` 约束：
+- `trade_type in {buy,sell,switch}`：仅允许 `buy/sell/ref`；
+- `trade_type=buy`：至少包含 1 个 `buy` 产品；
+- `trade_type=sell`：至少包含 1 个 `sell` 产品；
+- `trade_type=switch`：至少包含 1 个 `buy` 与 1 个 `sell` 产品；
+- `trade_type in {open,close,spread}`：仅允许 `open/close/ref`；
+- `trade_type=open`：至少包含 1 个 `open` 产品；
+- `trade_type=close`：至少包含 1 个 `close` 产品；
+- `trade_type=spread`：至少包含 1 个 `open` 与 1 个 `close` 产品。
 
 `conditions` 列表项统一结构（两类）：
 - `condition_id`：条件唯一标识（用于日志与审计追踪）
@@ -157,8 +171,8 @@
 - 当同时配置 `trade_action` 和 `next_strategy_id` 时，允许“执行交易 + 激活下游策略”。
 - 触发语义固定为 `ONCE`（本系统不提供 `on_trigger` 配置）。
 - 当前版本仅发送 `TIF=DAY` 订单。
-- `sec_type=STK` 仅允许 `action_type=STOCK_TRADE`。
-- `sec_type=FUT` 仅允许 `action_type=FUT_POSITION` 或 `FUT_ROLL`。
+- `trade_type in {buy,sell,switch}` 仅允许 `action_type=STOCK_TRADE`。
+- `trade_type in {open,close,spread}` 仅允许 `action_type=FUT_POSITION` 或 `FUT_ROLL`。
 
 ### 4.14 全局条件配置
 - `MAX_CONDITIONS_PER_STRATEGY`：单策略最大条件数（全局配置，默认建议 `5`）。
@@ -177,7 +191,7 @@
 - `策略编辑`不出现在主菜单中，仅通过“策略列表 -> 新建策略”进入。
 
 策略编辑要求（拆分为三部分）：
-- `基本信息编辑`：仅编辑策略基础字段（如 `id`、`sec_type`、`symbol`、描述、激活限制、过期方式）。
+- `基本信息编辑`：仅编辑策略基础字段（如 `id`、`trade_type`、`symbols`、描述、激活限制、过期方式）。
 - `触发条件编辑`：编辑 `condition_id`、`trigger_mode`、`evaluation_window`，并支持按 `condition_type` 切换单产品/双产品字段；单产品比例类场景使用“指标（含基准）”组合选择，不单独暴露 `price_reference` 输入。
 - `触发条件编辑`：支持 `window_price_basis` 下拉（收盘/最高/最低/平均），默认收盘价。
 - `触发条件编辑`：`触发判定`选项需按 `metric` 动态约束，避免无效组合。
@@ -265,7 +279,7 @@ verification:
 - 保留并恢复“待激活”策略，不得误激活。
 
 ### 4.8 期货与自动展期
-当 `sec_type=FUT` 时，系统必须支持：
+当 `trade_type in {open, close, spread}` 时，系统必须支持：
 1. 识别当前持仓合约与下一可交易主力候选合约。
 2. 在满足展期条件时自动执行“平近开远”。
 3. 展期过程按同方向、同数量（或配置比例）执行，防止裸露风险敞口。
@@ -426,7 +440,7 @@ verification:
 ### 示例 D：期货自动展期（双产品组合条件）
 目标：对期货持仓在满足市场条件时自动从当前合约切到目标合约。
 
-- `sec_type=FUT`
+- `trade_type=spread`
 - 待切换合约：`product_a`
 - 目标合约：`product_b`
 - 触发可组合：
@@ -438,7 +452,7 @@ verification:
 ### 示例 F：期货开平仓
 目标：对指定期货合约执行开仓或平仓。
 
-- `sec_type=FUT`
+- `trade_type=open`（或 `close`）
 - 动作类型：`action_type=FUT_POSITION`
 - 示例 1：`position_effect=OPEN`, `side=BUY`, `quantity=2`, `contract=SIH7`
 - 示例 2：`position_effect=CLOSE`, `side=SELL`, `quantity=1`, `contract=SIH7`

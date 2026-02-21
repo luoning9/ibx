@@ -1,0 +1,74 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  min-height: 100vh;
+  margin: 0;
+}
+
+body {
+  font-family:
+    'Inter',
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Microsoft YaHei',
+    sans-serif;
+  background: #0f1318;
+  color: #e6edf3;
+}
+
+.app-shell {
+  min-height: 100vh;
+  background: #0f1318;
+}
+
+.top-nav {
+  height: 56px;
+  padding: 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  border-bottom: 1px solid #2b3440;
+  background: #151b23;
+}
+
+.brand {
+  font-weight: 600;
+  color: #e6edf3;
+  white-space: nowrap;
+}
+
+.menu {
+  flex: 1;
+  min-width: 0;
+  border-bottom: none !important;
+  background: transparent !important;
+}
+
+.menu.el-menu--horizontal > .el-menu-item {
+  height: 56px;
+  line-height: 56px;
+}
+
+.main {
+  padding: 16px;
+}
+
+.page-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.card-title {
+  font-weight: 600;
+}
+
+.card-tools {
+  color: #9fb0c3;
+  font-size: 12px;
+}
