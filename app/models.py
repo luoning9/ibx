@@ -21,6 +21,44 @@ ConditionState = Literal["TRUE", "FALSE", "WAITING", "NOT_EVALUATED"]
 TriggerGroupStatus = Literal["NOT_CONFIGURED", "MONITORING", "TRIGGERED", "EXPIRED"]
 StrategyTradeType = Literal["buy", "sell", "switch", "open", "close", "spread"]
 SymbolTradeType = Literal["buy", "sell", "open", "close", "ref"]
+ConditionMetric = Literal[
+    "PRICE",
+    "DRAWDOWN_PCT",
+    "RALLY_PCT",
+    "VOLUME_RATIO",
+    "AMOUNT_RATIO",
+    "SPREAD",
+]
+ConditionTriggerMode = Literal["LEVEL", "CROSS_UP", "CROSS_DOWN"]
+ConditionOperator = Literal[">=", "<="]
+ConditionEvaluationWindow = Literal["1m", "2m", "5m", "1h", "2h", "4h", "1d", "2d", "5d"]
+
+LEGACY_METRIC_ALIASES: dict[str, ConditionMetric] = {
+    "LIQUIDITY_RATIO": "VOLUME_RATIO",
+}
+
+CONDITION_METRICS_BY_TYPE: dict[str, set[ConditionMetric]] = {
+    "SINGLE_PRODUCT": {"PRICE", "DRAWDOWN_PCT", "RALLY_PCT"},
+    "PAIR_PRODUCTS": {"VOLUME_RATIO", "AMOUNT_RATIO", "SPREAD"},
+}
+
+METRIC_ALLOWED_RULES: dict[ConditionMetric, set[tuple[ConditionTriggerMode, ConditionOperator]]] = {
+    "PRICE": {("LEVEL", ">="), ("LEVEL", "<="), ("CROSS_UP", ">="), ("CROSS_DOWN", "<=")},
+    "DRAWDOWN_PCT": {("LEVEL", ">=")},
+    "RALLY_PCT": {("LEVEL", ">=")},
+    "VOLUME_RATIO": {("LEVEL", ">="), ("LEVEL", "<=")},
+    "AMOUNT_RATIO": {("LEVEL", ">="), ("LEVEL", "<=")},
+    "SPREAD": {("LEVEL", ">="), ("LEVEL", "<="), ("CROSS_UP", ">="), ("CROSS_DOWN", "<=")},
+}
+
+METRIC_ALLOWED_WINDOWS: dict[ConditionMetric, set[ConditionEvaluationWindow]] = {
+    "PRICE": {"1m", "2m", "5m"},
+    "DRAWDOWN_PCT": {"1m", "2m", "5m"},
+    "RALLY_PCT": {"1m", "2m", "5m"},
+    "SPREAD": {"1m", "2m", "5m"},
+    "VOLUME_RATIO": {"1h", "2h", "4h", "1d", "2d", "5d"},
+    "AMOUNT_RATIO": {"1h", "2h", "4h", "1d", "2d", "5d"},
+}
 
 
 class Capabilities(BaseModel):
@@ -28,6 +66,7 @@ class Capabilities(BaseModel):
     can_pause: bool = False
     can_resume: bool = False
     can_cancel: bool = False
+    can_delete: bool = False
 
 
 class CapabilityReasons(BaseModel):
@@ -35,6 +74,7 @@ class CapabilityReasons(BaseModel):
     can_pause: str | None = None
     can_resume: str | None = None
     can_cancel: str | None = None
+    can_delete: str | None = None
 
 
 class EventLogItem(BaseModel):
@@ -103,16 +143,64 @@ class ConditionItem(BaseModel):
     condition_id: str | None = None
     condition_nl: str | None = None
     condition_type: Literal["SINGLE_PRODUCT", "PAIR_PRODUCTS"]
-    metric: str
-    trigger_mode: str
-    evaluation_window: str
+    metric: ConditionMetric
+    trigger_mode: ConditionTriggerMode
+    evaluation_window: ConditionEvaluationWindow
     window_price_basis: Literal["CLOSE", "HIGH", "LOW", "AVG"] = "CLOSE"
-    operator: str
+    operator: ConditionOperator
     value: float
     product: str | None = None
     product_a: str | None = None
     product_b: str | None = None
     price_reference: str | None = None
+
+    @field_validator("metric", mode="before")
+    @classmethod
+    def normalize_metric(cls, value: Any) -> str:
+        metric = str(value).strip().upper()
+        return LEGACY_METRIC_ALIASES.get(metric, metric)
+
+    @field_validator("product", "product_a", "product_b")
+    @classmethod
+    def normalize_products(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().upper()
+        return normalized or None
+
+    @field_validator("evaluation_window", mode="before")
+    @classmethod
+    def normalize_evaluation_window(cls, value: Any) -> str:
+        return str(value).strip().lower()
+
+    @model_validator(mode="after")
+    def validate_condition_shape(self) -> "ConditionItem":
+        allowed_metrics = CONDITION_METRICS_BY_TYPE[self.condition_type]
+        if self.metric not in allowed_metrics:
+            raise ValueError(f"metric={self.metric} is not allowed for condition_type={self.condition_type}")
+
+        if (self.trigger_mode, self.operator) not in METRIC_ALLOWED_RULES[self.metric]:
+            raise ValueError(
+                f"metric={self.metric} does not allow trigger_mode={self.trigger_mode} with operator={self.operator}"
+            )
+
+        if self.evaluation_window not in METRIC_ALLOWED_WINDOWS[self.metric]:
+            raise ValueError(
+                f"metric={self.metric} does not allow evaluation_window={self.evaluation_window}"
+            )
+
+        if self.condition_type == "SINGLE_PRODUCT":
+            if not self.product:
+                raise ValueError("SINGLE_PRODUCT requires product")
+            self.product_a = None
+            self.product_b = None
+        else:
+            if not self.product_a or not self.product_b:
+                raise ValueError("PAIR_PRODUCTS requires product_a and product_b")
+            if self.product_a == self.product_b:
+                raise ValueError("PAIR_PRODUCTS requires different product_a and product_b")
+            self.product = None
+        return self
 
 
 class ConditionRuntimeItem(BaseModel):
@@ -169,6 +257,7 @@ class StrategyDetailOut(BaseModel):
     trade_action_json: dict[str, Any] | None = None
     trade_action_runtime: TradeActionRuntime
     next_strategy: NextStrategyProjection | None = None
+    upstream_strategy: NextStrategyProjection | None = None
 
     anchor_price: float | None = None
     events: list[EventLogItem] = Field(default_factory=list)

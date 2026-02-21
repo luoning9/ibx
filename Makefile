@@ -1,4 +1,4 @@
-.PHONY: check check-paper check-live check-both portfolio api api-dev test-api init-db
+.PHONY: check check-paper check-live check-both portfolio api api-dev test-api init-db seed-sample
 
 ENV_FILE := gateway/.env
 PAPER_PORT := 4002
@@ -45,3 +45,7 @@ test-api:
 # 初始化 SQLite 表结构
 init-db:
 	python3 scripts/init_db.py
+
+# 灌入干净样本数据（先清空业务数据，再写入 SMP-*）
+seed-sample:
+	python3 scripts/seed_sample_data.py

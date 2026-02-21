@@ -17,7 +17,7 @@
 
 - `R2.1` 范围与能力：单账户、条件类型、订单类型、到期、期货、链式触发。
 - `R4.1` 策略创建字段与输入约束。
-- `R4.2` 查询与控制（取消/激活/暂停/恢复）。
+- `R4.2` 查询与控制（取消/删除/激活/暂停/恢复）。
 - `R4.3` 监测间隔配置（20~300 秒）。
 - `R4.4` 触发到下单流程。
 - `R4.5` 到期中止。
@@ -73,9 +73,10 @@ flowchart LR
 - 三段编辑（对应 UI 三页，R4.13）：
   - `PATCH /v1/strategies/{id}/basic`：更新基本信息。
   - `PUT /v1/strategies/{id}/conditions`：更新触发条件列表与 `condition_logic`。
-  - `PUT /v1/strategies/{id}/actions`：更新 `trade_action_json` 与 `next_strategy_id`。
+  - `PUT /v1/strategies/{id}/actions`：更新 `trade_action_json` 与 `next_strategy_id`（并同步反向 `upstream_strategy_id`）。
 - 控制操作：
   - `POST /v1/strategies/{id}/cancel`：取消（R4.2）。
+  - `DELETE /v1/strategies/{id}`：删除（软删除，R4.2）。
   - `POST /v1/strategies/{id}/activate`：手动激活（仅 `upstream_only_activation=false` 时允许，R4.2, R4.10）。
   - `POST /v1/strategies/{id}/pause`：暂停（仅 `ACTIVE` 时允许，R4.2）。
   - `POST /v1/strategies/{id}/resume`：恢复（仅 `PAUSED` 时允许，R4.2）。
@@ -98,17 +99,22 @@ flowchart LR
 - 顶层：`condition_logic`（`AND` / `OR`）
 - 条件项：`condition_type`（`SINGLE_PRODUCT` / `PAIR_PRODUCTS`）
 - 条件项字段：`condition_id`、`metric`、`trigger_mode`、`evaluation_window`、`window_price_basis`、`operator`、`value` 以及产品字段
-- `value` 语义按 `metric` 解释：`PRICE/SPREAD` 为 USD，`DRAWDOWN_PCT/RALLY_PCT/LIQUIDITY_RATIO` 为比例
+- `value` 语义按 `metric` 解释：`PRICE/SPREAD` 为 USD，`DRAWDOWN_PCT/RALLY_PCT/VOLUME_RATIO/AMOUNT_RATIO` 为比例
 - 条件文本渲染：生成 `condition_nl`（统一文案模板，供详情/日志直接展示）
 
 条件原子支持（R4.1）：
 - `SINGLE_PRODUCT`：`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT`
-- `PAIR_PRODUCTS`：`LIQUIDITY_RATIO` / `SPREAD`
+- `PAIR_PRODUCTS`：`VOLUME_RATIO` / `AMOUNT_RATIO` / `SPREAD`
+- 比值定义：
+- `VOLUME_RATIO = volume(product_a) / volume(product_b)`
+- `AMOUNT_RATIO = amount(product_a) / amount(product_b)`（成交额比值）
 
 触发语义：
 - 本系统固定 `ONCE`，不提供 `on_trigger` 配置（R4.12）。
 - `evaluation_window` 为滚动窗口，`MONITOR_INTERVAL_SECONDS` 为调度频率，二者独立（R4.3, R4.14）。
-- `evaluation_window` 最小值为 `1m`（R4.14）。
+- `evaluation_window` 按 `metric` 约束：
+- 分钟级（`1m/2m/5m`）：`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `SPREAD`
+- 小时/天级（`1h/2h/4h/1d/2d/5d`）：`VOLUME_RATIO` / `AMOUNT_RATIO`
 - `window_price_basis` 用于指定评估窗口取值口径（`CLOSE/HIGH/LOW/AVG`，默认 `CLOSE`）。
 
 ### 4.4 Chain Activator
@@ -148,8 +154,22 @@ flowchart LR
 - `id`, `idempotency_key`, `description`, `trade_type`, `symbols`, `currency`
 - `conditions_json`, `condition_logic`
 - `trade_action_json`, `next_strategy_id`, `next_strategy_note`, `anchor_price`
+- `upstream_strategy_id`（反向链路，系统维护）
+- `is_deleted`, `deleted_at`（软删除标记与时间）
 - `upstream_only_activation`, `activated_at`, `logical_activated_at`, `expire_in_seconds`
 - `expire_at`, `status`, `created_at`, `updated_at`
+
+链路约束：
+- 每个策略最多一个下游（`next_strategy_id` 单值）；
+- 每个策略最多一个上游（`upstream_strategy_id` 单值）；
+- `next_strategy_id` 与 `upstream_strategy_id` 双向一致；
+- 删除策略时（软删除），引用该策略的上下游指针由数据层同步置空。
+- 删除能力门控：
+- `ACTIVE` 状态不可删除；
+- `PAUSED` 状态不可删除；
+- 存在上游策略（`upstream_strategy_id` 非空）时不可删除；
+- 存在活动交易指令（`trade_instructions.is_active=1`，表示交易未终止）时不可删除。
+- 查询层使用 SQLite 视图 `v_strategies_active`（`is_deleted=0`）屏蔽已删除策略。
 
 `symbols[*]` 结构：
 - `code`（产品代码）
@@ -354,7 +374,7 @@ flowchart LR
 1. 策略列表页（`strategies.html`）：
 - 仅显示摘要字段：`id`、`status`、`description`、`updated_at`、`expire_at`
 - 不返回 `conditions_json`、`trade_action_json` 明细到列表组件
-- 返回 `capabilities`（如 `can_activate/can_cancel`）用于按钮可用性控制
+- 返回 `capabilities`（如 `can_activate/can_cancel/can_delete`）用于按钮可用性控制
 
 2. 策略详情页（`strategy-detail.html`）：
 - 已配置策略：返回完整结构 `conditions_json`、`trade_action_json`、`next_strategy_id`、`anchor_price`
@@ -424,12 +444,12 @@ flowchart LR
 1. `GET /v1/strategies`（列表页）
 - 返回数组项最小字段：
   - `id`、`status`、`description`、`updated_at`、`expire_at`
-  - `capabilities.can_activate`、`capabilities.can_cancel`
+  - `capabilities.can_activate`、`capabilities.can_cancel`、`capabilities.can_delete`
 
 2. `GET /v1/strategies/{id}`（详情页）
 - 最小字段：
   - 基本信息：`id`、`description`、`trade_type`、`symbols`、`currency`、`upstream_only_activation`、`activated_at`、`expire_in_seconds`、`expire_at`、`status`
-  - 编辑与操作能力：`editable`、`editable_reason`、`capabilities(can_activate/can_pause/can_resume/can_cancel)`、`capability_reasons`
+  - 编辑与操作能力：`editable`、`editable_reason`、`capabilities(can_activate/can_pause/can_resume/can_cancel/can_delete)`、`capability_reasons`
   - `can_activate=false` 的典型原因：`upstream_only_activation=true`、条件未配置、后续动作未配置
   - 触发条件：`condition_logic`、`conditions_json[*]`（含 `condition_nl`）
   - 条件运行态：`trigger_group_status`、`conditions_runtime[*]`
@@ -448,26 +468,26 @@ flowchart LR
 
 5. `PUT /v1/strategies/{id}/actions`
 - 请求体：`trade_action_json?`、`next_strategy_id?`、`next_strategy_note?`
-- 响应体：`trade_action_json`、`next_strategy(id/description/status)`、`action_configured=true/false`
+- 响应体：返回更新后的策略详情对象（含 `trade_action_json`、`next_strategy`、`trade_action_runtime`）
 
 6. `GET /v1/portfolio-summary`
 - 响应体：`net_liquidation`、`available_funds`、`daily_pnl`、`updated_at`
 
 7. `GET /v1/positions?sec_type=STK|FUT&symbol=...`（查询参数均可选）
-- 响应体：`items[]`
+- 响应体：数组
   - `sec_type`、`symbol`、`position_qty`、`position_unit`（股/手）
   - `avg_price`、`last_price`、`market_value`、`unrealized_pnl`
   - `updated_at`
 
 8. `GET /v1/trade-instructions/active`
-- 响应体：`items[]`
+- 响应体：数组
   - `updated_at`、`strategy_id`、`trade_id`
   - `instruction_summary`
   - `status`（如 `PENDING_SUBMIT/ORDER_SUBMITTED/PARTIAL_FILL`）
   - `expire_at`
 
 9. `GET /v1/trade-logs`
-- 响应体：`items[]`
+- 响应体：数组
   - `timestamp`、`strategy_id`、`trade_id`、`stage`、`result`、`detail`
 
 ---
@@ -535,7 +555,7 @@ app/
   - `S0: SINGLE_PRODUCT PRICE>=100 + next_strategy_id=S1`
   - `S1: SINGLE_PRODUCT DRAWDOWN_PCT>=0.1 + trade_action + next_strategy_id=S2`
   - `S2: SINGLE_PRODUCT DRAWDOWN_PCT>=0.2 + trade_action`（需求文档 §10 示例 B）。
-- 示例 C（双产品调仓）：`PAIR_PRODUCTS(LIQUIDITY_RATIO/SPREAD) + trade_action`（需求文档 §10 示例 C）。
+- 示例 C（双产品调仓）：`PAIR_PRODUCTS(VOLUME_RATIO/AMOUNT_RATIO/SPREAD) + trade_action`（需求文档 §10 示例 C）。
 - 示例 D（期货展期）：`trade_type=spread + roll handler`（需求文档 §10 示例 D）。
 - 示例 E（上涨比例）：`SINGLE_PRODUCT RALLY_PCT`（需求文档 §10 示例 E）。
 
@@ -545,7 +565,7 @@ app/
 
 - 按 R8 的 19 条 DoD 编写测试：
   - API 用例（创建/查询/三段编辑/取消/激活/暂停/恢复/持仓查询）。
-  - 条件触发用例（绝对价、回撤、上涨、流动性、双产品）。
+  - 条件触发用例（绝对价、回撤、上涨、成交量比值、成交额比值、双产品）。
   - 链式下游激活用例。
   - 展期用例。
   - 核验拒单用例（金额超限、禁 `MKT`）。

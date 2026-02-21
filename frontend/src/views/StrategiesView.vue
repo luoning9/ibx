@@ -3,7 +3,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { cancelStrategy, fetchStrategies } from '../api/services'
+import { deleteStrategy, fetchStrategies } from '../api/services'
 import type { StrategySummary } from '../api/types'
 import { formatIsoDateTime } from '../utils/format'
 
@@ -31,11 +31,11 @@ async function loadStrategies() {
   }
 }
 
-async function onCancel(row: StrategySummary) {
+async function onDelete(row: StrategySummary) {
   try {
-    await ElMessageBox.confirm(`确认取消策略 ${row.id} 吗？`, '取消策略', {
+    await ElMessageBox.confirm(`确认删除策略 ${row.id} 吗？`, '删除策略', {
       type: 'warning',
-      confirmButtonText: '确认',
+      confirmButtonText: '确认删除',
       cancelButtonText: '返回',
     })
   } catch {
@@ -43,11 +43,11 @@ async function onCancel(row: StrategySummary) {
   }
 
   try {
-    await cancelStrategy(row.id)
-    ElMessage.success(`已取消策略 ${row.id}`)
+    await deleteStrategy(row.id)
+    ElMessage.success(`已删除策略 ${row.id}`)
     await loadStrategies()
   } catch (err) {
-    ElMessage.error(`取消失败：${String(err)}`)
+    ElMessage.error(`删除失败：${String(err)}`)
   }
 }
 
@@ -57,6 +57,10 @@ function openDetail(strategyId: string) {
 
 function onRowClick(row: StrategySummary) {
   openDetail(row.id)
+}
+
+function createStrategyEntry() {
+  router.push('/strategies/new')
 }
 
 onMounted(loadStrategies)
@@ -70,7 +74,7 @@ onMounted(loadStrategies)
           <span class="card-title">策略列表</span>
           <el-space>
             <el-button size="small" @click="loadStrategies">刷新</el-button>
-            <el-button type="primary" size="small">新建策略</el-button>
+            <el-button type="primary" size="small" @click="createStrategyEntry">新建策略</el-button>
           </el-space>
         </div>
       </template>
@@ -99,21 +103,16 @@ onMounted(loadStrategies)
         <el-table-column label="最近更新" width="180">
           <template #default="{ row }">{{ formatIsoDateTime(row.updated_at) }}</template>
         </el-table-column>
-        <el-table-column label="过期时间" width="180">
-          <template #default="{ row }">{{ formatIsoDateTime(row.expire_at) }}</template>
-        </el-table-column>
-        <el-table-column label="操作" width="170">
+        <el-table-column label="操作" width="90">
           <template #default="{ row }">
             <el-space>
-              <el-button size="small" @click.stop="openDetail(row.id)">详情</el-button>
               <el-button
                 size="small"
                 type="danger"
-                plain
-                :disabled="!row.capabilities?.can_cancel"
-                @click.stop="onCancel(row)"
+                :disabled="!row.capabilities?.can_delete"
+                @click.stop="onDelete(row)"
               >
-                取消
+                删除
               </el-button>
             </el-space>
           </template>

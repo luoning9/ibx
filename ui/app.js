@@ -29,7 +29,8 @@ const METRIC_TRIGGER_RULES = {
   PRICE: ["LEVEL_GTE", "LEVEL_LTE", "CROSS_UP", "CROSS_DOWN"],
   DRAWDOWN_PCT: ["LEVEL_GTE"],
   RALLY_PCT: ["LEVEL_GTE"],
-  LIQUIDITY_RATIO: ["LEVEL_GTE", "LEVEL_LTE"],
+  VOLUME_RATIO: ["LEVEL_GTE", "LEVEL_LTE"],
+  AMOUNT_RATIO: ["LEVEL_GTE", "LEVEL_LTE"],
   SPREAD: ["LEVEL_GTE", "LEVEL_LTE", "CROSS_UP", "CROSS_DOWN"],
 };
 
@@ -48,7 +49,8 @@ const METRIC_OPTIONS_BY_TYPE = {
     },
   ],
   PAIR_PRODUCTS: [
-    { metric: "LIQUIDITY_RATIO", label: "流动性比值（LIQUIDITY_RATIO）", priceReference: "" },
+    { metric: "VOLUME_RATIO", label: "成交量比值（VOLUME_RATIO）", priceReference: "" },
+    { metric: "AMOUNT_RATIO", label: "成交额比值（AMOUNT_RATIO）", priceReference: "" },
     { metric: "SPREAD", label: "价差（SPREAD）", priceReference: "" },
   ],
 };
@@ -58,8 +60,20 @@ const METRIC_VALUE_TYPES = {
   SPREAD: "USD",
   DRAWDOWN_PCT: "RATIO",
   RALLY_PCT: "RATIO",
-  LIQUIDITY_RATIO: "RATIO",
+  VOLUME_RATIO: "RATIO",
+  AMOUNT_RATIO: "RATIO",
 };
+
+const FAST_EVALUATION_WINDOWS = ["1m", "2m", "5m"];
+const RATIO_EVALUATION_WINDOWS = ["1h", "2h", "4h", "1d", "2d", "5d"];
+
+function isRatioMetric(metric) {
+  return metric === "VOLUME_RATIO" || metric === "AMOUNT_RATIO";
+}
+
+function getEvaluationWindowOptions(metric) {
+  return isRatioMetric(metric) ? RATIO_EVALUATION_WINDOWS : FAST_EVALUATION_WINDOWS;
+}
 
 function getConditionType(row) {
   const checkedTypeRadio = row.querySelector(".condition-type-radio:checked");
@@ -154,6 +168,21 @@ function syncValueFieldByMetric(row) {
   valueTypeInput.value = valueType;
 }
 
+function renderEvaluationWindowsByMetric(row, preferredWindow) {
+  const metricSelect = row.querySelector(".metric-select");
+  const evaluationWindowSelect = row.querySelector(".evaluation-window-select");
+  if (!metricSelect || !evaluationWindowSelect) return;
+
+  const options = getEvaluationWindowOptions(metricSelect.value);
+  const finalValue = options.includes(preferredWindow) ? preferredWindow : options[0];
+  evaluationWindowSelect.innerHTML = options
+    .map((windowValue) => {
+      const selected = windowValue === finalValue ? " selected" : "";
+      return `<option value="${windowValue}"${selected}>${windowValue}</option>`;
+    })
+    .join("");
+}
+
 function conditionRowTemplate(conditionId) {
   const typeName = `condition-type-${conditionId}`;
   return `
@@ -188,7 +217,7 @@ function conditionRowTemplate(conditionId) {
         </div>
         <div class="col-md-2">
           <label class="form-label small mb-1">evaluation_window</label>
-          <select class="form-select form-select-sm">
+          <select class="form-select form-select-sm evaluation-window-select">
             <option>1m</option>
             <option>2m</option>
             <option>5m</option>
@@ -246,6 +275,7 @@ function addConditionRow() {
   const row = conditionsContainer.lastElementChild;
   if (row) {
     renderMetricOptionsByType(row);
+    renderEvaluationWindowsByMetric(row);
     renderTriggerRulesByMetric(row);
     syncValueFieldByMetric(row);
     syncConditionSpecificFields(row);
@@ -296,13 +326,17 @@ if (conditionsContainer && addConditionBtn) {
 
     if (event.target.classList.contains("condition-type-radio")) {
       const previousMetric = row.querySelector(".metric-select")?.value;
+      const previousWindow = row.querySelector(".evaluation-window-select")?.value;
       renderMetricOptionsByType(row, previousMetric);
+      renderEvaluationWindowsByMetric(row, previousWindow);
       renderTriggerRulesByMetric(row);
       syncValueFieldByMetric(row);
       syncConditionSpecificFields(row);
     }
 
     if (event.target.classList.contains("metric-select")) {
+      const previousWindow = row.querySelector(".evaluation-window-select")?.value;
+      renderEvaluationWindowsByMetric(row, previousWindow);
       renderTriggerRulesByMetric(row);
       syncValueFieldByMetric(row);
       syncConditionSpecificFields(row);

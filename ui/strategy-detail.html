@@ -209,20 +209,20 @@
                   <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
                     <div class="small">
                       <span class="text-muted">规则表达式：</span>
-                      <code>liquidity(SLV) / liquidity(GLD) &gt;= 1.2</code>
+                      <code>volume(SLV) / volume(GLD) &gt;= 1.2</code>
                     </div>
                     <span class="condition-state is-false">未满足</span>
                   </div>
                   <div class="small">
                     <span class="text-muted">自然语言：</span>
-                    当 <code>SLV</code> 的流动性至少是 <code>GLD</code> 的 <code>1.2</code> 倍时满足该条件。
+                    当 <code>SLV</code> 的成交量至少是 <code>GLD</code> 的 <code>1.2</code> 倍时满足该条件。
                   </div>
                   <div class="condition-meta d-flex flex-wrap gap-2 mt-2">
                     <span class="meta-pill">ID: c2</span>
                     <span class="meta-pill">双产品</span>
-                    <span class="meta-pill">LIQUIDITY_RATIO</span>
+                    <span class="meta-pill">VOLUME_RATIO</span>
                     <span class="meta-pill">LEVEL</span>
-                    <span class="meta-pill">window: 1m</span>
+                    <span class="meta-pill">window: 1d</span>
                     <span class="meta-pill">price_basis: CLOSE</span>
                   </div>
                 </div>
@@ -272,11 +272,11 @@
   },
   {
     "condition_id": "c2",
-    "condition_nl": "当 SLV 的流动性至少是 GLD 的 1.2 倍时满足该条件。",
+    "condition_nl": "当 SLV 的成交量至少是 GLD 的 1.2 倍时满足该条件。",
     "condition_type": "PAIR_PRODUCTS",
-    "metric": "LIQUIDITY_RATIO",
+    "metric": "VOLUME_RATIO",
     "trigger_mode": "LEVEL",
-    "evaluation_window": "1m",
+    "evaluation_window": "1d",
     "window_price_basis": "CLOSE",
     "operator": ">=",
     "value": 1.2,

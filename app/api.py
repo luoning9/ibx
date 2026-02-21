@@ -78,6 +78,11 @@ def cancel_strategy(strategy_id: str) -> ControlResponse:
     return store.cancel(strategy_id)
 
 
+@router.delete("/strategies/{strategy_id}", response_model=ControlResponse)
+def delete_strategy(strategy_id: str) -> ControlResponse:
+    return store.delete_strategy(strategy_id)
+
+
 @router.get("/strategies/{strategy_id}/events", response_model=list[EventLogItem])
 def strategy_events(strategy_id: str) -> list[EventLogItem]:
     return store.strategy_events(strategy_id)
@@ -112,4 +117,3 @@ def positions(
     symbol: str | None = Query(default=None),
 ) -> list[PositionItemOut]:
     return store.positions(sec_type=sec_type, symbol=symbol)
-

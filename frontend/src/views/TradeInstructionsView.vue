@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 
 import { fetchActiveTradeInstructions, fetchTradeLogs } from '../api/services'
 import type { ActiveTradeInstruction, TradeLogItem } from '../api/types'
 import { formatIsoDateTime } from '../utils/format'
 
+const router = useRouter()
 const activeRows = ref<ActiveTradeInstruction[]>([])
 const logs = ref<TradeLogItem[]>([])
 const loading = ref(false)
@@ -34,6 +36,10 @@ async function loadTradeData() {
   }
 }
 
+function openStrategyDetail(strategyId: string) {
+  router.push(`/strategies/${strategyId}`)
+}
+
 onMounted(loadTradeData)
 </script>
 
@@ -61,7 +67,13 @@ onMounted(loadTradeData)
         <el-table-column label="更新时间" width="180">
           <template #default="{ row }">{{ formatIsoDateTime(row.updated_at) }}</template>
         </el-table-column>
-        <el-table-column prop="strategy_id" label="strategy_id" width="120" />
+        <el-table-column label="strategy_id" width="120" class-name="strategy-id-col" label-class-name="strategy-id-header">
+          <template #default="{ row }">
+            <el-link class="strategy-id-link" type="primary" @click="openStrategyDetail(row.strategy_id)">
+              {{ row.strategy_id }}
+            </el-link>
+          </template>
+        </el-table-column>
         <el-table-column prop="trade_id" label="trade_id" width="190" />
         <el-table-column prop="instruction_summary" label="指令摘要" min-width="260" />
         <el-table-column label="状态" width="170">
@@ -106,5 +118,11 @@ onMounted(loadTradeData)
 
 .mb-12 {
   margin-bottom: 12px;
+}
+
+:deep(.strategy-id-header .cell),
+:deep(.strategy-id-col .cell),
+:deep(.strategy-id-link) {
+  white-space: nowrap;
 }
 </style>
