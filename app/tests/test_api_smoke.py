@@ -543,8 +543,8 @@ def test_delete_strategy_with_active_trade_instruction_is_rejected() -> None:
         conn.execute(
             """
             INSERT INTO trade_instructions (
-              trade_id, strategy_id, instruction_summary, status, expire_at, updated_at, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, 1)
+              trade_id, strategy_id, instruction_summary, status, expire_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 f"T-{uuid4().hex[:8].upper()}",

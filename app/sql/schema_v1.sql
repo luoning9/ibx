@@ -75,18 +75,6 @@ CREATE TABLE IF NOT EXISTS strategy_events (
   detail TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS strategy_activations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  from_strategy_id TEXT NOT NULL REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
-  to_strategy_id TEXT NOT NULL REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
-  trigger_event_id INTEGER NOT NULL REFERENCES strategy_events(id) ON UPDATE CASCADE ON DELETE RESTRICT,
-  effective_activated_at TEXT NOT NULL,
-  market_snapshot_json TEXT NOT NULL CHECK (json_valid(market_snapshot_json)),
-  context_json TEXT NOT NULL DEFAULT "{}" CHECK (json_valid(context_json)),
-  created_at TEXT NOT NULL,
-  UNIQUE (trigger_event_id, to_strategy_id)
-);
-
 CREATE TABLE IF NOT EXISTS condition_states (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   strategy_id TEXT NOT NULL REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
@@ -150,8 +138,7 @@ CREATE TABLE IF NOT EXISTS trade_instructions (
   instruction_summary TEXT NOT NULL,
   status TEXT NOT NULL,
   expire_at TEXT,
-  updated_at TEXT NOT NULL,
-  is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
@@ -188,8 +175,6 @@ CREATE INDEX IF NOT EXISTS idx_strategy_symbols_code
 
 CREATE INDEX IF NOT EXISTS idx_strategy_events_strategy_ts
   ON strategy_events (strategy_id, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_strategy_activations_to_strategy
-  ON strategy_activations (to_strategy_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_condition_states_strategy
   ON condition_states (strategy_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_strategy_runs_strategy_eval
@@ -201,8 +186,8 @@ CREATE INDEX IF NOT EXISTS idx_verification_events_strategy_ts
   ON verification_events (strategy_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trade_logs_ts
   ON trade_logs (timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_trade_instructions_active_updated
-  ON trade_instructions (is_active, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_instructions_status_updated
+  ON trade_instructions (status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_updated
   ON portfolio_snapshots (updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_positions_updated

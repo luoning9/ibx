@@ -36,6 +36,7 @@ from .models import (
 )
 
 TERMINAL_STATUSES: set[str] = {"FILLED", "EXPIRED", "CANCELLED", "FAILED"}
+TRADE_INSTRUCTION_TERMINAL_STATUSES: tuple[str, ...] = ("FILLED", "CANCELLED", "FAILED", "EXPIRED")
 EDITABLE_STATUSES: set[str] = {"PENDING_ACTIVATION", "PAUSED"}
 STOCK_TRADE_TYPES: set[str] = {"buy", "sell", "switch"}
 ACTIVE_STRATEGIES_SOURCE = "v_strategies_active"
@@ -381,10 +382,11 @@ class SQLiteStore:
             """
             SELECT 1
             FROM trade_instructions
-            WHERE strategy_id = ? AND is_active = 1
+            WHERE strategy_id = ?
+              AND status NOT IN (?, ?, ?, ?)
             LIMIT 1
             """,
-            (strategy_id,),
+            (strategy_id, *TRADE_INSTRUCTION_TERMINAL_STATUSES),
         ).fetchone()
         return row is not None
 
@@ -561,8 +563,9 @@ class SQLiteStore:
                     """
                     SELECT DISTINCT strategy_id
                     FROM trade_instructions
-                    WHERE is_active = 1
-                    """
+                    WHERE status NOT IN (?, ?, ?, ?)
+                    """,
+                    TRADE_INSTRUCTION_TERMINAL_STATUSES,
                 ).fetchall()
             }
             out: list[StrategySummaryOut] = []
@@ -585,6 +588,7 @@ class SQLiteStore:
                         description=row["description"],
                         updated_at=parse_iso(row["updated_at"]) or utcnow(),
                         expire_at=self._effective_expire_at(row),
+                        upstream_strategy_id=_normalize_strategy_id(row["upstream_strategy_id"]),
                         capabilities=caps,
                     )
                 )
@@ -1021,14 +1025,6 @@ class SQLiteStore:
             )
             conn.execute(
                 """
-                UPDATE trade_instructions
-                SET is_active = 0, updated_at = ?
-                WHERE strategy_id = ? AND is_active = 1
-                """,
-                (now_iso, strategy_id),
-            )
-            conn.execute(
-                """
                 UPDATE strategies
                 SET status = 'CANCELLED',
                     next_strategy_id = NULL,
@@ -1081,9 +1077,10 @@ class SQLiteStore:
                 """
                 SELECT updated_at, strategy_id, trade_id, instruction_summary, status, expire_at
                 FROM trade_instructions
-                WHERE is_active = 1
+                WHERE status NOT IN (?, ?, ?, ?)
                 ORDER BY updated_at DESC
-                """
+                """,
+                TRADE_INSTRUCTION_TERMINAL_STATUSES,
             ).fetchall()
             return [
                 ActiveTradeInstructionOut(

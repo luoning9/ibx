@@ -128,9 +128,16 @@ const lockedSideText = computed(() => sideLabel(lockedSide.value))
 
 const nextStrategyChoices = computed(() => {
   const selfId = strategyId.value.toUpperCase()
+  const currentNextId = detail.value?.next_strategy?.id?.toUpperCase() || ''
   return strategyOptions.value
     .filter((row) => row.id.toUpperCase() !== selfId)
     .filter((row) => row.status === 'PENDING_ACTIVATION')
+    .filter((row) => {
+      const upstreamId = (row.upstream_strategy_id || '').toUpperCase()
+      if (!upstreamId) return true
+      // Keep currently linked downstream visible for no-op edits.
+      return row.id.toUpperCase() === currentNextId && upstreamId === selfId
+    })
     .map((row) => ({
       id: row.id,
       label: row.id,
@@ -308,7 +315,7 @@ async function loadDetail() {
       const allowed = new Set(nextStrategyChoices.value.map((item) => item.id.toUpperCase()))
       if (form.nextStrategyId && !allowed.has(form.nextStrategyId.toUpperCase())) {
         form.nextStrategyId = ''
-        ElMessage.warning('当前下游策略不是 PENDING_ACTIVATION 状态，已清空，请重新选择。')
+        ElMessage.warning('当前下游策略不可选（已有关联上游或状态不允许），已清空，请重新选择。')
       }
     } catch {
       strategyOptions.value = []

@@ -228,6 +228,7 @@ class StrategySummaryOut(BaseModel):
     description: str
     updated_at: datetime
     expire_at: datetime | None = None
+    upstream_strategy_id: str | None = None
     capabilities: Capabilities
 
 

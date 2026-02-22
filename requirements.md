@@ -60,7 +60,7 @@
 - `expire_at` 或 `expire_in_seconds`（二选一）
 - `next_strategy_id`（可选，下游策略 ID；为空表示无后续策略）
 - `upstream_strategy_id`（只读，系统反向维护的上游策略 ID）
-- `upstream_only_activation`（`true` 表示禁止手动激活，仅允许由上游策略激活）
+- `upstream_only_activation`（`true` 表示禁止手动激活，仅允许由上游策略激活；当策略成为下游时系统强制为 `true`）
 
 `symbols` 列表项结构：
 - `code`：产品代码（如 `SLV`）
@@ -123,7 +123,8 @@
 - `PAUSED` 状态不可删除。
 - 若存在上游策略（`upstream_strategy_id` 非空），不可删除。
 - 若存在未终止交易（如仍有活动中的交易指令），不可删除。
-- 手动激活策略（仅当 `upstream_only_activation=false` 时允许）。
+- 手动激活策略（仅当 `upstream_only_activation=false` 且 `upstream_strategy_id` 为空时允许）。
+- 若策略存在上游（`upstream_strategy_id` 非空），系统必须拒绝手动激活。
 - 手动暂停策略（仅 `ACTIVE` 可暂停，暂停后转 `PAUSED`）。
 - 手动恢复策略（仅 `PAUSED` 可恢复，恢复后转 `ACTIVE`）。
 
@@ -212,6 +213,7 @@
 - `触发条件编辑`：支持 `window_price_basis` 下拉（收盘/最高/最低/平均），默认收盘价。
 - `触发条件编辑`：`触发判定`选项需按 `metric` 动态约束，避免无效组合。
 - `后续动作编辑`：编辑 `trade_action` 与 `next_strategy_id`（链式控制）。
+- `后续动作编辑`：`next_strategy_id` 候选必须过滤为“无上游策略（`upstream_strategy_id` 为空）且状态可链接”的策略；已有关联上游的策略不可选择。
 - `触发条件编辑`与`后续动作编辑`仅在策略状态为 `PENDING_ACTIVATION` 或 `PAUSED` 时允许。
 - 当状态为 `ACTIVE` 时，需先暂停后再编辑。
 - “新增策略”时只进入 `基本信息编辑`；保存后进入该策略详情页，初始状态不含触发条件和后续动作。
@@ -237,6 +239,7 @@
 - `后续动作`区块与`触发条件`区块一致，使用单一表头按钮；文案按是否已配置在“编辑/设置后续动作”间切换。
 - 包含该策略的 `事件日志`（时间、事件类型、详情）。
 - 在基础信息区域提供策略操作按钮：`取消执行` / `暂停执行` / `恢复执行` / `激活策略`（按当前状态控制可用性）。
+- 对下游策略（`upstream_strategy_id` 非空），`激活策略`按钮必须禁用并展示“仅允许上游激活”的原因提示。
 - 编辑入口在 `PENDING_ACTIVATION` / `PAUSED` 可用，其它状态禁用。
 
 运行事件页要求：
@@ -326,7 +329,9 @@ verification:
 一致性要求：
 - 同一上游触发事件对同一下游只能激活一次（防重复）。
 - 禁止策略环路（A->B->A）。
-- `upstream_only_activation=true` 的策略只能由上游触发激活，任何手动激活请求必须拒绝。
+- 只要策略存在上游（`upstream_strategy_id` 非空），即视为下游策略，必须禁止手动激活。
+- 当策略被设置为下游（`upstream_strategy_id` 写入）时，系统必须自动将 `upstream_only_activation` 置为 `true`。
+- 在“每个策略最多一个上游 + 下游禁止手动激活 + 策略只激活一次”的约束下，若策略已激活且 `upstream_strategy_id` 非空，可判定该策略由该上游激活。
 - 对于使用 `price_reference=HIGHEST_SINCE_ACTIVATION/LOWEST_SINCE_ACTIVATION` 的策略，必须以 `logical_activated_at` 为统计起点，而非仅以数据库落库时间为起点。
 
 ---

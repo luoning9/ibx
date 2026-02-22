@@ -293,7 +293,6 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
 
         if clean_all:
             # Reset all runtime rows first, then insert a clean sample dataset.
-            cur.execute("DELETE FROM strategy_activations")
             cur.execute("DELETE FROM condition_states")
             cur.execute("DELETE FROM strategy_runs")
             cur.execute("DELETE FROM verification_events")
@@ -307,9 +306,6 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
             cur.execute("DELETE FROM portfolio_snapshots")
         else:
             # Compatibility mode: only refresh SMP-* sample rows.
-            cur.execute(
-                "DELETE FROM strategy_activations WHERE from_strategy_id LIKE 'SMP-%' OR to_strategy_id LIKE 'SMP-%'"
-            )
             cur.execute(
                 "DELETE FROM condition_states WHERE strategy_id LIKE 'SMP-%'"
             )
@@ -406,17 +402,8 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                 ),
             )
 
-        # Seed strategy events and keep IDs for chain activation relation.
-        cur.execute(
-            """
-            INSERT INTO strategy_events (strategy_id, timestamp, event_type, detail)
-            VALUES (?, ?, ?, ?)
-            """,
-            ("SMP-B0", to_iso(now - timedelta(hours=1, minutes=20)), "TRIGGERED", "触发条件满足：SLV >= 100"),
-        )
-        b0_trigger_event_id = cur.lastrowid
-
         event_rows = [
+            ("SMP-B0", to_iso(now - timedelta(hours=1, minutes=20)), "TRIGGERED", "触发条件满足：SLV >= 100"),
             ("SMP-B0", to_iso(now - timedelta(hours=1, minutes=19)), "DOWNSTREAM_ACTIVATED", "激活下游策略 SMP-B1"),
             ("SMP-B1", to_iso(now - timedelta(hours=1, minutes=15)), "ACTIVATED", "由上游策略 SMP-B0 激活"),
             ("SMP-B1", to_iso(now - timedelta(minutes=50)), "ORDER_SUBMITTED", "提交卖出订单 T-SMP-0001"),
@@ -430,24 +417,6 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
             VALUES (?, ?, ?, ?)
             """,
             event_rows,
-        )
-
-        cur.execute(
-            """
-            INSERT INTO strategy_activations (
-                from_strategy_id, to_strategy_id, trigger_event_id, effective_activated_at,
-                market_snapshot_json, context_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "SMP-B0",
-                "SMP-B1",
-                b0_trigger_event_id,
-                to_iso(now - timedelta(hours=1, minutes=20)),
-                dumps_json({"SLV": {"last": 100.6, "high": 101.24, "low": 99.85}}),
-                dumps_json({"anchor_price": 101.24}),
-                to_iso(now - timedelta(hours=1, minutes=19)),
-            ),
         )
 
         condition_state_rows = [
@@ -579,7 +548,6 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                 "ORDER_SUBMITTED",
                 to_iso(now.replace(hour=16, minute=0, second=0, microsecond=0)),
                 to_iso(now - timedelta(minutes=5)),
-                1,
             ),
             (
                 "T-SMP-0002",
@@ -588,14 +556,13 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                 "PARTIAL_FILL",
                 to_iso(now.replace(hour=16, minute=0, second=0, microsecond=0)),
                 to_iso(now - timedelta(minutes=2)),
-                1,
             ),
         ]
         cur.executemany(
             """
             INSERT INTO trade_instructions (
-                trade_id, strategy_id, instruction_summary, status, expire_at, updated_at, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                trade_id, strategy_id, instruction_summary, status, expire_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             trade_instruction_rows,
         )
