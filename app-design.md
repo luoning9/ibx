@@ -76,7 +76,7 @@ flowchart LR
 - 控制操作：
   - `POST /v1/strategies/{id}/cancel`：取消（R4.2）。
   - `DELETE /v1/strategies/{id}`：删除（软删除，R4.2）。
-  - `POST /v1/strategies/{id}/activate`：手动激活（仅 `upstream_only_activation=false` 时允许，R4.2, R4.10）。
+  - `POST /v1/strategies/{id}/activate`：手动激活（仅 `upstream_only_activation=false` 且 `upstream_strategy_id` 为空时允许，R4.2, R4.10）。
   - `POST /v1/strategies/{id}/pause`：暂停（仅 `ACTIVE` 时允许，R4.2）。
   - `POST /v1/strategies/{id}/resume`：恢复（仅 `PAUSED` 时允许，R4.2）。
 - 日志与辅助查询：
@@ -123,7 +123,7 @@ flowchart LR
 - 写入激活行情快照（如 `last/high/low`）并在延迟激活时做区间补偿（R4.10）。
 - 同一触发事件对同一下游仅激活一次（R4.10）。
 - 启动时做 DAG 校验，拒绝环路（R4.10）。
-- 若下游 `upstream_only_activation=true`，仅允许 Chain Activator 激活（R4.10）。
+- 下游策略（`upstream_strategy_id` 非空）强制 `upstream_only_activation=true`，仅允许 Chain Activator 激活（R4.10）。
 
 ### 4.5 Risk Engine
 - 账户、产品币种、交易时段、展期交割风险等风控（R4.4, R4.8, R6）。
@@ -163,12 +163,15 @@ flowchart LR
 - 每个策略最多一个下游（`next_strategy_id` 单值）；
 - 每个策略最多一个上游（`upstream_strategy_id` 单值）；
 - `next_strategy_id` 与 `upstream_strategy_id` 双向一致；
+- 当策略存在上游（`upstream_strategy_id` 非空）时，系统强制 `upstream_only_activation=true`；
+- 存在上游策略（`upstream_strategy_id` 非空）时，手动激活请求必须拒绝；
+- 在“每个策略最多一个上游 + 下游禁止手动激活 + 策略只激活一次”的约束下，若策略已激活且 `upstream_strategy_id` 非空，可判定该策略由该上游激活；
 - 删除策略时（软删除），引用该策略的上下游指针由数据层同步置空。
 - 删除能力门控：
 - `ACTIVE` 状态不可删除；
 - `PAUSED` 状态不可删除；
 - 存在上游策略（`upstream_strategy_id` 非空）时不可删除；
-- 存在活动交易指令（`trade_instructions.is_active=1`，表示交易未终止）时不可删除。
+- 存在活动交易指令（`trade_instructions.status` 非终态，表示交易未终止）时不可删除。
 - 查询层使用 SQLite 视图 `v_strategies_active`（`is_deleted=0`）屏蔽已删除策略。
 
 `symbols[*]` 结构：
@@ -179,7 +182,7 @@ flowchart LR
 - `trade_type in {buy,sell,switch}`：`symbols[*].trade_type` 仅允许 `buy/sell/ref`；
 - `trade_type in {open,close,spread}`：`symbols[*].trade_type` 仅允许 `open/close/ref`。
 
-### 5.6 `trade_action_json` 结构
+### 5.2 `trade_action_json` 结构
 - `action_type`：`STOCK_TRADE` / `FUT_POSITION` / `FUT_ROLL`
 - `quantity`：统一数量
 - `tif`：固定 `DAY`
@@ -211,7 +214,7 @@ flowchart LR
 - `trade_action_json` 可为空，表示该策略只负责激活下游策略（R4.12）。
 - `trade_type in {buy,sell,switch}` 仅允许 `action_type=STOCK_TRADE`；`trade_type in {open,close,spread}` 仅允许 `FUT_POSITION/FUT_ROLL`（R4.12）。
 
-### 5.7 `conditions_json` 条件项结构
+### 5.3 `conditions_json` 条件项结构
 - `condition_id`
 - `condition_nl`（系统生成，只读）
 - `condition_type`
@@ -224,20 +227,16 @@ flowchart LR
 - `product` 或 `product_a/product_b`
 - `price_reference`（比例类指标，按 `metric` 联动：`DRAWDOWN_PCT->HIGHEST_SINCE_ACTIVATION`，`RALLY_PCT->LOWEST_SINCE_ACTIVATION`）
 
-### 5.2 `strategy_activations`
-- `id`, `from_strategy_id`, `to_strategy_id`, `trigger_event_id`, `effective_activated_at`, `market_snapshot_json`, `context_json`, `created_at`
-- 唯一约束：`(trigger_event_id, to_strategy_id)`（R4.10）
-
-### 5.3 `orders`
+### 5.4 `orders`
 - `id`, `strategy_id`, `ib_order_id`, `status`, `qty`, `avg_fill_price`, `filled_qty`, `error_message`, `created_at`, `updated_at`
 
-### 5.4 `verification_events`
+### 5.5 `verification_events`
 - `id`, `strategy_id`, `rule_id`, `rule_version`, `passed`, `reason`, `order_snapshot_json`, `created_at`
 
-### 5.5 `strategy_runs`
+### 5.6 `strategy_runs`
 - `id`, `strategy_id`, `evaluated_at`, `condition_met`, `decision_reason`, `metrics_json`
 
-### 5.8 `condition_states`（读模型，可选）
+### 5.7 `condition_states`（读模型，可选）
 - `id`, `strategy_id`, `condition_id`, `state`, `last_value`, `last_evaluated_at`, `updated_at`
 - `state`：`TRUE` / `FALSE` / `WAITING` / `NOT_EVALUATED`
 - 用于详情页“条件是否满足”与“条件组状态”快速读取（R4.13）
@@ -280,7 +279,7 @@ flowchart LR
 6. 幂等检查：`idempotency_key` 冲突返回已有记录（R4.6）。
 
 ### 7.2 激活策略
-1. 手动激活请求到达时，若 `upstream_only_activation=true` 则拒绝（R4.2, R4.10）。
+1. 手动激活请求到达时，若 `upstream_only_activation=true` 或 `upstream_strategy_id` 非空则拒绝（R4.2, R4.10）。
 2. 激活前完整性校验：
 - `conditions_json` 至少 1 条；
 - `trade_action_json` 与 `next_strategy_id` 至少存在一个（避免空动作激活）。
@@ -304,8 +303,11 @@ flowchart LR
 - 校验 `trade_type` 与 `action_type` 匹配；
 - `order_type=LMT` 时对应限价必填；
 - 同时支持“仅交易”“仅激活下游”“交易+激活下游”。
+  - 当 `next_strategy_id` 指向下游时，系统同步写入下游 `upstream_strategy_id`，并强制下游 `upstream_only_activation=true`。
+  - 下游候选选择仅允许 `upstream_strategy_id` 为空的策略；已有上游的策略不可被选为新的下游。
 5. `PATCH basic`：
 - 支持更新 `description`、过期方式、`upstream_only_activation` 等；
+- 若策略当前存在上游（`upstream_strategy_id` 非空），不允许将 `upstream_only_activation` 改为 `false`；
 - `expire_in_seconds` 相对时间仍以“激活时”计算绝对到期（R4.5）。
 
 ### 7.3 监测与触发
@@ -450,7 +452,7 @@ flowchart LR
 - 最小字段：
   - 基本信息：`id`、`description`、`trade_type`、`symbols`、`currency`、`upstream_only_activation`、`activated_at`、`expire_in_seconds`、`expire_at`、`status`
   - 编辑与操作能力：`editable`、`editable_reason`、`capabilities(can_activate/can_pause/can_resume/can_cancel/can_delete)`、`capability_reasons`
-  - `can_activate=false` 的典型原因：`upstream_only_activation=true`、条件未配置、后续动作未配置
+  - `can_activate=false` 的典型原因：`upstream_only_activation=true`、`upstream_strategy_id` 非空（下游策略）、条件未配置、后续动作未配置
   - 触发条件：`condition_logic`、`conditions_json[*]`（含 `condition_nl`）
   - 条件运行态：`trigger_group_status`、`conditions_runtime[*]`
   - 后续动作：`trade_action_json`、`trade_action_runtime(trade_status/trade_id/last_error)`、`next_strategy(id/description/status)`

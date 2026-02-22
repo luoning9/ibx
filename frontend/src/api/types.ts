@@ -23,6 +23,7 @@ export type StrategySummary = {
   description: string
   updated_at: string
   expire_at: string | null
+  upstream_strategy_id: string | null
   capabilities: {
     can_activate: boolean
     can_pause: boolean
