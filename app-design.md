@@ -52,7 +52,6 @@ flowchart LR
     I --> L[Order/Fill Events]
     L --> B
     C --> M[Expiry Handler]
-    C --> N[Roll Handler]
     E --> O[Chain Activator]
     O --> B
 ```
@@ -91,7 +90,7 @@ flowchart LR
 ### 4.2 Scheduler/Worker
 - 周期拉取 `ACTIVE` 策略（含已激活上下文）评估触发（R4.3, R4.10）。
 - 执行到期中止（R4.5）。
-- 执行期货展期检查（R4.8）。
+- 触发后将 `FUT_ROLL` 交易动作交由 Execution Engine 分支执行（R4.8）。
 - `PAUSED` 策略不参与触发评估（R4.2, R4.3）。
 
 ### 4.3 Trigger Evaluator
@@ -143,6 +142,7 @@ flowchart LR
 - 把 `trade_action` 转成订单请求并发给 IB（R4.4, R4.12）。
 - 统一按数量下单（`quantity`），不做名义金额换算（R4.4）。
 - 统一按 `TIF=DAY` 发单；`allow_overnight=true` 时附带隔夜时段成交标记（R4.12）。
+- `FUT_ROLL` 作为执行层内部工作流处理“先平后开”，不单独拆分模块（R4.8）。
 - 订阅并回写订单/成交状态（R4.4）。
 
 ---
@@ -334,7 +334,7 @@ flowchart LR
 - `cancel_on_expiry` 缺省按 `false` 处理。
 - `PAUSED` 状态下到期计时继续，不冻结 `expire_at`。
 
-### 7.6 期货展期
+### 7.6 执行层内的期货展期分支
 1. 识别待切换/目标合约。
 2. 满足条件后执行“先平后开”（R4.8）。
 3. 展期只执行一次，失败告警并记录（R4.8, R5.3）。
@@ -537,7 +537,6 @@ app/
   risk.py
   verification.py
   chain.py
-  roll.py
   ib_adapter.py
   tests/
 ```
@@ -556,7 +555,7 @@ app/
   - `S1: SINGLE_PRODUCT DRAWDOWN_PCT>=0.1 + trade_action + next_strategy_id=S2`
   - `S2: SINGLE_PRODUCT DRAWDOWN_PCT>=0.2 + trade_action`（需求文档 §10 示例 B）。
 - 示例 C（双产品调仓）：`PAIR_PRODUCTS(VOLUME_RATIO/AMOUNT_RATIO/SPREAD) + trade_action`（需求文档 §10 示例 C）。
-- 示例 D（期货展期）：`trade_type=spread + roll handler`（需求文档 §10 示例 D）。
+- 示例 D（期货展期）：`trade_type=spread + execution branch(FUT_ROLL)`（需求文档 §10 示例 D）。
 - 示例 E（上涨比例）：`SINGLE_PRODUCT RALLY_PCT`（需求文档 §10 示例 E）。
 
 ---
