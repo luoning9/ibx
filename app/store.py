@@ -10,6 +10,15 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from .db import get_connection, init_db
+from .broker_provider_registry import (
+    close_shared_broker_data_provider,
+    get_shared_broker_data_provider,
+    reset_shared_broker_data_provider,
+)
+from .ib_data_service import (
+    AccountSnapshot,
+    IBDataServiceError,
+)
 from .market_config import resolve_market_profile
 from .models import (
     ActiveTradeInstructionOut,
@@ -216,6 +225,17 @@ class SQLiteStore:
 
     def _conn(self) -> sqlite3.Connection:
         return get_connection()
+
+    def _load_broker_snapshot(self) -> AccountSnapshot:
+        try:
+            provider = get_shared_broker_data_provider()
+            return provider.get_account_snapshot()
+        except (IBDataServiceError, ValueError, RuntimeError, TimeoutError) as exc:
+            reset_shared_broker_data_provider()
+            raise HTTPException(status_code=502, detail=f"broker_data unavailable: {exc}") from exc
+        except Exception as exc:
+            reset_shared_broker_data_provider()
+            raise HTTPException(status_code=502, detail=f"broker_data unavailable: {exc}") from exc
 
     def _get_strategy_row(
         self,
@@ -1259,22 +1279,25 @@ class SQLiteStore:
             ]
 
     def portfolio_summary(self) -> PortfolioSummaryOut:
-        with self._lock, self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT net_liquidation, available_funds, daily_pnl, updated_at
-                FROM portfolio_snapshots
-                ORDER BY updated_at DESC, id DESC
-                LIMIT 1
-                """
-            ).fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail="portfolio summary not found")
+        with self._lock:
+            snapshot = self._load_broker_snapshot()
+            values = snapshot.values_float
+            net_liquidation = float(values.get("NetLiquidation") or 0.0)
+            available_funds = float(values.get("AvailableFunds") or values.get("ExcessLiquidity") or 0.0)
+            positions_unrealized = sum(float(item.unrealized_pnl or 0.0) for item in snapshot.positions)
+            positions_realized = sum(float(item.realized_pnl or 0.0) for item in snapshot.positions)
+            unrealized_pnl = float(values.get("UnrealizedPnL", positions_unrealized))
+            realized_pnl = float(values.get("RealizedPnL", positions_realized))
+            daily_pnl = values.get("DailyPnL")
+            if daily_pnl is None:
+                daily_pnl = unrealized_pnl + realized_pnl
             return PortfolioSummaryOut(
-                net_liquidation=row["net_liquidation"],
-                available_funds=row["available_funds"],
-                daily_pnl=row["daily_pnl"],
-                updated_at=parse_iso(row["updated_at"]) or utcnow(),
+                net_liquidation=net_liquidation,
+                available_funds=available_funds,
+                unrealized_pnl=unrealized_pnl,
+                realized_pnl=realized_pnl,
+                daily_pnl=float(daily_pnl),
+                updated_at=snapshot.fetched_at,
             )
 
     def positions(
@@ -1282,36 +1305,40 @@ class SQLiteStore:
         sec_type: str | None = None,
         symbol: str | None = None,
     ) -> list[PositionItemOut]:
-        with self._lock, self._conn() as conn:
-            sql = """
-                SELECT sec_type, symbol, position_qty, position_unit, avg_price, last_price,
-                       market_value, unrealized_pnl, updated_at
-                FROM positions
-                WHERE 1=1
-            """
-            params: list[Any] = []
-            if sec_type:
-                sql += " AND sec_type = ?"
-                params.append(sec_type)
-            if symbol:
-                sql += " AND symbol = ?"
-                params.append(symbol.upper())
-            sql += " ORDER BY symbol ASC"
-            rows = conn.execute(sql, params).fetchall()
-            return [
-                PositionItemOut(
-                    sec_type=r["sec_type"],
-                    symbol=r["symbol"],
-                    position_qty=r["position_qty"],
-                    position_unit=r["position_unit"],
-                    avg_price=r["avg_price"],
-                    last_price=r["last_price"],
-                    market_value=r["market_value"],
-                    unrealized_pnl=r["unrealized_pnl"],
-                    updated_at=parse_iso(r["updated_at"]) or utcnow(),
+        with self._lock:
+            snapshot = self._load_broker_snapshot()
+            sec_type_filter = str(sec_type or "").strip().upper() or None
+            symbol_filter = str(symbol or "").strip().upper() or None
+
+            items: list[PositionItemOut] = []
+            for row in snapshot.positions:
+                normalized_sec_type = str(row.sec_type).strip().upper()
+                if normalized_sec_type not in {"STK", "FUT"}:
+                    continue
+                normalized_symbol = str(row.symbol).strip().upper()
+                if sec_type_filter and normalized_sec_type != sec_type_filter:
+                    continue
+                if symbol_filter and normalized_symbol != symbol_filter:
+                    continue
+                items.append(
+                    PositionItemOut(
+                        sec_type=normalized_sec_type,
+                        symbol=normalized_symbol,
+                        position_qty=float(row.position),
+                        position_unit="股" if normalized_sec_type == "STK" else "手",
+                        avg_price=float(row.average_cost),
+                        last_price=float(row.market_price),
+                        market_value=float(row.market_value),
+                        unrealized_pnl=float(row.unrealized_pnl),
+                        updated_at=snapshot.fetched_at,
+                    )
                 )
-                for r in rows
-            ]
+            items.sort(key=lambda item: (item.symbol, item.sec_type))
+            return items
+
+    def shutdown(self) -> None:
+        with self._lock:
+            close_shared_broker_data_provider()
 
 
 store = SQLiteStore()

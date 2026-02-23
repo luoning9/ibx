@@ -32,6 +32,11 @@ def test_load_app_config_from_conf_file(tmp_path: Path) -> None:
         client_id = 123
         timeout_seconds = 9
         trading_mode = "live"
+        
+        [ib_gateway.client_ids]
+        broker_data = 223
+        market_data = 224
+        cli = 225
 
         [runtime]
         data_dir = "/tmp/ibx-data"
@@ -56,6 +61,9 @@ def test_load_app_config_from_conf_file(tmp_path: Path) -> None:
         assert cfg.ib_gateway.paper_port == 5002
         assert cfg.ib_gateway.live_port == 5001
         assert cfg.ib_gateway.client_id == 123
+        assert cfg.ib_gateway.client_ids.broker_data == 223
+        assert cfg.ib_gateway.client_ids.market_data == 224
+        assert cfg.ib_gateway.client_ids.cli == 225
         assert cfg.ib_gateway.timeout_seconds == 9
         assert cfg.ib_gateway.trading_mode == "live"
         assert cfg.runtime.data_dir == "/tmp/ibx-data"
@@ -209,6 +217,33 @@ def test_provider_broker_data_can_be_configured(tmp_path: Path) -> None:
         cfg = load_app_config()
         assert cfg.providers.broker_data == "fixture"
         assert cfg.providers.market_data == "fixture"
+    finally:
+        if old_config_path is None:
+            os.environ.pop("IBX_APP_CONFIG", None)
+        else:
+            os.environ["IBX_APP_CONFIG"] = old_config_path
+        clear_app_config_cache()
+
+
+def test_client_ids_fallback_to_client_id_when_not_configured(tmp_path: Path) -> None:
+    conf_path = tmp_path / "app.toml"
+    _write_toml(
+        conf_path,
+        """
+        [ib_gateway]
+        client_id = 321
+        """,
+    )
+
+    old_config_path = os.getenv("IBX_APP_CONFIG")
+    os.environ["IBX_APP_CONFIG"] = str(conf_path)
+    clear_app_config_cache()
+    try:
+        cfg = load_app_config()
+        assert cfg.ib_gateway.client_id == 321
+        assert cfg.ib_gateway.client_ids.broker_data == 321
+        assert cfg.ib_gateway.client_ids.market_data == 321
+        assert cfg.ib_gateway.client_ids.cli == 321
     finally:
         if old_config_path is None:
             os.environ.pop("IBX_APP_CONFIG", None)

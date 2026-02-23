@@ -5,8 +5,9 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from .broker_provider_registry import get_shared_broker_data_provider
 from .config import load_app_config
-from .ib_data_service import BrokerDataProvider, build_broker_data_provider_from_config
+from .ib_data_service import BrokerDataProvider
 from .market_config import resolve_market_profile
 
 
@@ -201,71 +202,60 @@ def run_activation_verification(
         return ActivationVerificationResult(passed=False, reason=symbol_error)
 
     provider = broker_data_provider
-    owned_provider = False
     if provider is None:
-        provider = build_broker_data_provider_from_config()
-        owned_provider = True
+        provider = get_shared_broker_data_provider()
 
+    account_code = str(load_app_config().ib_gateway.account_code or "").strip() or None
     try:
-        account_code = str(load_app_config().ib_gateway.account_code or "").strip() or None
-        try:
-            provider.get_account_snapshot(account_code=account_code)
-        except Exception as exc:  # noqa: BLE001
-            return ActivationVerificationResult(
-                passed=False,
-                reason=f"get_account_snapshot failed: {exc}",
-            )
-
-        resolved_contract_ids, resolve_error = _resolve_missing_contract_ids(
-            provider=provider,
-            market=market,
-            symbol_contract_ids=symbol_contract_ids,
-        )
-        if resolve_error is not None:
-            return ActivationVerificationResult(passed=False, reason=resolve_error)
-
-        resolved_symbol_rows = 0
-        for symbol in symbols:
-            target_contract_id = resolved_contract_ids[symbol.code]
-            if symbol.contract_id == target_contract_id:
-                continue
-            conn.execute(
-                """
-                UPDATE strategy_symbols
-                SET contract_id = ?
-                WHERE id = ? AND strategy_id = ?
-                """,
-                (target_contract_id, symbol.row_id, strategy_id),
-            )
-            resolved_symbol_rows += 1
-
-        enriched_conditions, updated_condition_fields, conditions_error = _enrich_conditions_with_contract_ids(
-            conditions_json=strategy_row["conditions_json"],
-            symbol_contract_ids=resolved_contract_ids,
-        )
-        if conditions_error is not None:
-            return ActivationVerificationResult(passed=False, reason=conditions_error)
-        if updated_condition_fields > 0:
-            conn.execute(
-                """
-                UPDATE strategies
-                SET conditions_json = ?
-                WHERE id = ? AND is_deleted = 0
-                """,
-                (_json_dumps(enriched_conditions), strategy_id),
-            )
-
+        provider.get_account_snapshot(account_code=account_code)
+    except Exception as exc:  # noqa: BLE001
         return ActivationVerificationResult(
-            passed=True,
-            reason="verification_passed",
-            resolved_symbol_contracts=resolved_symbol_rows,
-            updated_condition_contracts=updated_condition_fields,
+            passed=False,
+            reason=f"get_account_snapshot failed: {exc}",
         )
-    finally:
-        if owned_provider:
-            disconnect = getattr(provider, "disconnect", None)
-            if callable(disconnect):
-                try:
-                    disconnect()
-                except Exception:  # noqa: BLE001
-                    pass
+
+    resolved_contract_ids, resolve_error = _resolve_missing_contract_ids(
+        provider=provider,
+        market=market,
+        symbol_contract_ids=symbol_contract_ids,
+    )
+    if resolve_error is not None:
+        return ActivationVerificationResult(passed=False, reason=resolve_error)
+
+    resolved_symbol_rows = 0
+    for symbol in symbols:
+        target_contract_id = resolved_contract_ids[symbol.code]
+        if symbol.contract_id == target_contract_id:
+            continue
+        conn.execute(
+            """
+            UPDATE strategy_symbols
+            SET contract_id = ?
+            WHERE id = ? AND strategy_id = ?
+            """,
+            (target_contract_id, symbol.row_id, strategy_id),
+        )
+        resolved_symbol_rows += 1
+
+    enriched_conditions, updated_condition_fields, conditions_error = _enrich_conditions_with_contract_ids(
+        conditions_json=strategy_row["conditions_json"],
+        symbol_contract_ids=resolved_contract_ids,
+    )
+    if conditions_error is not None:
+        return ActivationVerificationResult(passed=False, reason=conditions_error)
+    if updated_condition_fields > 0:
+        conn.execute(
+            """
+            UPDATE strategies
+            SET conditions_json = ?
+            WHERE id = ? AND is_deleted = 0
+            """,
+            (_json_dumps(enriched_conditions), strategy_id),
+        )
+
+    return ActivationVerificationResult(
+        passed=True,
+        reason="verification_passed",
+        resolved_symbol_contracts=resolved_symbol_rows,
+        updated_condition_contracts=updated_condition_fields,
+    )

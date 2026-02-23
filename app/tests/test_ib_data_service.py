@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from app.config import clear_app_config_cache
 from app.ib_data_service import (
     IBDataService,
+    IBDataServiceError,
     FixtureBrokerDataProvider,
     build_broker_data_provider_from_config,
 )
@@ -211,6 +213,63 @@ def test_get_account_snapshot_filters_account_and_parses_values(monkeypatch) -> 
     assert len(snapshot.positions) == 1
     assert snapshot.positions[0].contract_id == 101
     assert snapshot.positions[0].symbol == "AAPL"
+
+
+def test_connect_initializes_event_loop_when_missing(monkeypatch) -> None:
+    fake_ib = _FakeIB()
+    svc = IBDataService(
+        ib=fake_ib,
+        host="127.0.0.1",
+        port=4002,
+        client_id=99,
+        timeout_seconds=5.0,
+    )
+
+    recorded = {"set_called": False}
+
+    def fake_get_event_loop() -> object:
+        raise RuntimeError("no event loop")
+
+    def fake_new_event_loop() -> object:
+        return object()
+
+    def fake_set_event_loop(loop: object) -> None:
+        recorded["set_called"] = loop is not None
+
+    monkeypatch.setattr(asyncio, "get_event_loop", fake_get_event_loop)
+    monkeypatch.setattr(asyncio, "new_event_loop", fake_new_event_loop)
+    monkeypatch.setattr(asyncio, "set_event_loop", fake_set_event_loop)
+
+    svc.connect()
+    assert recorded["set_called"] is True
+    assert len(fake_ib.connect_calls) == 1
+
+
+def test_connect_fails_when_client_id_conflicted() -> None:
+    class _ConflictedIB(_FakeIB):
+        def connect(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            self.connect_calls.append(kwargs)
+            raise RuntimeError("client id is already in use")
+
+    fake_ib = _ConflictedIB()
+    svc = IBDataService(
+        ib=fake_ib,
+        host="127.0.0.1",
+        port=4002,
+        client_id=99,
+        timeout_seconds=5.0,
+    )
+    try:
+        svc.connect()
+        raise AssertionError("expected IBDataServiceError")
+    except IBDataServiceError as exc:
+        message = str(exc)
+        assert "client_id=99" in message
+        assert "already in use" in message
+
+    assert len(fake_ib.connect_calls) == 1
+    assert int(fake_ib.connect_calls[0]["clientId"]) == 99
+    assert svc.client_id == 99
 
 
 def _write_toml(path: Path, content: str) -> None:

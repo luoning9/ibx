@@ -1,14 +1,34 @@
 <script setup lang="ts">
+import axios from 'axios'
 import { onMounted, ref } from 'vue'
 
 import { fetchPortfolioSummary, fetchPositions } from '../api/services'
 import type { PortfolioSummary, PositionItem } from '../api/types'
-import { formatCurrency, formatIsoDateTime, formatNumber, formatSignedCurrency } from '../utils/format'
+import { formatCurrency, formatNumber, formatSignedCurrency } from '../utils/format'
 
 const summary = ref<PortfolioSummary | null>(null)
 const rows = ref<PositionItem[]>([])
 const loading = ref(false)
 const error = ref('')
+
+function toLoadError(err: unknown) {
+  if (axios.isAxiosError(err)) {
+    const payload = err.response?.data as { detail?: unknown } | undefined
+    const detailPayload = payload?.detail
+    if (typeof detailPayload === 'string' && detailPayload) {
+      return `加载持仓失败：${detailPayload}`
+    }
+    if (detailPayload && typeof detailPayload === 'object') {
+      const detailObj = detailPayload as Record<string, unknown>
+      const message =
+        (typeof detailObj.message === 'string' && detailObj.message) ||
+        (typeof detailObj.detail === 'string' && detailObj.detail) ||
+        ''
+      if (message) return `加载持仓失败：${message}`
+    }
+  }
+  return `加载持仓失败：${String(err)}`
+}
 
 async function loadPositions() {
   loading.value = true
@@ -21,7 +41,7 @@ async function loadPositions() {
     summary.value = summaryData
     rows.value = positionsData
   } catch (err) {
-    error.value = `加载持仓失败：${String(err)}`
+    error.value = toLoadError(err)
   } finally {
     loading.value = false
   }
@@ -48,28 +68,30 @@ onMounted(loadPositions)
         class="mb-12"
       />
       <el-row :gutter="16">
-        <el-col :xs="12" :sm="12" :md="6">
+        <el-col :xs="12" :sm="12" :md="8">
           <div class="kv">
             <span>账户净值</span>
             <strong>{{ formatCurrency(summary?.net_liquidation) }}</strong>
           </div>
         </el-col>
-        <el-col :xs="12" :sm="12" :md="6">
+        <el-col :xs="12" :sm="12" :md="8">
           <div class="kv">
             <span>可用资金</span>
             <strong>{{ formatCurrency(summary?.available_funds) }}</strong>
           </div>
         </el-col>
-        <el-col :xs="12" :sm="12" :md="6">
+        <el-col :xs="12" :sm="12" :md="8">
           <div class="kv">
-            <span>当日浮盈亏</span>
-            <strong>{{ formatSignedCurrency(summary?.daily_pnl) }}</strong>
+            <span>未实现盈亏</span>
+            <strong>{{ formatSignedCurrency(summary?.unrealized_pnl) }}</strong>
           </div>
         </el-col>
-        <el-col :xs="12" :sm="12" :md="6">
+      </el-row>
+      <el-row :gutter="16">
+        <el-col :xs="12" :sm="12" :md="8">
           <div class="kv">
-            <span>更新时间</span>
-            <strong>{{ formatIsoDateTime(summary?.updated_at) }}</strong>
+            <span>已实现盈亏</span>
+            <strong>{{ formatSignedCurrency(summary?.realized_pnl) }}</strong>
           </div>
         </el-col>
       </el-row>

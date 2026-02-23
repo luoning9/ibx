@@ -3,6 +3,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from app.db import get_connection
+from app.ib_data_service import FixtureBrokerDataProvider
 from app.main import app
 
 
@@ -364,6 +365,44 @@ def test_pause_rejected_when_strategy_locked() -> None:
     body = resp.json()
     assert body["detail"]["code"] == "STRATEGY_LOCKED"
     assert body["detail"]["action"] == "pause"
+
+
+def test_portfolio_summary_uses_broker_data_provider(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.store.get_shared_broker_data_provider",
+        lambda: FixtureBrokerDataProvider(),
+    )
+    resp = client.get("/v1/portfolio-summary")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["net_liquidation"] == 143445.18
+    assert body["available_funds"] == 0.0
+    assert body["unrealized_pnl"] == 9159.22
+    assert body["realized_pnl"] == 0.0
+    assert body["daily_pnl"] == 9159.22
+    assert body["updated_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_positions_uses_broker_data_provider(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.store.get_shared_broker_data_provider",
+        lambda: FixtureBrokerDataProvider(),
+    )
+    resp = client.get("/v1/positions")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 9
+    assert rows[0]["symbol"] == "CRML"
+    assert rows[0]["sec_type"] == "STK"
+    assert rows[0]["position_unit"] == "股"
+    assert rows[0]["updated_at"] == "2026-01-01T00:00:00Z"
+
+    one = client.get("/v1/positions", params={"symbol": "vgt"})
+    assert one.status_code == 200
+    one_rows = one.json()
+    assert len(one_rows) == 1
+    assert one_rows[0]["symbol"] == "VGT"
+    assert one_rows[0]["position_qty"] == 41.0
 
 
 def test_update_config_resets_status_to_pending_activation() -> None:
