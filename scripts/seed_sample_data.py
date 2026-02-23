@@ -21,6 +21,14 @@ def dumps_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _table_exists(cur, table_name: str) -> bool:  # type: ignore[no-untyped-def]
+    row = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
 def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
     path = init_db(db_path=db_path)
     now = datetime.now(timezone.utc)
@@ -299,6 +307,8 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
             cur.execute("DELETE FROM trade_logs")
             cur.execute("DELETE FROM trade_instructions")
             cur.execute("DELETE FROM orders")
+            if _table_exists(cur, "strategy_activations"):
+                cur.execute("DELETE FROM strategy_activations")
             cur.execute("DELETE FROM strategy_events")
             cur.execute("DELETE FROM strategy_symbols")
             cur.execute("DELETE FROM strategies")
@@ -327,6 +337,17 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
             cur.execute(
                 "DELETE FROM trade_instructions WHERE strategy_id LIKE 'SMP-%' OR trade_id LIKE 'T-SMP-%'"
             )
+            if _table_exists(cur, "strategy_activations"):
+                cur.execute(
+                    """
+                    DELETE FROM strategy_activations
+                    WHERE from_strategy_id LIKE 'SMP-%'
+                       OR to_strategy_id LIKE 'SMP-%'
+                       OR trigger_event_id IN (
+                           SELECT id FROM strategy_events WHERE strategy_id LIKE 'SMP-%'
+                       )
+                    """
+                )
             cur.execute(
                 "DELETE FROM strategy_events WHERE strategy_id LIKE 'SMP-%'"
             )

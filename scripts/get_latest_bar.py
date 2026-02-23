@@ -18,17 +18,19 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.config import infer_ib_api_port, load_app_config
 from app.market_config import resolve_market_profile
-from app.market_data import HistoricalBar, HistoricalBarsRequest, SQLiteMarketDataCache
+from app.market_data import (
+    HistoricalBar,
+    HistoricalBarsRequest,
+    build_market_data_provider_from_config,
+)
 from app.runtime_paths import resolve_market_cache_db_path
 
 try:
     from ib_insync import IB, Future, Stock
 except ModuleNotFoundError:
-    print(
-        "[ERROR] Missing dependency: ib_insync. Install with: pip install ib_insync",
-        file=sys.stderr,
-    )
-    sys.exit(3)
+    IB = None  # type: ignore[assignment]
+    Future = None  # type: ignore[assignment]
+    Stock = None  # type: ignore[assignment]
 
 
 UTC = timezone.utc
@@ -197,6 +199,8 @@ class IBHistoricalFetcher:
         return out
 
     def _resolve_contract(self, contract: Mapping[str, Any] | str) -> Any:
+        if Stock is None or Future is None:
+            raise RuntimeError("ib_insync is required for IB-backed market data fetcher")
         if isinstance(contract, str):
             payload = {"market": "US_STOCK", "code": contract}
         else:
@@ -367,6 +371,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    cfg = load_app_config()
     bar_delta = _parse_bar_size_delta(args.bar_size)
     now = _aligned_query_end(datetime.now(UTC), bar_delta)
 
@@ -374,26 +379,45 @@ def main() -> int:
     if args.contract_month:
         request_contract["contract_month"] = args.contract_month
 
-    ib = IB()
-    try:
-        ib.connect(
-            host=args.host,
-            port=args.port,
-            clientId=args.client_id,
-            timeout=args.timeout,
-            readonly=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ERROR] Failed to connect IB API: {exc}", file=sys.stderr)
-        return 1
+    ib: IB | None = None
 
     try:
-        fetcher = IBHistoricalFetcher(ib)
-        cache = (
-            SQLiteMarketDataCache(fetcher=fetcher)
-            if not args.cache_db.strip()
-            else SQLiteMarketDataCache(fetcher=fetcher, db_path=Path(args.cache_db.strip()))
-        )
+        if cfg.providers.market_data == "fixture":
+            cache = build_market_data_provider_from_config(
+                now_fn=lambda: now,
+            )
+        else:
+            if IB is None:
+                print(
+                    "[ERROR] Missing dependency: ib_insync. Install with: pip install ib_insync",
+                    file=sys.stderr,
+                )
+                return 3
+            ib = IB()
+            try:
+                ib.connect(
+                    host=args.host,
+                    port=args.port,
+                    clientId=args.client_id,
+                    timeout=args.timeout,
+                    readonly=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ERROR] Failed to connect IB API: {exc}", file=sys.stderr)
+                return 1
+            fetcher = IBHistoricalFetcher(ib)
+            cache = (
+                build_market_data_provider_from_config(
+                    fetcher=fetcher,
+                    now_fn=lambda: now,
+                )
+                if not args.cache_db.strip()
+                else build_market_data_provider_from_config(
+                    fetcher=fetcher,
+                    db_path=Path(args.cache_db.strip()),
+                    now_fn=lambda: now,
+                )
+            )
         result = None
         for lookback in _lookback_candidates(bar_delta, args.lookback_bars):
             start = now - lookback
@@ -418,7 +442,7 @@ def main() -> int:
         print(f"[ERROR] Query latest bar failed: {exc}", file=sys.stderr)
         return 2
     finally:
-        if ib.isConnected():
+        if ib is not None and ib.isConnected():
             ib.disconnect()
 
     if not result.bars:

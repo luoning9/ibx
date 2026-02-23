@@ -59,8 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.getenv("IB_API_PORT", str(infer_default_port()))),
-        help="IB API port",
+        default=None,
+        help="IB API port (default: trading mode selected port)",
     )
     parser.add_argument(
         "--client-id",
@@ -84,7 +84,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Output JSON instead of a table",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Force live mode connection (uses live port when --port is not set)",
+    )
+    args = parser.parse_args()
+
+    if args.port is None:
+        if os.getenv("IB_API_PORT"):
+            args.port = int(os.getenv("IB_API_PORT", "0"))
+        else:
+            mode = "live" if bool(args.live) else os.getenv("TRADING_MODE", cfg.trading_mode).strip().lower()
+            args.port = infer_ib_api_port(mode)
+    return args
 
 
 def build_holdings(items: list[Any], account_filter: str) -> list[Holding]:

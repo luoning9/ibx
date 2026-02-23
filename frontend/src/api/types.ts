@@ -171,3 +171,28 @@ export type StrategyBasicPatchPayload = {
   expire_in_seconds?: number | null
   expire_at?: string | null
 }
+
+export type ConditionRulePair = {
+  trigger_mode: string
+  operator: '>=' | '<='
+}
+
+export type ConditionRulesResponse = {
+  trigger_mode_windows: Record<
+    string,
+    Record<
+      string,
+      {
+        base_bar: string
+        confirm_consecutive: number
+        confirm_ratio: number
+        include_partial_bar: boolean
+        missing_data_policy: string
+      }
+    >
+  >
+  metric_trigger_operator_rules: {
+    allowed_windows: Record<string, string[]>
+    allowed_rules: Record<string, ConditionRulePair[]>
+  }
+}

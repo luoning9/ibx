@@ -143,6 +143,8 @@ python3 scripts/get_latest_bar.py --code GC --bar-size "1 hour" --market COMEX_F
 - `--contract-month YYYYMM`：期货指定合约月
 - `--lookback-bars`：回看 bar 数（默认 `30`）
 
+当 `conf/app.toml` 配置 `providers.market_data="fixture"` 时，脚本会使用本地样本行情（`conf/fixtures/market_data.sample.json`），无需连接 IB。
+
 ## 🖥 静态控制台 UI（Bootstrap 5）
 
 仓库已提供静态控制台原型：
@@ -199,6 +201,7 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 - `[ib_gateway]`：网关 `host`、`paper_port/live_port`、`client_id`、`timeout_seconds` 等
 - `[runtime]`：`data_dir`、`db_path`、日志路径、行情缓存路径等
 - `[worker]`：执行引擎开关、扫描间隔、线程数、队列长度等
+- `[providers]`：外部数据模块实现选择（`broker_data=ib|fixture`、`market_data=ib|fixture`；`fixture` 使用内置缺省样本文件）
 
 条件判定规则使用独立配置文件 `conf/condition_rules.json`（不放在 `app.toml`）：
 - `trigger_mode_profiles`：按 `trigger_mode + evaluation_window` 定义 `base_bar`、`confirm_consecutive`、`confirm_ratio`、`include_partial_bar`、`missing_data_policy`

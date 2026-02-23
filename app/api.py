@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
+from .config import export_condition_rules
 from .models import (
     ActiveTradeInstructionOut,
     ControlResponse,
@@ -24,6 +25,11 @@ router = APIRouter(prefix="/v1", tags=["ibx"])
 @router.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/condition-rules")
+def condition_rules() -> dict[str, object]:
+    return export_condition_rules()
 
 
 @router.post("/strategies", response_model=StrategyDetailOut)

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import axios from 'axios'
 import { ArrowDown, ArrowUp, CaretRight, CloseBold, Link, RefreshRight, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
@@ -276,14 +277,39 @@ function openUpstreamStrategy() {
   router.push(`/strategies/${upstreamId}`)
 }
 
+function toActionError(actionLabel: string, err: unknown) {
+  if (axios.isAxiosError(err)) {
+    const payload = err.response?.data as { detail?: unknown } | undefined
+    const detailPayload = payload?.detail
+    if (detailPayload && typeof detailPayload === 'object') {
+      const detailObj = detailPayload as Record<string, unknown>
+      const code = typeof detailObj.code === 'string' ? detailObj.code : ''
+      if (code === 'STRATEGY_LOCKED') {
+        const lockUntilRaw = typeof detailObj.lock_until === 'string' ? detailObj.lock_until : ''
+        const lockUntilText = lockUntilRaw ? `（锁到期：${formatIsoDateTime(lockUntilRaw)}）` : ''
+        return `${actionLabel}失败：策略正在执行中，暂时不能修改状态，请稍后重试${lockUntilText}`
+      }
+      const apiMsg =
+        (typeof detailObj.message === 'string' && detailObj.message) ||
+        (typeof detailObj.detail === 'string' && detailObj.detail) ||
+        ''
+      if (apiMsg) return `${actionLabel}失败：${apiMsg}`
+    }
+    if (typeof detailPayload === 'string' && detailPayload) {
+      return `${actionLabel}失败：${detailPayload}`
+    }
+  }
+  return `${actionLabel}失败：${String(err)}`
+}
+
 async function doActivate() {
   if (!detail.value) return
   try {
     await activateStrategy(detail.value.id)
-    ElMessage.success(`策略 ${detail.value.id} 已激活`)
+    ElMessage.success(`策略 ${detail.value.id} 已进入校验中`)
     await loadDetail()
   } catch (err) {
-    error.value = `激活失败：${String(err)}`
+    error.value = toActionError('激活', err)
   }
 }
 
@@ -294,7 +320,7 @@ async function doPause() {
     ElMessage.success(`策略 ${detail.value.id} 已暂停`)
     await loadDetail()
   } catch (err) {
-    error.value = `暂停失败：${String(err)}`
+    error.value = toActionError('暂停', err)
   }
 }
 
@@ -305,7 +331,7 @@ async function doResume() {
     ElMessage.success(`策略 ${detail.value.id} 已恢复`)
     await loadDetail()
   } catch (err) {
-    error.value = `恢复失败：${String(err)}`
+    error.value = toActionError('恢复', err)
   }
 }
 
@@ -316,7 +342,7 @@ async function doCancel() {
     ElMessage.success(`策略 ${detail.value.id} 已取消`)
     await loadDetail()
   } catch (err) {
-    error.value = `取消失败：${String(err)}`
+    error.value = toActionError('取消', err)
   }
 }
 

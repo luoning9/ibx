@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS strategies (
   anchor_price REAL,
   activated_at TEXT,
   logical_activated_at TEXT,
+  lock_until TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   version INTEGER NOT NULL DEFAULT 1

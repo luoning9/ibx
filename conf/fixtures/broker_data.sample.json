@@ -1,0 +1,170 @@
+{
+  "contracts": [
+    { "market": "US_STOCK", "code": "VGT", "contract_id": 910001 },
+    { "market": "US_STOCK", "code": "IAU", "contract_id": 910002 },
+    { "market": "US_STOCK", "code": "SLV", "contract_id": 910003 },
+    { "market": "US_STOCK", "code": "IEI", "contract_id": 910004 },
+    { "market": "US_STOCK", "code": "MGK", "contract_id": 910005 },
+    { "market": "US_STOCK", "code": "USAR", "contract_id": 910006 },
+    { "market": "US_STOCK", "code": "CRML", "contract_id": 910007 },
+    { "market": "US_STOCK", "code": "LTBR", "contract_id": 910008 },
+    { "market": "US_STOCK", "code": "IPX", "contract_id": 910009 }
+  ],
+  "account_snapshots": {
+    "U13883817": {
+      "fetched_at": "2026-01-01T00:00:00Z",
+      "values": {
+        "NetLiquidation": "143445.18",
+        "GrossPositionValue": "143445.18",
+        "UnrealizedPnL": "9159.22",
+        "RealizedPnL": "0.00",
+        "AvailableFunds": "0.00"
+      },
+      "value_currencies": {
+        "NetLiquidation": "USD",
+        "GrossPositionValue": "USD",
+        "UnrealizedPnL": "USD",
+        "RealizedPnL": "USD",
+        "AvailableFunds": "USD",
+        "MaintMarginReq": "USD"
+      },
+      "positions": [
+        {
+          "account": "U13883817",
+          "contract_id": 910001,
+          "symbol": "VGT",
+          "local_symbol": "VGT",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 41.0,
+          "market_price": 735.6476,
+          "market_value": 30161.55,
+          "average_cost": 703.4445,
+          "unrealized_pnl": 1320.33,
+          "realized_pnl": 0
+        },
+        {
+          "account": "U13883817",
+          "contract_id": 910002,
+          "symbol": "IAU",
+          "local_symbol": "IAU",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 258.0,
+          "market_price": 97.0198,
+          "market_value": 25031.12,
+          "average_cost": 71.6957,
+          "unrealized_pnl": 6533.63,
+          "realized_pnl": 0
+        },
+        {
+          "account": "U13883817",
+          "contract_id": 910003,
+          "symbol": "SLV",
+          "local_symbol": "SLV",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 230.0,
+          "market_price": 78.6747,
+          "market_value": 18095.19,
+          "average_cost": 54.49,
+          "unrealized_pnl": 5562.5,
+          "realized_pnl": 0
+        },
+        {
+          "account": "U13883817",
+          "contract_id": 910004,
+          "symbol": "IEI",
+          "local_symbol": "IEI",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 130.0,
+          "market_price": 120.02,
+          "market_value": 15602.6,
+          "average_cost": 119.2277,
+          "unrealized_pnl": 103.0,
+          "realized_pnl": 0
+        },
+        {
+          "account": "U13883817",
+          "contract_id": 910005,
+          "symbol": "MGK",
+          "local_symbol": "MGK",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 38.0,
+          "market_price": 388.7052,
+          "market_value": 14770.8,
+          "average_cost": 392.6316,
+          "unrealized_pnl": -149.2,
+          "realized_pnl": 0
+        },
+        {
+          "account": "U13883817",
+          "contract_id": 910006,
+          "symbol": "USAR",
+          "local_symbol": "USAR",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 650.0,
+          "market_price": 17.12,
+          "market_value": 11128.0,
+          "average_cost": 18.8198,
+          "unrealized_pnl": -1104.86,
+          "realized_pnl": 0
+        },
+        {
+          "account": "U13883817",
+          "contract_id": 910007,
+          "symbol": "CRML",
+          "local_symbol": "CRML",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 1100.0,
+          "market_price": 9.02,
+          "market_value": 9922.0,
+          "average_cost": 10.763,
+          "unrealized_pnl": -1917.33,
+          "realized_pnl": 0
+        },
+        {
+          "account": "U13883817",
+          "contract_id": 910008,
+          "symbol": "LTBR",
+          "local_symbol": "LTBR",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 746.0,
+          "market_price": 12.88,
+          "market_value": 9608.48,
+          "average_cost": 13.9315,
+          "unrealized_pnl": -784.43,
+          "realized_pnl": 0
+        },
+        {
+          "account": "U13883817",
+          "contract_id": 910009,
+          "symbol": "IPX",
+          "local_symbol": "IPX",
+          "sec_type": "STK",
+          "currency": "USD",
+          "exchange": "SMART",
+          "position": 217.0,
+          "market_price": 42.0527,
+          "market_value": 9125.44,
+          "average_cost": 43.9164,
+          "unrealized_pnl": -404.42,
+          "realized_pnl": 0
+        }
+      ]
+    }
+  }
+}

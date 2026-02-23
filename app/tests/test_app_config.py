@@ -66,6 +66,8 @@ def test_load_app_config_from_conf_file(tmp_path: Path) -> None:
         assert cfg.worker.queue_maxsize == 8000
         assert cfg.worker.gateway_not_work_event_throttle_seconds == 600
         assert cfg.worker.waiting_for_market_data_event_throttle_seconds == 180
+        assert cfg.providers.broker_data == "ib"
+        assert cfg.providers.market_data == "ib"
     finally:
         if old_config_path is None:
             os.environ.pop("IBX_APP_CONFIG", None)
@@ -187,3 +189,29 @@ def test_confirm_window_rejects_below_5m() -> None:
     clear_app_config_cache()
     with pytest.raises(ValueError, match="does not allow evaluation_window"):
         resolve_trigger_window_policy("CROSS_UP_CONFIRM", "1m")
+
+
+def test_provider_broker_data_can_be_configured(tmp_path: Path) -> None:
+    conf_path = tmp_path / "app.toml"
+    _write_toml(
+        conf_path,
+        """
+        [providers]
+        broker_data = "fixture"
+        market_data = "fixture"
+        """,
+    )
+
+    old_config_path = os.getenv("IBX_APP_CONFIG")
+    os.environ["IBX_APP_CONFIG"] = str(conf_path)
+    clear_app_config_cache()
+    try:
+        cfg = load_app_config()
+        assert cfg.providers.broker_data == "fixture"
+        assert cfg.providers.market_data == "fixture"
+    finally:
+        if old_config_path is None:
+            os.environ.pop("IBX_APP_CONFIG", None)
+        else:
+            os.environ["IBX_APP_CONFIG"] = old_config_path
+        clear_app_config_cache()

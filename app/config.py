@@ -55,6 +55,12 @@ class WorkerConfig:
 
 
 @dataclass(frozen=True)
+class ProvidersConfig:
+    broker_data: str
+    market_data: str
+
+
+@dataclass(frozen=True)
 class TriggerWindowPolicy:
     base_bar: str
     confirm_consecutive: int
@@ -125,6 +131,7 @@ class AppConfig:
     ib_gateway: IBGatewayConfig
     runtime: RuntimeConfig
     worker: WorkerConfig
+    providers: ProvidersConfig
     trigger_mode: TriggerModeConfig
     metric_rules: MetricRuleConfig
 
@@ -214,6 +221,20 @@ def _normalize_trading_mode(value: str) -> str:
 def _normalize_missing_data_policy(value: Any, default: str = "fail") -> str:
     normalized = str(value or "").strip().lower()
     if normalized in {"fail", "skip", "carry_forward"}:
+        return normalized
+    return default
+
+
+def _normalize_broker_data_provider(value: Any, default: str = "ib") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"ib", "fixture"}:
+        return normalized
+    return default
+
+
+def _normalize_market_data_provider(value: Any, default: str = "ib") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"ib", "fixture"}:
         return normalized
     return default
 
@@ -495,6 +516,7 @@ def load_app_config() -> AppConfig:
     ib_raw = _as_dict(raw.get("ib_gateway"))
     runtime_raw = _as_dict(raw.get("runtime"))
     worker_raw = _as_dict(raw.get("worker"))
+    providers_raw = _as_dict(raw.get("providers"))
     condition_rules_raw = _load_condition_rules_config_raw()
     trigger_mode_raw = _as_dict(condition_rules_raw.get("trigger_mode_profiles"))
     metric_rules_raw = _as_dict(condition_rules_raw.get("metric_trigger_operator_rules"))
@@ -537,6 +559,16 @@ def load_app_config() -> AppConfig:
             maximum=86400,
         ),
     )
+    providers = ProvidersConfig(
+        broker_data=_normalize_broker_data_provider(
+            providers_raw.get("broker_data"),
+            "ib",
+        ),
+        market_data=_normalize_market_data_provider(
+            providers_raw.get("market_data"),
+            "ib",
+        ),
+    )
     trigger_mode = _build_trigger_mode_config(trigger_mode_raw)
     metric_rules = _build_metric_rule_config(metric_rules_raw)
 
@@ -544,6 +576,7 @@ def load_app_config() -> AppConfig:
         ib_gateway=ib,
         runtime=runtime,
         worker=worker,
+        providers=providers,
         trigger_mode=trigger_mode,
         metric_rules=metric_rules,
     )
@@ -583,3 +616,60 @@ def resolve_metric_allowed_windows(
 ) -> set[str]:
     cfg = config or load_app_config()
     return cfg.metric_rules.resolve_windows(metric)
+
+
+def export_condition_rules(
+    *,
+    config: AppConfig | None = None,
+) -> dict[str, Any]:
+    cfg = config or load_app_config()
+    window_order = {"1m": 1, "5m": 2, "30m": 3, "1h": 4, "2h": 5, "4h": 6, "1d": 7, "2d": 8}
+    trigger_mode_order = {
+        "LEVEL_INSTANT": 1,
+        "LEVEL_CONFIRM": 2,
+        "CROSS_UP_INSTANT": 3,
+        "CROSS_UP_CONFIRM": 4,
+        "CROSS_DOWN_INSTANT": 5,
+        "CROSS_DOWN_CONFIRM": 6,
+    }
+
+    trigger_mode_windows: dict[str, dict[str, Any]] = {}
+    for trigger_mode, windows in cfg.trigger_mode.windows.items():
+        trigger_mode_windows[trigger_mode] = {}
+        for evaluation_window, policy in sorted(
+            windows.items(),
+            key=lambda item: (window_order.get(item[0], 999), item[0]),
+        ):
+            trigger_mode_windows[trigger_mode][evaluation_window] = {
+                "base_bar": policy.base_bar,
+                "confirm_consecutive": policy.confirm_consecutive,
+                "confirm_ratio": policy.confirm_ratio,
+                "include_partial_bar": policy.include_partial_bar,
+                "missing_data_policy": policy.missing_data_policy,
+            }
+
+    metric_allowed_windows: dict[str, list[str]] = {}
+    for metric, windows in cfg.metric_rules.allowed_windows.items():
+        metric_allowed_windows[metric] = sorted(
+            windows,
+            key=lambda item: (window_order.get(item, 999), item),
+        )
+
+    metric_allowed_rules: dict[str, list[dict[str, str]]] = {}
+    for metric, pairs in cfg.metric_rules.allowed_rules.items():
+        metric_allowed_rules[metric] = sorted(
+            [{"trigger_mode": mode, "operator": operator} for mode, operator in pairs],
+            key=lambda item: (
+                trigger_mode_order.get(item["trigger_mode"], 999),
+                item["trigger_mode"],
+                item["operator"],
+            ),
+        )
+
+    return {
+        "trigger_mode_windows": trigger_mode_windows,
+        "metric_trigger_operator_rules": {
+            "allowed_windows": metric_allowed_windows,
+            "allowed_rules": metric_allowed_rules,
+        },
+    }

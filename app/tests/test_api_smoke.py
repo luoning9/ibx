@@ -9,10 +9,52 @@ from app.main import app
 client = TestClient(app)
 
 
+def _ready_strategy_payload(strategy_id: str, description: str) -> dict[str, object]:
+    return {
+        "id": strategy_id,
+        "description": description,
+        "market": "US_STOCK",
+        "trade_type": "buy",
+        "symbols": [{"code": "AAPL", "trade_type": "buy", "contract_id": None}],
+        "expire_mode": "relative",
+        "expire_in_seconds": 86400,
+        "conditions": [
+            {
+                "condition_type": "SINGLE_PRODUCT",
+                "metric": "PRICE",
+                "trigger_mode": "LEVEL_INSTANT",
+                "evaluation_window": "1m",
+                "window_price_basis": "CLOSE",
+                "operator": ">=",
+                "value": 1.0,
+                "product": "AAPL",
+            }
+        ],
+        "trade_action_json": {
+            "action_type": "STOCK_TRADE",
+            "symbol": "AAPL",
+            "side": "BUY",
+            "order_type": "MKT",
+            "quantity": 1,
+        },
+    }
+
+
 def test_healthz() -> None:
     resp = client.get("/v1/healthz")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+def test_condition_rules() -> None:
+    resp = client.get("/v1/condition-rules")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "trigger_mode_windows" in body
+    assert "metric_trigger_operator_rules" in body
+    assert "allowed_windows" in body["metric_trigger_operator_rules"]
+    assert "allowed_rules" in body["metric_trigger_operator_rules"]
+    assert "PRICE" in body["metric_trigger_operator_rules"]["allowed_rules"]
 
 
 def test_list_strategies() -> None:
@@ -129,7 +171,7 @@ def test_symbols_return_contract_id_nullable() -> None:
     assert body["symbols"][0]["contract_id"] is None
 
 
-def test_activate_moves_through_verifying_to_active() -> None:
+def test_activate_moves_to_verifying() -> None:
     strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
     payload = {
         "id": strategy_id,
@@ -164,20 +206,20 @@ def test_activate_moves_through_verifying_to_active() -> None:
 
     activated = client.post(f"/v1/strategies/{strategy_id}/activate")
     assert activated.status_code == 200
-    assert activated.json()["status"] == "ACTIVE"
+    assert activated.json()["status"] == "VERIFYING"
 
     detail = client.get(f"/v1/strategies/{strategy_id}")
     assert detail.status_code == 200
-    assert detail.json()["status"] == "ACTIVE"
+    assert detail.json()["status"] == "VERIFYING"
 
     events = client.get(f"/v1/strategies/{strategy_id}/events")
     assert events.status_code == 200
     event_types = [item["event_type"] for item in events.json()]
     assert "VERIFYING" in event_types
-    assert "ACTIVATED" in event_types
+    assert "ACTIVATED" not in event_types
 
 
-def test_activate_verify_failed_when_market_mapping_invalid() -> None:
+def test_activate_does_not_verify_inline_when_market_mapping_invalid() -> None:
     strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
     payload = {
         "id": strategy_id,
@@ -216,11 +258,112 @@ def test_activate_verify_failed_when_market_mapping_invalid() -> None:
 
     activated = client.post(f"/v1/strategies/{strategy_id}/activate")
     assert activated.status_code == 200
-    assert activated.json()["status"] == "VERIFY_FAILED"
+    assert activated.json()["status"] == "VERIFYING"
 
     detail = client.get(f"/v1/strategies/{strategy_id}")
     assert detail.status_code == 200
-    assert detail.json()["status"] == "VERIFY_FAILED"
+    assert detail.json()["status"] == "VERIFYING"
+
+
+def test_pause_resume_when_verifying() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    payload = {
+        "id": strategy_id,
+        "description": "pause resume in verifying",
+        "market": "US_STOCK",
+        "trade_type": "buy",
+        "symbols": [{"code": "AAPL", "trade_type": "buy", "contract_id": None}],
+        "expire_mode": "relative",
+        "expire_in_seconds": 86400,
+        "conditions": [
+            {
+                "condition_type": "SINGLE_PRODUCT",
+                "metric": "PRICE",
+                "trigger_mode": "LEVEL_INSTANT",
+                "evaluation_window": "1m",
+                "window_price_basis": "CLOSE",
+                "operator": ">=",
+                "value": 1.0,
+                "product": "AAPL",
+            }
+        ],
+        "trade_action_json": {
+            "action_type": "STOCK_TRADE",
+            "symbol": "AAPL",
+            "side": "BUY",
+            "order_type": "MKT",
+            "quantity": 1,
+        },
+    }
+    created = client.post("/v1/strategies", json=payload)
+    assert created.status_code == 200
+
+    activated = client.post(f"/v1/strategies/{strategy_id}/activate")
+    assert activated.status_code == 200
+    assert activated.json()["status"] == "VERIFYING"
+
+    detail = client.get(f"/v1/strategies/{strategy_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "VERIFYING"
+    assert detail.json()["capabilities"]["can_pause"] is True
+
+    paused = client.post(f"/v1/strategies/{strategy_id}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "PAUSED"
+
+    resumed = client.post(f"/v1/strategies/{strategy_id}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "VERIFYING"
+
+    detail_after = client.get(f"/v1/strategies/{strategy_id}")
+    assert detail_after.status_code == 200
+    assert detail_after.json()["status"] == "VERIFYING"
+
+
+def test_activate_rejected_when_strategy_locked() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    created = client.post(
+        "/v1/strategies",
+        json=_ready_strategy_payload(strategy_id, "activate blocked by lock"),
+    )
+    assert created.status_code == 200
+
+    lock_until = "2099-01-01T00:00:00Z"
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE strategies SET lock_until = ? WHERE id = ?",
+            (lock_until, strategy_id),
+        )
+        conn.commit()
+
+    resp = client.post(f"/v1/strategies/{strategy_id}/activate")
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["detail"]["code"] == "STRATEGY_LOCKED"
+    assert body["detail"]["action"] == "activate"
+    assert body["detail"]["lock_until"] == lock_until
+
+
+def test_pause_rejected_when_strategy_locked() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    created = client.post(
+        "/v1/strategies",
+        json=_ready_strategy_payload(strategy_id, "pause blocked by lock"),
+    )
+    assert created.status_code == 200
+    with get_connection() as conn:
+        conn.execute("UPDATE strategies SET status = 'ACTIVE' WHERE id = ?", (strategy_id,))
+        conn.execute(
+            "UPDATE strategies SET lock_until = ? WHERE id = ?",
+            ("2099-01-01T00:00:00Z", strategy_id),
+        )
+        conn.commit()
+
+    resp = client.post(f"/v1/strategies/{strategy_id}/pause")
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["detail"]["code"] == "STRATEGY_LOCKED"
+    assert body["detail"]["action"] == "pause"
 
 
 def test_update_config_resets_status_to_pending_activation() -> None:
@@ -258,6 +401,9 @@ def test_update_config_resets_status_to_pending_activation() -> None:
 
     activated = client.post(f"/v1/strategies/{strategy_id}/activate")
     assert activated.status_code == 200
+    with get_connection() as conn:
+        conn.execute("UPDATE strategies SET status = 'ACTIVE' WHERE id = ?", (strategy_id,))
+        conn.commit()
     paused = client.post(f"/v1/strategies/{strategy_id}/pause")
     assert paused.status_code == 200
 
