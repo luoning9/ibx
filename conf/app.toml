@@ -1,26 +1,53 @@
+# IBX 主配置文件
+# 说明：
+# 1) 该文件用于放置应用级全局配置（不再依赖环境变量细节开关）。
+# 2) 留空字符串 "" 表示“使用系统默认值/默认路径”。
+
 [ib_gateway]
+# IB Gateway / TWS 连接参数
+# - trading_mode 决定默认走 paper_port 还是 live_port
+# - paper/live 端口都保留，便于同一份配置切换模式
 host = "127.0.0.1"
 paper_port = 4002
 live_port = 4001
 client_id = 99
 timeout_seconds = 5
+# 账户代码；留空表示由 IB 返回的默认账户
 account_code = ""
+# 可选: "paper" | "live"
 trading_mode = "paper"
 
 [runtime]
+# 运行时路径与全局开关
 # 留空表示使用缺省路径（项目内 data/）
+# data_dir 是根目录；db/log/cache 的空值会在该根目录下自动推导
 data_dir = ""
 db_path = ""
 log_path = ""
 market_data_log_path = ""
 market_cache_db_path = ""
+# 市场映射配置文件（market -> sec_type/exchange/currency）
 market_config_path = "conf/markets.json"
+# live 交易总开关（即使 trading_mode=live，也需该开关显式为 true）
 enable_live_trading = false
 
 [worker]
+# 策略执行引擎配置（扫描 + 线程池）
 enabled = false
+# 扫描周期（秒）
 monitor_interval_seconds = 60
+# worker 线程数
 threads = 2
+# 策略任务队列上限
 queue_maxsize = 4096
+# 事件节流：网关不可用事件最小间隔（秒）
 gateway_not_work_event_throttle_seconds = 300
+# 事件节流：行情未就绪事件最小间隔（秒）
 waiting_for_market_data_event_throttle_seconds = 120
+
+[providers]
+# 外部依赖提供者选择
+# - "ib": 真实 IB 连接
+# - "fixture": 本地样本数据（离线测试）
+broker_data = "fixture"
+market_data = "fixture"

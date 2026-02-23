@@ -1,6 +1,7 @@
 import http from './http'
 import type {
   ActiveTradeInstruction,
+  ConditionRulesResponse,
   EventItem,
   PortfolioSummary,
   PositionItem,
@@ -73,6 +74,11 @@ export async function resumeStrategy(strategyId: string) {
 
 export async function fetchEvents() {
   const { data } = await http.get<EventItem[]>('/events')
+  return data
+}
+
+export async function fetchConditionRules() {
+  const { data } = await http.get<ConditionRulesResponse>('/condition-rules')
   return data
 }
 

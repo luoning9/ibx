@@ -9,11 +9,13 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Mapping, Protocol
 
+from .config import PROJECT_ROOT, load_app_config
 from .logging_config import configure_market_data_logging
 from .runtime_paths import resolve_market_cache_db_path
 
 
 UTC = timezone.utc
+DEFAULT_MARKET_DATA_FIXTURE_PATH = PROJECT_ROOT / "conf" / "fixtures" / "market_data.sample.json"
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,11 @@ class HistoricalBarsFetcher(Protocol):
         what_to_show: str,
         use_rth: bool,
     ) -> list[HistoricalBar | Mapping[str, Any]]:
+        ...
+
+
+class MarketDataProvider(Protocol):
+    def get_historical_bars(self, request: HistoricalBarsRequest) -> HistoricalBarsResult:
         ...
 
 
@@ -528,3 +535,132 @@ class SQLiteMarketDataCache:
         except Exception:
             self._logger.exception("historical_bars failed cache_key=%s", cache_key)
             raise
+
+
+class FixtureMarketDataProvider:
+    def __init__(
+        self,
+        *,
+        fixture_path: str | Path | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+    ) -> None:
+        configure_market_data_logging()
+        self._logger = logging.getLogger("ibx.market_data")
+        self._fixture_path = Path(fixture_path) if fixture_path is not None else DEFAULT_MARKET_DATA_FIXTURE_PATH
+        self._now_fn = now_fn or (lambda: datetime.now(UTC))
+        self._cache: dict[str, Any] | None = None
+        self._logger.info("FixtureMarketDataProvider initialized fixture_path=%s", self._fixture_path.resolve())
+
+    def _load_payload(self) -> dict[str, Any]:
+        if self._cache is not None:
+            return self._cache
+        if not self._fixture_path.exists():
+            raise RuntimeError(f"market data fixture not found: {self._fixture_path}")
+        try:
+            payload = json.loads(self._fixture_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid market data fixture JSON: {self._fixture_path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("market data fixture root must be a JSON object")
+        self._cache = payload
+        return payload
+
+    def get_historical_bars(self, request: HistoricalBarsRequest) -> HistoricalBarsResult:
+        start = _to_utc(request.start_time)
+        end = _to_utc(request.end_time)
+        if start >= end:
+            raise ValueError("start_time must be earlier than end_time")
+        if request.max_bars is not None and request.max_bars <= 0:
+            raise ValueError("max_bars must be positive")
+        if request.page_size is not None and request.page_size <= 0:
+            raise ValueError("page_size must be positive")
+        bar_size = request.bar_size.strip()
+        if not bar_size:
+            raise ValueError("bar_size cannot be empty")
+
+        cache_key = _cache_key(
+            request.contract,
+            bar_size=bar_size,
+            what_to_show=request.what_to_show,
+            use_rth=request.use_rth,
+        )
+        payload = self._load_payload()
+        series = payload.get("series")
+        if not isinstance(series, list):
+            raise RuntimeError("market data fixture must contain `series` list")
+
+        bars: list[HistoricalBar] = []
+        for item in series:
+            row = item if isinstance(item, dict) else {}
+            row_contract = row.get("contract")
+            row_bar_size = str(row.get("bar_size", "")).strip() or bar_size
+            row_what_to_show = str(row.get("what_to_show", "TRADES"))
+            row_use_rth = bool(row.get("use_rth", True))
+            try:
+                row_key = _cache_key(
+                    row_contract,
+                    bar_size=row_bar_size,
+                    what_to_show=row_what_to_show,
+                    use_rth=row_use_rth,
+                )
+            except ValueError:
+                continue
+            if row_key != cache_key:
+                continue
+            raw_bars = row.get("bars")
+            if not isinstance(raw_bars, list):
+                continue
+            for raw_bar in raw_bars:
+                bar = _coerce_bar(raw_bar)
+                if start <= bar.ts < end:
+                    bars.append(bar)
+
+        bars.sort(key=lambda x: x.ts)
+        bar_delta = _parse_bar_size(bar_size)
+        if not request.include_partial_bar and bar_delta is not None:
+            now = _to_utc(self._now_fn())
+            bars = [bar for bar in bars if bar.ts + bar_delta <= now]
+
+        truncated = False
+        if request.max_bars is not None and len(bars) > request.max_bars:
+            bars = bars[-request.max_bars :]
+            truncated = True
+
+        meta = {
+            "source": "FIXTURE",
+            "timezone": "UTC",
+            "bar_size": bar_size,
+            "what_to_show": request.what_to_show,
+            "use_rth": request.use_rth,
+            "include_partial_bar": request.include_partial_bar,
+            "cache_hit_ratio": 1.0,
+            "has_gaps": len(bars) == 0,
+            "fetched_segments": [],
+            "covered_segments": [{"start": _to_iso_utc(start), "end": _to_iso_utc(end)}],
+            "returned_bars": len(bars),
+            "truncated": truncated,
+        }
+        return HistoricalBarsResult(bars=bars, meta=meta)
+
+
+def build_market_data_provider_from_config(
+    *,
+    fetcher: HistoricalBarsFetcher | None = None,
+    db_path: str | Path | None = None,
+    fixture_path: str | Path | None = None,
+    now_fn: Callable[[], datetime] | None = None,
+) -> MarketDataProvider:
+    cfg = load_app_config()
+    provider = cfg.providers.market_data
+    if provider == "fixture":
+        return FixtureMarketDataProvider(
+            fixture_path=fixture_path,
+            now_fn=now_fn,
+        )
+    if fetcher is None:
+        raise ValueError("fetcher is required when providers.market_data=ib")
+    return SQLiteMarketDataCache(
+        fetcher=fetcher,
+        db_path=db_path,
+        now_fn=now_fn,
+    )

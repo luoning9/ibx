@@ -15,10 +15,7 @@
         "include_partial_bar": true,
         "missing_data_policy": "fail",
         "windows": {
-          "1m": { "base_bar": "1m", "confirm_consecutive": 1, "confirm_ratio": 1.0 },
-          "5m": { "base_bar": "1m", "confirm_consecutive": 1, "confirm_ratio": 1.0 },
-          "30m": { "base_bar": "5m", "confirm_consecutive": 1, "confirm_ratio": 1.0 },
-          "1h": { "base_bar": "5m", "confirm_consecutive": 1, "confirm_ratio": 1.0 }
+          "1m": { "base_bar": "1m", "confirm_consecutive": 1, "confirm_ratio": 1.0 }
         }
       },
       {

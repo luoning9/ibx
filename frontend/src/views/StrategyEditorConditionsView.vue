@@ -4,7 +4,8 @@ import { Delete } from '@element-plus/icons-vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { fetchStrategyDetail, putStrategyConditions } from '../api/services'
+import { fetchConditionRules, fetchStrategyDetail, putStrategyConditions } from '../api/services'
+import type { ConditionRulesResponse } from '../api/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -14,66 +15,27 @@ const MAX_CONDITIONS = 2
 
 const CONDITION_TYPES = ['SINGLE_PRODUCT', 'PAIR_PRODUCTS'] as const
 const EVALUATION_WINDOWS = ['1m', '5m', '30m', '1h', '2h', '4h', '1d', '2d'] as const
-const FAST_EVALUATION_WINDOWS: EvaluationWindow[] = ['1m', '5m', '30m', '1h']
-const RATIO_EVALUATION_WINDOWS: EvaluationWindow[] = ['1h', '2h', '4h', '1d', '2d']
-const WINDOW_PRICE_BASIS_OPTIONS = ['CLOSE', 'HIGH', 'LOW', 'AVG'] as const
 
 type ConditionType = (typeof CONDITION_TYPES)[number]
 type EvaluationWindow = (typeof EVALUATION_WINDOWS)[number]
-type WindowPriceBasis = (typeof WINDOW_PRICE_BASIS_OPTIONS)[number]
 type Metric = 'PRICE' | 'DRAWDOWN_PCT' | 'RALLY_PCT' | 'VOLUME_RATIO' | 'AMOUNT_RATIO' | 'SPREAD'
 type ValueType = 'USD' | 'RATIO'
+type TriggerMode =
+  | 'LEVEL_INSTANT'
+  | 'LEVEL_CONFIRM'
+  | 'CROSS_UP_INSTANT'
+  | 'CROSS_UP_CONFIRM'
+  | 'CROSS_DOWN_INSTANT'
+  | 'CROSS_DOWN_CONFIRM'
+type Operator = '>=' | '<='
+type TriggerRuleId = `${string}|>=` | `${string}|<=`
 
 type TriggerRuleDef = {
-  triggerMode: 'LEVEL_INSTANT' | 'LEVEL_CONFIRM' | 'CROSS_UP_INSTANT' | 'CROSS_UP_CONFIRM' | 'CROSS_DOWN_INSTANT' | 'CROSS_DOWN_CONFIRM'
-  operator: '>=' | '<='
+  id: TriggerRuleId
+  triggerMode: TriggerMode
+  operator: Operator
   label: string
 }
-
-const TRIGGER_RULE_DEFS = {
-  LEVEL_GTE: {
-    triggerMode: 'LEVEL_INSTANT',
-    operator: '>=',
-    label: '达到/高于阈值（LEVEL_INSTANT + >=）',
-  },
-  LEVEL_LTE: {
-    triggerMode: 'LEVEL_INSTANT',
-    operator: '<=',
-    label: '达到/低于阈值（LEVEL_INSTANT + <=）',
-  },
-  LEVEL_CONFIRM_GTE: {
-    triggerMode: 'LEVEL_CONFIRM',
-    operator: '>=',
-    label: '确认达到/高于阈值（LEVEL_CONFIRM + >=）',
-  },
-  LEVEL_CONFIRM_LTE: {
-    triggerMode: 'LEVEL_CONFIRM',
-    operator: '<=',
-    label: '确认达到/低于阈值（LEVEL_CONFIRM + <=）',
-  },
-  CROSS_UP: {
-    triggerMode: 'CROSS_UP_INSTANT',
-    operator: '>=',
-    label: '上穿阈值（CROSS_UP_INSTANT + >=）',
-  },
-  CROSS_UP_CONFIRM: {
-    triggerMode: 'CROSS_UP_CONFIRM',
-    operator: '>=',
-    label: '确认上穿阈值（CROSS_UP_CONFIRM + >=）',
-  },
-  CROSS_DOWN: {
-    triggerMode: 'CROSS_DOWN_INSTANT',
-    operator: '<=',
-    label: '下穿阈值（CROSS_DOWN_INSTANT + <=）',
-  },
-  CROSS_DOWN_CONFIRM: {
-    triggerMode: 'CROSS_DOWN_CONFIRM',
-    operator: '<=',
-    label: '确认下穿阈值（CROSS_DOWN_CONFIRM + <=）',
-  },
-} as const satisfies Record<string, TriggerRuleDef>
-
-type TriggerRuleKey = keyof typeof TRIGGER_RULE_DEFS
 
 type MetricOption = {
   metric: Metric
@@ -99,14 +61,60 @@ const METRIC_OPTIONS_BY_TYPE: Record<ConditionType, MetricOption[]> = {
   ],
 }
 
-const METRIC_TRIGGER_RULES: Record<Metric, TriggerRuleKey[]> = {
-  PRICE: ['LEVEL_GTE', 'LEVEL_LTE', 'CROSS_UP', 'CROSS_DOWN'],
-  DRAWDOWN_PCT: ['LEVEL_GTE'],
-  RALLY_PCT: ['LEVEL_GTE'],
-  VOLUME_RATIO: ['LEVEL_CONFIRM_GTE', 'LEVEL_CONFIRM_LTE'],
-  AMOUNT_RATIO: ['LEVEL_CONFIRM_GTE', 'LEVEL_CONFIRM_LTE'],
-  SPREAD: ['LEVEL_CONFIRM_GTE', 'LEVEL_CONFIRM_LTE', 'CROSS_UP_CONFIRM', 'CROSS_DOWN_CONFIRM'],
+const DEFAULT_ALLOWED_WINDOWS: Record<Metric, EvaluationWindow[]> = {
+  PRICE: ['1m', '5m', '30m', '1h'],
+  DRAWDOWN_PCT: ['1m', '5m', '30m', '1h'],
+  RALLY_PCT: ['1m', '5m', '30m', '1h'],
+  SPREAD: ['1m', '5m', '30m', '1h'],
+  VOLUME_RATIO: ['1h', '2h', '4h', '1d', '2d'],
+  AMOUNT_RATIO: ['1h', '2h', '4h', '1d', '2d'],
 }
+
+const DEFAULT_ALLOWED_RULES: Record<Metric, Array<{ trigger_mode: TriggerMode; operator: Operator }>> = {
+  PRICE: [
+    { trigger_mode: 'LEVEL_INSTANT', operator: '>=' },
+    { trigger_mode: 'LEVEL_INSTANT', operator: '<=' },
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '>=' },
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '<=' },
+    { trigger_mode: 'CROSS_UP_INSTANT', operator: '>=' },
+    { trigger_mode: 'CROSS_UP_CONFIRM', operator: '>=' },
+    { trigger_mode: 'CROSS_DOWN_INSTANT', operator: '<=' },
+    { trigger_mode: 'CROSS_DOWN_CONFIRM', operator: '<=' },
+  ],
+  DRAWDOWN_PCT: [
+    { trigger_mode: 'LEVEL_INSTANT', operator: '>=' },
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '>=' },
+  ],
+  RALLY_PCT: [
+    { trigger_mode: 'LEVEL_INSTANT', operator: '>=' },
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '>=' },
+  ],
+  VOLUME_RATIO: [
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '>=' },
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '<=' },
+  ],
+  AMOUNT_RATIO: [
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '>=' },
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '<=' },
+  ],
+  SPREAD: [
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '>=' },
+    { trigger_mode: 'LEVEL_CONFIRM', operator: '<=' },
+    { trigger_mode: 'CROSS_UP_CONFIRM', operator: '>=' },
+    { trigger_mode: 'CROSS_DOWN_CONFIRM', operator: '<=' },
+  ],
+}
+
+const DEFAULT_TRIGGER_MODE_WINDOWS: Record<TriggerMode, EvaluationWindow[]> = {
+  LEVEL_INSTANT: ['1m', '5m', '30m', '1h'],
+  CROSS_UP_INSTANT: ['1m', '5m', '30m', '1h'],
+  CROSS_DOWN_INSTANT: ['1m', '5m', '30m', '1h'],
+  LEVEL_CONFIRM: ['5m', '30m', '1h', '2h', '4h', '1d', '2d'],
+  CROSS_UP_CONFIRM: ['5m', '30m', '1h', '2h', '4h', '1d', '2d'],
+  CROSS_DOWN_CONFIRM: ['5m', '30m', '1h', '2h', '4h', '1d', '2d'],
+}
+
+const conditionRules = ref<ConditionRulesResponse | null>(null)
 
 const METRIC_VALUE_TYPES: Record<Metric, ValueType> = {
   PRICE: 'USD',
@@ -123,9 +131,8 @@ type ConditionRow = {
   product: string
   productB: string
   evaluationWindow: EvaluationWindow
-  windowPriceBasis: WindowPriceBasis
   metric: Metric
-  triggerRule: TriggerRuleKey
+  triggerRuleId: TriggerRuleId
   valueText: string
 }
 
@@ -163,32 +170,106 @@ function getMetricOptions(conditionType: ConditionType) {
   return METRIC_OPTIONS_BY_TYPE[conditionType]
 }
 
-function getAllowedRules(metric: Metric) {
-  return METRIC_TRIGGER_RULES[metric]
+function buildTriggerRuleId(triggerMode: TriggerMode, operator: Operator): TriggerRuleId {
+  return `${triggerMode}|${operator}`
+}
+
+function buildTriggerRuleLabel(triggerMode: TriggerMode, operator: Operator) {
+  const opText = operator === '>=' ? '高于' : '低于'
+  if (triggerMode === 'LEVEL_INSTANT') return `一旦达到/${opText}阈值（${triggerMode} + ${operator}）`
+  if (triggerMode === 'LEVEL_CONFIRM') return `确认达到/${opText}阈值（${triggerMode} + ${operator}）`
+  if (triggerMode === 'CROSS_UP_INSTANT') return `一旦上穿阈值（${triggerMode} + ${operator}）`
+  if (triggerMode === 'CROSS_UP_CONFIRM') return `确认上穿阈值（${triggerMode} + ${operator}）`
+  if (triggerMode === 'CROSS_DOWN_INSTANT') return `一旦下穿阈值（${triggerMode} + ${operator}）`
+  return `确认下穿阈值（${triggerMode} + ${operator}）`
+}
+
+function asTriggerMode(value: string): TriggerMode | null {
+  if (
+    value === 'LEVEL_INSTANT' ||
+    value === 'LEVEL_CONFIRM' ||
+    value === 'CROSS_UP_INSTANT' ||
+    value === 'CROSS_UP_CONFIRM' ||
+    value === 'CROSS_DOWN_INSTANT' ||
+    value === 'CROSS_DOWN_CONFIRM'
+  ) {
+    return value
+  }
+  return null
+}
+
+function normalizeRulePairList(metric: Metric) {
+  const fromApi = conditionRules.value?.metric_trigger_operator_rules.allowed_rules?.[metric]
+  const fallback = DEFAULT_ALLOWED_RULES[metric]
+  const source = Array.isArray(fromApi) && fromApi.length > 0 ? fromApi : fallback
+  const out: Array<{ trigger_mode: TriggerMode; operator: Operator }> = []
+  for (const item of source) {
+    const triggerMode = asTriggerMode(String(item.trigger_mode || ''))
+    const operator = item.operator
+    if (!triggerMode) continue
+    if (operator !== '>=' && operator !== '<=') continue
+    out.push({ trigger_mode: triggerMode, operator })
+  }
+  if (out.length === 0) return fallback
+  return out
+}
+
+function getAllowedRules(metric: Metric): TriggerRuleDef[] {
+  return normalizeRulePairList(metric).map((item) => ({
+    id: buildTriggerRuleId(item.trigger_mode, item.operator),
+    triggerMode: item.trigger_mode,
+    operator: item.operator,
+    label: buildTriggerRuleLabel(item.trigger_mode, item.operator),
+  }))
+}
+
+function getTriggerModeWindows(triggerMode: TriggerMode): EvaluationWindow[] {
+  const windowsFromApi = conditionRules.value?.trigger_mode_windows?.[triggerMode]
+  if (windowsFromApi && typeof windowsFromApi === 'object') {
+    const parsed = Object.keys(windowsFromApi).filter((item): item is EvaluationWindow =>
+      (EVALUATION_WINDOWS as readonly string[]).includes(item),
+    )
+    if (parsed.length > 0) return parsed
+  }
+  return DEFAULT_TRIGGER_MODE_WINDOWS[triggerMode]
+}
+
+function getMetricAllowedWindows(metric: Metric): EvaluationWindow[] {
+  const windowsFromApi = conditionRules.value?.metric_trigger_operator_rules.allowed_windows?.[metric]
+  if (Array.isArray(windowsFromApi) && windowsFromApi.length > 0) {
+    const parsed = windowsFromApi.filter((item): item is EvaluationWindow =>
+      (EVALUATION_WINDOWS as readonly string[]).includes(item),
+    )
+    if (parsed.length > 0) return parsed
+  }
+  return DEFAULT_ALLOWED_WINDOWS[metric]
 }
 
 function getDefaultMetric(conditionType: ConditionType) {
   return getMetricOptions(conditionType)[0]!.metric
 }
 
-function getDefaultRule(metric: Metric) {
-  return getAllowedRules(metric)[0]!
+function getDefaultRuleId(metric: Metric) {
+  return getAllowedRules(metric)[0]!.id
 }
 
 function getValueType(metric: Metric): ValueType {
   return METRIC_VALUE_TYPES[metric]
 }
 
-function isRatioMetric(metric: Metric) {
-  return metric === 'VOLUME_RATIO' || metric === 'AMOUNT_RATIO'
+function getEvaluationWindowOptions(metric: Metric, triggerRuleId?: TriggerRuleId): EvaluationWindow[] {
+  const metricWindows = getMetricAllowedWindows(metric)
+  if (!triggerRuleId) return metricWindows
+  const triggerMode = asTriggerMode(triggerRuleId.split('|')[0] || '')
+  if (!triggerMode) return metricWindows
+  const triggerModeWindows = getTriggerModeWindows(triggerMode)
+  const set = new Set(triggerModeWindows)
+  const merged = metricWindows.filter((item) => set.has(item))
+  return merged.length > 0 ? merged : metricWindows
 }
 
-function getEvaluationWindowOptions(metric: Metric): EvaluationWindow[] {
-  return isRatioMetric(metric) ? RATIO_EVALUATION_WINDOWS : FAST_EVALUATION_WINDOWS
-}
-
-function getDefaultEvaluationWindow(metric: Metric): EvaluationWindow {
-  return getEvaluationWindowOptions(metric)[0]!
+function getDefaultEvaluationWindow(metric: Metric, triggerRuleId?: TriggerRuleId): EvaluationWindow {
+  return getEvaluationWindowOptions(metric, triggerRuleId)[0]!
 }
 
 function getValuePlaceholder(metric: Metric) {
@@ -199,16 +280,17 @@ function getValueUnit(metric: Metric) {
   return getValueType(metric) === 'RATIO' ? '%' : '$'
 }
 
-function deriveTriggerRuleKey(
+function deriveTriggerRuleId(
+  metric: Metric,
   triggerModeRaw: string,
   operatorRaw: string,
-  fallback: TriggerRuleKey,
-): TriggerRuleKey {
-  const matched = (Object.keys(TRIGGER_RULE_DEFS) as TriggerRuleKey[]).find((key) => {
-    const def = TRIGGER_RULE_DEFS[key]
-    return def.triggerMode === triggerModeRaw && def.operator === operatorRaw
-  })
-  return matched || fallback
+  fallback: TriggerRuleId,
+): TriggerRuleId {
+  const triggerMode = asTriggerMode(triggerModeRaw)
+  if (!triggerMode) return fallback
+  if (operatorRaw !== '>=' && operatorRaw !== '<=') return fallback
+  const candidate = buildTriggerRuleId(triggerMode, operatorRaw)
+  return getAllowedRules(metric).some((item) => item.id === candidate) ? candidate : fallback
 }
 
 function syncNextConditionId() {
@@ -233,16 +315,13 @@ function normalizeRow(row: ConditionRow) {
   }
 
   const allowedRules = getAllowedRules(row.metric)
-  if (!allowedRules.includes(row.triggerRule)) {
-    row.triggerRule = allowedRules[0]!
+  if (!allowedRules.some((item) => item.id === row.triggerRuleId)) {
+    row.triggerRuleId = allowedRules[0]!.id
   }
 
-  const allowedWindows = getEvaluationWindowOptions(row.metric)
+  const allowedWindows = getEvaluationWindowOptions(row.metric, row.triggerRuleId)
   if (!allowedWindows.includes(row.evaluationWindow)) {
-    row.evaluationWindow = getDefaultEvaluationWindow(row.metric)
-  }
-  if (isRatioMetric(row.metric)) {
-    row.windowPriceBasis = 'CLOSE'
+    row.evaluationWindow = getDefaultEvaluationWindow(row.metric, row.triggerRuleId)
   }
 }
 
@@ -262,12 +341,11 @@ function addConditionRow(initial?: Partial<ConditionRow>) {
     conditionType,
     product: initial?.product || '',
     productB: initial?.productB || '',
-    evaluationWindow: initial?.evaluationWindow || getDefaultEvaluationWindow(metric),
-    windowPriceBasis: initial?.windowPriceBasis || 'CLOSE',
+    evaluationWindow: initial?.evaluationWindow || getDefaultEvaluationWindow(metric, initial?.triggerRuleId),
     metric,
-    triggerRule: initial?.triggerRule && getAllowedRules(metric).includes(initial.triggerRule as TriggerRuleKey)
-      ? (initial.triggerRule as TriggerRuleKey)
-      : getDefaultRule(metric),
+    triggerRuleId: initial?.triggerRuleId && getAllowedRules(metric).some((item) => item.id === initial.triggerRuleId)
+      ? initial.triggerRuleId
+      : getDefaultRuleId(metric),
     valueText: initial?.valueText || '',
   }
 
@@ -286,8 +364,12 @@ function onConditionTypeChange(row: ConditionRow) {
 }
 
 function onMetricChange(row: ConditionRow) {
-  row.triggerRule = getDefaultRule(row.metric)
+  row.triggerRuleId = getDefaultRuleId(row.metric)
   row.valueText = ''
+  normalizeRow(row)
+}
+
+function onTriggerRuleChange(row: ConditionRow) {
   normalizeRow(row)
 }
 
@@ -320,7 +402,8 @@ function buildConditionPayload(row: ConditionRow) {
   const conditionId = row.conditionId.trim()
   if (!conditionId) throw new Error('condition_id 不能为空')
 
-  const ruleDef = TRIGGER_RULE_DEFS[row.triggerRule]
+  const ruleDef = getAllowedRules(row.metric).find((item) => item.id === row.triggerRuleId)
+  if (!ruleDef) throw new Error(`条件 ${conditionId} 的触发判定无效`)
   const value = parseRowValue(row.metric, row.valueText.trim())
 
   const payload: Record<string, unknown> = {
@@ -329,7 +412,7 @@ function buildConditionPayload(row: ConditionRow) {
     metric: row.metric,
     trigger_mode: ruleDef.triggerMode,
     evaluation_window: row.evaluationWindow,
-    window_price_basis: row.windowPriceBasis,
+    window_price_basis: 'CLOSE',
     operator: ruleDef.operator,
     value,
   }
@@ -391,11 +474,12 @@ async function loadDetail() {
         ? metricRaw
         : getDefaultMetric(conditionType)
 
-      const fallbackRule = getDefaultRule(metric)
-      const triggerRule = deriveTriggerRuleKey(
+      const fallbackRuleId = getDefaultRuleId(metric)
+      const triggerRuleId = deriveTriggerRuleId(
+        metric,
         asString(condition.trigger_mode),
         asString(condition.operator),
-        fallbackRule,
+        fallbackRuleId,
       )
 
       addConditionRow({
@@ -405,12 +489,9 @@ async function loadDetail() {
         productB: asString(condition.product_b),
         evaluationWindow: (EVALUATION_WINDOWS as readonly string[]).includes(asString(condition.evaluation_window))
           ? (asString(condition.evaluation_window) as EvaluationWindow)
-          : getDefaultEvaluationWindow(metric),
-        windowPriceBasis: (WINDOW_PRICE_BASIS_OPTIONS as readonly string[]).includes(asString(condition.window_price_basis))
-          ? (asString(condition.window_price_basis) as WindowPriceBasis)
-          : 'CLOSE',
+          : getDefaultEvaluationWindow(metric, triggerRuleId),
         metric,
-        triggerRule,
+        triggerRuleId,
         valueText: mapValueFromBackend(metric, condition.value),
       })
     }
@@ -421,6 +502,15 @@ async function loadDetail() {
     error.value = `加载策略失败：${String(err)}`
   } finally {
     loading.value = false
+  }
+}
+
+async function loadConditionRules() {
+  try {
+    conditionRules.value = await fetchConditionRules()
+  } catch {
+    conditionRules.value = null
+    ElMessage.warning('条件规则配置加载失败，已使用前端缺省规则')
   }
 }
 
@@ -450,7 +540,10 @@ async function saveConditions() {
   }
 }
 
-onMounted(loadDetail)
+onMounted(async () => {
+  await loadConditionRules()
+  await loadDetail()
+})
 </script>
 
 <template>
@@ -473,10 +566,10 @@ onMounted(loadDetail)
       />
 
       <div class="editor-note">
-        编辑规则：第一行固定 <code>condition_id / type(单选) / product / evaluation_window / window_price_basis</code>；
+        编辑规则：第一行固定 <code>condition_id / type(单选) / product / evaluation_window</code>；
         第二行设置 <code>指标（含基准） / 触发判定 / value</code>；
         <code>condition_id</code> 自动生成；价格类窗口支持分钟级，成交量/成交额比值支持小时/天级；
-        <code>window_price_basis</code> 缺省为 <code>CLOSE</code>。
+        <code>window_price_basis</code> 固定为 <code>CLOSE</code>。
       </div>
 
       <div class="conditions-toolbar">
@@ -584,36 +677,25 @@ onMounted(loadDetail)
                   <span class="window-prefix">window</span>
                   <el-select v-model="row.evaluationWindow" size="small" class="full-width">
                     <el-option
-                      v-for="item in getEvaluationWindowOptions(row.metric)"
+                      v-for="item in getEvaluationWindowOptions(row.metric, row.triggerRuleId)"
                       :key="item"
                       :label="item"
                       :value="item"
                     />
                   </el-select>
                 </div>
-                <el-select
-                  v-model="row.windowPriceBasis"
-                  size="small"
-                  class="full-width"
-                  :disabled="isRatioMetric(row.metric)"
-                >
-                  <el-option label="收盘价（CLOSE）" value="CLOSE" />
-                  <el-option label="最高价（HIGH）" value="HIGH" />
-                  <el-option label="最低价（LOW）" value="LOW" />
-                  <el-option label="平均价（AVG）" value="AVG" />
-                </el-select>
               </div>
             </div>
 
             <div class="condition-field">
               <label class="field-label">触发判定 / value</label>
               <div class="trigger-value-row">
-                <el-select v-model="row.triggerRule" size="small" class="full-width">
+                <el-select v-model="row.triggerRuleId" size="small" class="full-width" @change="onTriggerRuleChange(row)">
                   <el-option
                     v-for="rule in getAllowedRules(row.metric)"
-                    :key="rule"
-                    :label="TRIGGER_RULE_DEFS[rule].label"
-                    :value="rule"
+                    :key="rule.id"
+                    :label="rule.label"
+                    :value="rule.id"
                   />
                 </el-select>
                 <div class="value-inline-group">

@@ -1,0 +1,164 @@
+{
+  "series": [
+    {
+      "contract": "VGT",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 734.9,
+          "high": 735.2,
+          "low": 734.7,
+          "close": 735.0,
+          "volume": 410
+        },
+        {
+          "ts": "2026-02-22T10:01:00Z",
+          "open": 735.0,
+          "high": 735.7,
+          "low": 734.9,
+          "close": 735.4,
+          "volume": 520
+        },
+        {
+          "ts": "2026-02-22T10:02:00Z",
+          "open": 735.4,
+          "high": 735.9,
+          "low": 735.3,
+          "close": 735.6476,
+          "volume": 615
+        }
+      ]
+    },
+    {
+      "contract": "IAU",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 96.9,
+          "high": 97.1,
+          "low": 96.8,
+          "close": 97.0198,
+          "volume": 2580
+        }
+      ]
+    },
+    {
+      "contract": "SLV",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 78.5,
+          "high": 78.8,
+          "low": 78.4,
+          "close": 78.6747,
+          "volume": 2300
+        }
+      ]
+    },
+    {
+      "contract": "IEI",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 119.95,
+          "high": 120.08,
+          "low": 119.9,
+          "close": 120.02,
+          "volume": 1300
+        }
+      ]
+    },
+    {
+      "contract": "MGK",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 388.4,
+          "high": 388.9,
+          "low": 388.2,
+          "close": 388.7052,
+          "volume": 380
+        }
+      ]
+    },
+    {
+      "contract": "USAR",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 17.05,
+          "high": 17.15,
+          "low": 17.0,
+          "close": 17.12,
+          "volume": 6500
+        }
+      ]
+    },
+    {
+      "contract": "CRML",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 8.95,
+          "high": 9.05,
+          "low": 8.9,
+          "close": 9.02,
+          "volume": 11000
+        }
+      ]
+    },
+    {
+      "contract": "LTBR",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 12.8,
+          "high": 12.9,
+          "low": 12.75,
+          "close": 12.88,
+          "volume": 7460
+        }
+      ]
+    },
+    {
+      "contract": "IPX",
+      "bar_size": "1 min",
+      "what_to_show": "TRADES",
+      "use_rth": true,
+      "bars": [
+        {
+          "ts": "2026-02-22T10:00:00Z",
+          "open": 41.95,
+          "high": 42.1,
+          "low": 41.9,
+          "close": 42.0527,
+          "volume": 2170
+        }
+      ]
+    }
+  ]
+}

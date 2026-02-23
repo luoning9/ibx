@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.config import clear_app_config_cache
 from app.db import get_connection, init_db
+from app.verification import ActivationVerificationResult
 from app.worker import (
     StrategyExecutionEngine,
     StrategyTask,
@@ -72,7 +73,13 @@ def _insert_strategy(
 
 def test_strategy_task_queue_deduplicates_inflight() -> None:
     task_queue = StrategyTaskQueue(maxsize=8)
-    task = StrategyTask(strategy_id="S-TQ-1", reason="unit_test", enqueued_at=datetime.now(UTC))
+    task = StrategyTask(
+        strategy_id="S-TQ-1",
+        reason="unit_test",
+        expected_status="ACTIVE",
+        expected_version=1,
+        enqueued_at=datetime.now(UTC),
+    )
 
     assert task_queue.enqueue(task) is True
     assert task_queue.enqueue(task) is False
@@ -97,6 +104,31 @@ def test_scan_once_excludes_verify_failed(tmp_path) -> None:
     try:
         enqueued = engine.scan_once()
         assert enqueued == 1
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_scan_once_enqueues_task_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_scan_snapshot.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy("S-WORKER-SCAN-SNAPSHOT", db_path=db_path, status="ACTIVE")
+
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        enqueued = engine.scan_once()
+        assert enqueued == 1
+
+        task = engine._queue.pop(timeout=0.01)
+        assert task is not None
+        assert task.strategy_id == "S-WORKER-SCAN-SNAPSHOT"
+        assert task.expected_status == "ACTIVE"
+        assert task.expected_version == 1
+        engine._queue.mark_done(task.strategy_id)
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
@@ -144,6 +176,133 @@ def test_process_once_skips_when_already_inflight(tmp_path) -> None:
             assert run_row["c"] == 0
     finally:
         engine._queue.release("S-WORKER-INFLIGHT")
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_start_clears_legacy_locks(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_start_clear_locks.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy("S-WORKER-LEGACY-LOCK", db_path=db_path, status="VERIFY_FAILED")
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE strategies SET lock_until = ? WHERE id = ?",
+            ("2099-01-01T00:00:00Z", "S-WORKER-LEGACY-LOCK"),
+        )
+        conn.commit()
+
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=600,
+        worker_count=1,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.start()
+        engine.stop()
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT lock_until FROM strategies WHERE id = ?",
+                ("S-WORKER-LEGACY-LOCK",),
+            ).fetchone()
+            assert row is not None
+            assert row["lock_until"] is None
+    finally:
+        if engine.running:
+            engine.stop()
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_task_skips_when_status_changed_after_enqueue_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_stale_status.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy("S-WORKER-STALE-STATUS", db_path=db_path, status="ACTIVE")
+    stale_task = StrategyTask(
+        strategy_id="S-WORKER-STALE-STATUS",
+        reason="unit_test",
+        expected_status="ACTIVE",
+        expected_version=1,
+        enqueued_at=datetime.now(UTC),
+    )
+
+    now_iso = _iso_now()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE strategies
+            SET status = 'PAUSED', updated_at = ?, version = version + 1
+            WHERE id = ?
+            """,
+            (now_iso, "S-WORKER-STALE-STATUS"),
+        )
+        conn.commit()
+
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine._process_task(stale_task)
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT status, version, lock_until FROM strategies WHERE id = ?",
+                ("S-WORKER-STALE-STATUS",),
+            ).fetchone()
+            assert row is not None
+            assert row["status"] == "PAUSED"
+            assert row["version"] == 2
+            assert row["lock_until"] is None
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_task_skips_when_version_changed_after_enqueue_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_stale_version.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy("S-WORKER-STALE-VERSION", db_path=db_path, status="ACTIVE")
+    stale_task = StrategyTask(
+        strategy_id="S-WORKER-STALE-VERSION",
+        reason="unit_test",
+        expected_status="ACTIVE",
+        expected_version=1,
+        enqueued_at=datetime.now(UTC),
+    )
+
+    now_iso = _iso_now()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE strategies
+            SET description = ?, updated_at = ?, version = version + 1
+            WHERE id = ?
+            """,
+            ("updated by api", now_iso, "S-WORKER-STALE-VERSION"),
+        )
+        conn.commit()
+
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine._process_task(stale_task)
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT status, version, lock_until FROM strategies WHERE id = ?",
+                ("S-WORKER-STALE-VERSION",),
+            ).fetchone()
+            assert row is not None
+            assert row["status"] == "ACTIVE"
+            assert row["version"] == 2
+            assert row["lock_until"] is None
+    finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
         else:
@@ -311,13 +470,22 @@ def test_process_once_triggered_creates_trade_instruction(tmp_path) -> None:
             os.environ["IBX_DB_PATH"] = old_db_path
 
 
-def test_process_once_verifying_moves_to_active(tmp_path) -> None:
+def test_process_once_verifying_moves_to_active(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "ibx_worker_verifying.sqlite3"
     init_db(db_path=db_path)
     _insert_strategy(
         "S-WORKER-VERIFY",
         db_path=db_path,
         status="VERIFYING",
+    )
+    monkeypatch.setattr(
+        "app.worker.run_activation_verification",
+        lambda conn, *, strategy_id, strategy_row: ActivationVerificationResult(
+            passed=True,
+            reason="verification_passed",
+            resolved_symbol_contracts=1,
+            updated_condition_contracts=2,
+        ),
     )
 
     engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
@@ -348,6 +516,59 @@ def test_process_once_verifying_moves_to_active(tmp_path) -> None:
             ).fetchone()
             assert event_row is not None
             assert event_row["event_type"] == "ACTIVATED"
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_verifying_moves_to_verify_failed_when_verification_rejected(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "ibx_worker_verifying_failed.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-VERIFY-FAIL",
+        db_path=db_path,
+        status="VERIFYING",
+    )
+    monkeypatch.setattr(
+        "app.worker.run_activation_verification",
+        lambda conn, *, strategy_id, strategy_row: ActivationVerificationResult(
+            passed=False,
+            reason="verification rejected",
+        ),
+    )
+
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-VERIFY-FAIL", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-VERIFY-FAIL",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "VERIFY_FAILED"
+
+            event_row = conn.execute(
+                """
+                SELECT event_type, detail
+                FROM strategy_events
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("S-WORKER-VERIFY-FAIL",),
+            ).fetchone()
+            assert event_row is not None
+            assert event_row["event_type"] == "VERIFY_FAILED"
+            assert "verification rejected" in event_row["detail"]
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)

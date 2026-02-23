@@ -12,6 +12,7 @@ from .chain import execute_triggered_strategy, sync_order_submitted_strategy_sta
 from .config import load_app_config
 from .db import get_connection
 from .evaluator import evaluate_strategy, persist_evaluation_result
+from .verification import run_activation_verification
 
 
 UTC = timezone.utc
@@ -28,6 +29,7 @@ EXPIRABLE_STATUSES: set[str] = {"PENDING_ACTIVATION", "ACTIVE", "PAUSED", "TRIGG
 RUNTIME_KEY_LAST_EVALUATION_OUTCOME = "last_evaluation_outcome"
 RUNTIME_KEY_GATEWAY_NOT_WORK_EVENT_TS = "event_throttle:GATEWAY_NOT_WORK"
 RUNTIME_KEY_WAITING_FOR_MARKET_DATA_EVENT_TS = "event_throttle:WAITING_FOR_MARKET_DATA"
+DEFAULT_STRATEGY_LOCK_TTL_SECONDS = 120
 
 
 def _utcnow() -> datetime:
@@ -54,6 +56,8 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
 class StrategyTask:
     strategy_id: str
     reason: str
+    expected_status: str
+    expected_version: int
     enqueued_at: datetime
 
 
@@ -108,6 +112,7 @@ class StrategyExecutionEngine:
         queue_maxsize: int = 4096,
         gateway_not_work_event_throttle_seconds: int = 300,
         waiting_for_market_data_event_throttle_seconds: int = 120,
+        strategy_lock_ttl_seconds: int = DEFAULT_STRATEGY_LOCK_TTL_SECONDS,
     ) -> None:
         self._logger = logging.getLogger("ibx.worker")
         self._enabled = enabled
@@ -118,6 +123,7 @@ class StrategyExecutionEngine:
         self._waiting_for_market_data_event_throttle_seconds = (
             waiting_for_market_data_event_throttle_seconds
         )
+        self._strategy_lock_ttl_seconds = max(1, int(strategy_lock_ttl_seconds))
         self._stop_event = Event()
         self._start_lock = Lock()
         self._running = False
@@ -148,6 +154,9 @@ class StrategyExecutionEngine:
         with self._start_lock:
             if self._running:
                 return
+            cleared_locks = self._clear_legacy_locks()
+            if cleared_locks > 0:
+                self._logger.info("cleared legacy strategy locks count=%s", cleared_locks)
             self._stop_event.clear()
             self._scanner_thread = Thread(
                 target=self._scan_loop,
@@ -173,6 +182,18 @@ class StrategyExecutionEngine:
                 self._worker_count,
             )
 
+    def _clear_legacy_locks(self) -> int:
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE strategies
+                SET lock_until = NULL
+                WHERE lock_until IS NOT NULL AND is_deleted = 0
+                """
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
+
     def stop(self, timeout_seconds: float = 10.0) -> None:
         with self._start_lock:
             if not self._running:
@@ -190,8 +211,40 @@ class StrategyExecutionEngine:
             worker.join(timeout=timeout_seconds)
         self._logger.info("strategy execution engine stopped")
 
-    def enqueue_strategy(self, strategy_id: str, *, reason: str = "manual") -> bool:
-        task = StrategyTask(strategy_id=strategy_id, reason=reason, enqueued_at=_utcnow())
+    def _load_task_snapshot(self, strategy_id: str) -> tuple[str, int] | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT status, version
+                FROM v_strategies_active
+                WHERE id = ?
+                """,
+                (strategy_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["status"]), int(row["version"])
+
+    def enqueue_strategy(
+        self,
+        strategy_id: str,
+        *,
+        reason: str = "manual",
+        expected_status: str | None = None,
+        expected_version: int | None = None,
+    ) -> bool:
+        if expected_status is None or expected_version is None:
+            snapshot = self._load_task_snapshot(strategy_id)
+            if snapshot is None:
+                return False
+            expected_status, expected_version = snapshot
+        task = StrategyTask(
+            strategy_id=strategy_id,
+            reason=reason,
+            expected_status=expected_status,
+            expected_version=expected_version,
+            enqueued_at=_utcnow(),
+        )
         accepted = self._queue.enqueue(task)
         if not accepted:
             self._logger.debug("skip enqueue strategy_id=%s reason=%s", strategy_id, reason)
@@ -202,7 +255,7 @@ class StrategyExecutionEngine:
         with get_connection() as conn:
             rows = conn.execute(
                 f"""
-                SELECT id
+                SELECT id, status, version
                 FROM v_strategies_active
                 WHERE status IN ({placeholders})
                 ORDER BY updated_at ASC, id ASC
@@ -211,19 +264,34 @@ class StrategyExecutionEngine:
             ).fetchall()
         enqueued = 0
         for row in rows:
-            if self.enqueue_strategy(row["id"], reason="periodic_scan"):
+            if self.enqueue_strategy(
+                row["id"],
+                reason="periodic_scan",
+                expected_status=str(row["status"]),
+                expected_version=int(row["version"]),
+            ):
                 enqueued += 1
         return enqueued
 
     def process_once(self, strategy_id: str, *, reason: str = "manual") -> None:
-        task = StrategyTask(strategy_id=strategy_id, reason=reason, enqueued_at=_utcnow())
-        if not self._queue.claim(task.strategy_id):
+        if not self._queue.claim(strategy_id):
             self._logger.debug("skip process_once strategy_id=%s reason=%s (already inflight)", strategy_id, reason)
             return
         try:
+            snapshot = self._load_task_snapshot(strategy_id)
+            if snapshot is None:
+                return
+            expected_status, expected_version = snapshot
+            task = StrategyTask(
+                strategy_id=strategy_id,
+                reason=reason,
+                expected_status=expected_status,
+                expected_version=expected_version,
+                enqueued_at=_utcnow(),
+            )
             self._process_task(task)
         finally:
-            self._queue.release(task.strategy_id)
+            self._queue.release(strategy_id)
 
     def _register_default_handlers(self) -> None:
         self.register_handler(["ACTIVE"], self._handle_active)
@@ -265,39 +333,83 @@ class StrategyExecutionEngine:
 
     def _process_task(self, task: StrategyTask) -> None:
         now = _utcnow()
+        lock_until_iso: str | None = None
         with get_connection() as conn:
-            row = conn.execute(
+            lock_until = _to_utc(now + timedelta(seconds=self._strategy_lock_ttl_seconds))
+            lock_until_iso = _to_iso_utc(lock_until)
+            cursor = conn.execute(
                 """
-                SELECT *
-                FROM v_strategies_active
+                UPDATE strategies
+                SET lock_until = ?
                 WHERE id = ?
+                  AND status = ?
+                  AND version = ?
+                  AND is_deleted = 0
+                  AND (lock_until IS NULL OR lock_until <= ?)
                 """,
-                (task.strategy_id,),
-            ).fetchone()
-            if row is None:
+                (
+                    lock_until_iso,
+                    task.strategy_id,
+                    task.expected_status,
+                    task.expected_version,
+                    _to_iso_utc(now),
+                ),
+            )
+            if cursor.rowcount <= 0:
+                self._logger.debug(
+                    "skip task strategy_id=%s reason=%s (snapshot changed status/version)",
+                    task.strategy_id,
+                    task.reason,
+                )
                 return
-            status = str(row["status"])
-            if status in TERMINAL_STATUSES:
-                return
-
-            if self._expire_if_needed(conn, strategy_row=row, now=now):
-                conn.commit()
-                return
-
-            # Always execute against the latest row inside the same transaction.
-            latest = conn.execute(
-                """
-                SELECT *
-                FROM v_strategies_active
-                WHERE id = ?
-                """,
-                (task.strategy_id,),
-            ).fetchone()
-            if latest is None:
-                return
-            handler = self._handlers.get(str(latest["status"]), self._handle_noop)
-            handler(conn, latest, now)
             conn.commit()
+
+        try:
+            now = _utcnow()
+            with get_connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM v_strategies_active
+                    WHERE id = ? AND lock_until = ?
+                    """,
+                    (task.strategy_id, lock_until_iso),
+                ).fetchone()
+                if row is None:
+                    return
+                status = str(row["status"])
+                if status in TERMINAL_STATUSES:
+                    return
+
+                if self._expire_if_needed(conn, strategy_row=row, now=now):
+                    conn.commit()
+                    return
+
+                latest = conn.execute(
+                    """
+                    SELECT *
+                    FROM v_strategies_active
+                    WHERE id = ? AND lock_until = ?
+                    """,
+                    (task.strategy_id, lock_until_iso),
+                ).fetchone()
+                if latest is None:
+                    return
+                handler = self._handlers.get(str(latest["status"]), self._handle_noop)
+                handler(conn, latest, now)
+                conn.commit()
+        finally:
+            if lock_until_iso is not None:
+                with get_connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE strategies
+                        SET lock_until = NULL
+                        WHERE id = ? AND lock_until = ? AND is_deleted = 0
+                        """,
+                        (task.strategy_id, lock_until_iso),
+                    )
+                    conn.commit()
 
     def _effective_expire_at(self, strategy_row: sqlite3.Row) -> datetime | None:
         explicit = _parse_iso_utc(strategy_row["expire_at"])
@@ -559,6 +671,30 @@ class StrategyExecutionEngine:
     def _handle_verifying(self, conn: sqlite3.Connection, strategy_row: sqlite3.Row, now: datetime) -> None:
         strategy_id = strategy_row["id"]
         now_iso = _to_iso_utc(now)
+        verification_result = run_activation_verification(
+            conn,
+            strategy_id=strategy_id,
+            strategy_row=strategy_row,
+        )
+        if not verification_result.passed:
+            cursor = conn.execute(
+                """
+                UPDATE strategies
+                SET status = 'VERIFY_FAILED', updated_at = ?, version = version + 1
+                WHERE id = ? AND status = 'VERIFYING' AND is_deleted = 0
+                """,
+                (now_iso, strategy_id),
+            )
+            if cursor.rowcount > 0:
+                self._append_event(
+                    conn,
+                    strategy_id=strategy_id,
+                    event_type="VERIFY_FAILED",
+                    detail=verification_result.reason,
+                    ts=now,
+                )
+            return
+
         activated_at_iso = strategy_row["activated_at"] or now_iso
         logical_activated_at_iso = strategy_row["logical_activated_at"] or activated_at_iso
         expire_at_iso = strategy_row["expire_at"]
@@ -595,7 +731,11 @@ class StrategyExecutionEngine:
             conn,
             strategy_id=strategy_id,
             event_type="ACTIVATED",
-            detail="VERIFYING 阶段占位实现：直接转 ACTIVE",
+            detail=(
+                "策略已通过激活校验并转 ACTIVE"
+                f" (resolved_symbol_contracts={verification_result.resolved_symbol_contracts},"
+                f" updated_condition_contracts={verification_result.updated_condition_contracts})"
+            ),
             ts=now,
         )
 

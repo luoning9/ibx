@@ -118,6 +118,7 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
           anchor_price REAL,
           activated_at TEXT,
           logical_activated_at TEXT,
+          lock_until TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           version INTEGER NOT NULL DEFAULT 1
@@ -140,7 +141,7 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
           expire_mode, expire_in_seconds, expire_at, status, condition_logic, conditions_json,
           trade_action_json, next_strategy_id, next_strategy_note, upstream_strategy_id,
           is_deleted, deleted_at, anchor_price, activated_at, logical_activated_at,
-          created_at, updated_at, version
+          lock_until, created_at, updated_at, version
         )
         SELECT
           id,
@@ -164,6 +165,7 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
           expire_mode, expire_in_seconds, expire_at, status, condition_logic, conditions_json,
           trade_action_json, next_strategy_id, next_strategy_note, upstream_strategy_id,
           COALESCE(is_deleted, 0), deleted_at, anchor_price, activated_at, logical_activated_at,
+          lock_until,
           created_at, updated_at, version
         FROM strategies
         """
@@ -216,6 +218,13 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             """
             ALTER TABLE strategies
             ADD COLUMN deleted_at TEXT
+            """
+        )
+    if "lock_until" not in strategy_columns:
+        conn.execute(
+            """
+            ALTER TABLE strategies
+            ADD COLUMN lock_until TEXT
             """
         )
 
