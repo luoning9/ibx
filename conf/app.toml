@@ -7,6 +7,7 @@
 # IB Gateway / TWS 连接参数
 # - trading_mode 决定默认走 paper_port 还是 live_port
 # - paper/live 端口都保留，便于同一份配置切换模式
+# - client_id 为兜底值；建议在 [ib_gateway.client_ids] 为不同角色分配独立 client id
 host = "127.0.0.1"
 paper_port = 4002
 live_port = 4001
@@ -15,7 +16,15 @@ timeout_seconds = 5
 # 账户代码；留空表示由 IB 返回的默认账户
 account_code = ""
 # 可选: "paper" | "live"
-trading_mode = "paper"
+trading_mode = "live"
+
+[ib_gateway.client_ids]
+# Broker 数据（API + worker 共享 provider 单例）
+broker_data = 99
+# 市场数据（启用 IB 行情拉取时使用）
+market_data = 98
+# CLI 脚本共用（如 make portfolio / get_latest_bar）
+cli = 97
 
 [runtime]
 # 运行时路径与全局开关
@@ -49,5 +58,5 @@ waiting_for_market_data_event_throttle_seconds = 120
 # 外部依赖提供者选择
 # - "ib": 真实 IB 连接
 # - "fixture": 本地样本数据（离线测试）
-broker_data = "fixture"
+broker_data = "ib"
 market_data = "fixture"

@@ -28,9 +28,17 @@ class IBGatewayConfig:
     paper_port: int
     live_port: int
     client_id: int
+    client_ids: "IBClientIDsConfig"
     timeout_seconds: float
     account_code: str
     trading_mode: str
+
+
+@dataclass(frozen=True)
+class IBClientIDsConfig:
+    broker_data: int
+    market_data: int
+    cli: int
 
 
 @dataclass(frozen=True)
@@ -521,11 +529,18 @@ def load_app_config() -> AppConfig:
     trigger_mode_raw = _as_dict(condition_rules_raw.get("trigger_mode_profiles"))
     metric_rules_raw = _as_dict(condition_rules_raw.get("metric_trigger_operator_rules"))
 
+    base_client_id = _as_int(ib_raw.get("client_id"), 99, minimum=1)
+    client_ids_raw = _as_dict(ib_raw.get("client_ids"))
     ib = IBGatewayConfig(
         host=_as_str(ib_raw.get("host"), "127.0.0.1"),
         paper_port=_as_int(ib_raw.get("paper_port"), 4002, minimum=1, maximum=65535),
         live_port=_as_int(ib_raw.get("live_port"), 4001, minimum=1, maximum=65535),
-        client_id=_as_int(ib_raw.get("client_id"), 99, minimum=1),
+        client_id=base_client_id,
+        client_ids=IBClientIDsConfig(
+            broker_data=_as_int(client_ids_raw.get("broker_data"), base_client_id, minimum=1),
+            market_data=_as_int(client_ids_raw.get("market_data"), base_client_id, minimum=1),
+            cli=_as_int(client_ids_raw.get("cli"), base_client_id, minimum=1),
+        ),
         timeout_seconds=_as_float(ib_raw.get("timeout_seconds"), 5.0, minimum=0.1),
         account_code=_as_str(ib_raw.get("account_code"), ""),
         trading_mode=_normalize_trading_mode(_as_str(ib_raw.get("trading_mode"), "paper")),
@@ -588,6 +603,16 @@ def infer_ib_api_port(trading_mode: str | None = None) -> int:
     if mode == "live":
         return cfg.live_port
     return cfg.paper_port
+
+
+def resolve_ib_client_id(role: str | None = None) -> int:
+    cfg = load_app_config().ib_gateway
+    normalized_role = str(role or "").strip().lower()
+    if normalized_role == "market_data":
+        return cfg.client_ids.market_data
+    if normalized_role == "cli":
+        return cfg.client_ids.cli
+    return cfg.client_ids.broker_data
 
 
 def resolve_trigger_window_policy(

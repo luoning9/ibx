@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api import router as v1_router
 from .logging_config import configure_logging
 from .runtime_paths import ensure_runtime_dirs
+from .store import store
 from .worker import worker_engine
 
 
@@ -38,6 +39,7 @@ def create_app() -> FastAPI:
     @app.on_event("shutdown")
     def on_shutdown() -> None:
         worker_engine.stop()
+        store.shutdown()
 
     return app
 

@@ -337,6 +337,8 @@ class ControlResponse(BaseModel):
 class PortfolioSummaryOut(BaseModel):
     net_liquidation: float
     available_funds: float
+    unrealized_pnl: float
+    realized_pnl: float
     daily_pnl: float
     updated_at: datetime
 

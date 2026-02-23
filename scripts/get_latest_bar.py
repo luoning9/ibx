@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.config import infer_ib_api_port, load_app_config
+from app.config import infer_ib_api_port, load_app_config, resolve_ib_client_id
 from app.market_config import resolve_market_profile
 from app.market_data import (
     HistoricalBar,
@@ -330,7 +330,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--client-id",
         type=int,
-        default=int(os.getenv("IB_CLIENT_ID", str(cfg.client_id))),
+        default=int(os.getenv("IB_CLIENT_ID", str(resolve_ib_client_id("cli")))),
         help="IB client id",
     )
     parser.add_argument(

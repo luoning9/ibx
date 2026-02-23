@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Protocol
 
-from .config import PROJECT_ROOT, infer_ib_api_port, load_app_config
+from .config import PROJECT_ROOT, infer_ib_api_port, load_app_config, resolve_ib_client_id
 from .market_config import resolve_market_profile
 
 
 UTC = timezone.utc
 DEFAULT_BROKER_DATA_FIXTURE_PATH = PROJECT_ROOT / "conf" / "fixtures" / "broker_data.sample.json"
+_IB_REQUEST_LOCK = Lock()
 
 
 class IBDataServiceError(RuntimeError):
@@ -94,6 +97,13 @@ def _to_int_or_none(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _ensure_thread_event_loop() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def _parse_contract_month(value: str | None) -> tuple[int, int, int] | None:
@@ -180,7 +190,7 @@ class IBDataService:
         mode = str(trading_mode or cfg.trading_mode).strip().lower()
         self.host = str(host or cfg.host)
         self.port = int(port if port is not None else infer_ib_api_port(mode))
-        self.client_id = int(client_id if client_id is not None else cfg.client_id)
+        self.client_id = int(client_id if client_id is not None else resolve_ib_client_id("broker_data"))
         self.timeout_seconds = float(timeout_seconds if timeout_seconds is not None else cfg.timeout_seconds)
         self.default_account_code = _normalize_account(account_code or cfg.account_code)
         self.readonly = bool(readonly)
@@ -188,6 +198,7 @@ class IBDataService:
         self._contract_builder = contract_builder or _default_contract_builder
 
     def _ensure_ib(self) -> Any:
+        _ensure_thread_event_loop()
         if self._ib is not None:
             return self._ib
         try:
@@ -203,18 +214,31 @@ class IBDataService:
         ib = self._ensure_ib()
         if bool(getattr(ib, "isConnected", lambda: False)()):
             return
-        ib.connect(
-            host=self.host,
-            port=self.port,
-            clientId=self.client_id,
-            timeout=self.timeout_seconds,
-            readonly=self.readonly,
-        )
+        try:
+            ib.connect(
+                host=self.host,
+                port=self.port,
+                clientId=self.client_id,
+                timeout=self.timeout_seconds,
+                readonly=self.readonly,
+            )
+        except Exception as exc:  # pragma: no cover - exercised via store/api path
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            raise IBDataServiceError(
+                "failed to connect IB gateway"
+                f" host={self.host} port={self.port} client_id={self.client_id}: {exc or ''}"
+            ) from exc
 
     def disconnect(self) -> None:
-        ib = self._ensure_ib()
-        if bool(getattr(ib, "isConnected", lambda: False)()):
-            ib.disconnect()
+        with _IB_REQUEST_LOCK:
+            ib = self._ensure_ib()
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
 
     def resolve_contract_id(
         self,
@@ -223,120 +247,122 @@ class IBDataService:
         market: str,
         contract_month: str | None = None,
     ) -> int:
-        normalized_code = str(code).strip().upper()
-        if not normalized_code:
-            raise ValueError("code is required")
-        normalized_month = str(contract_month or "").strip() or None
+        with _IB_REQUEST_LOCK:
+            normalized_code = str(code).strip().upper()
+            if not normalized_code:
+                raise ValueError("code is required")
+            normalized_month = str(contract_month or "").strip() or None
 
-        profile = resolve_market_profile(market, None)
-        self.connect()
-        ib = self._ensure_ib()
+            profile = resolve_market_profile(market, None)
+            self.connect()
+            ib = self._ensure_ib()
 
-        if profile.sec_type == "FUT" and normalized_month is None:
-            probe = self._contract_builder(
+            if profile.sec_type == "FUT" and normalized_month is None:
+                probe = self._contract_builder(
+                    sec_type=profile.sec_type,
+                    code=normalized_code,
+                    exchange=profile.exchange,
+                    currency=profile.currency,
+                    contract_month=None,
+                )
+                details = list(ib.reqContractDetails(probe))
+                front = _pick_front_future_contract(details, now=datetime.now(UTC))
+                if front is not None:
+                    con_id = _to_int_or_none(getattr(front, "conId", None))
+                    if con_id is not None:
+                        return con_id
+
+            candidate = self._contract_builder(
                 sec_type=profile.sec_type,
                 code=normalized_code,
                 exchange=profile.exchange,
                 currency=profile.currency,
-                contract_month=None,
+                contract_month=normalized_month,
             )
-            details = list(ib.reqContractDetails(probe))
-            front = _pick_front_future_contract(details, now=datetime.now(UTC))
-            if front is not None:
-                con_id = _to_int_or_none(getattr(front, "conId", None))
-                if con_id is not None:
-                    return con_id
-
-        candidate = self._contract_builder(
-            sec_type=profile.sec_type,
-            code=normalized_code,
-            exchange=profile.exchange,
-            currency=profile.currency,
-            contract_month=normalized_month,
-        )
-        qualified = list(ib.qualifyContracts(candidate))
-        if not qualified:
-            raise IBDataServiceError(
-                f"failed to resolve contract_id for market={profile.market}, code={normalized_code}"
-            )
-        con_id = _to_int_or_none(getattr(qualified[0], "conId", None))
-        if con_id is None:
-            raise IBDataServiceError(
-                f"resolved contract has invalid conId for market={profile.market}, code={normalized_code}"
-            )
-        return con_id
+            qualified = list(ib.qualifyContracts(candidate))
+            if not qualified:
+                raise IBDataServiceError(
+                    f"failed to resolve contract_id for market={profile.market}, code={normalized_code}"
+                )
+            con_id = _to_int_or_none(getattr(qualified[0], "conId", None))
+            if con_id is None:
+                raise IBDataServiceError(
+                    f"resolved contract has invalid conId for market={profile.market}, code={normalized_code}"
+                )
+            return con_id
 
     def get_account_snapshot(self, *, account_code: str | None = None) -> AccountSnapshot:
-        target_account = _normalize_account(account_code) or self.default_account_code
-        self.connect()
-        ib = self._ensure_ib()
+        with _IB_REQUEST_LOCK:
+            target_account = _normalize_account(account_code) or self.default_account_code
+            self.connect()
+            ib = self._ensure_ib()
 
-        summary_items = list(ib.accountSummary())
-        portfolio_items = list(ib.portfolio())
+            summary_items = list(ib.accountSummary())
+            portfolio_items = list(ib.portfolio())
 
-        if target_account is None:
-            if summary_items:
-                target_account = _normalize_account(getattr(summary_items[0], "account", None))
-            elif portfolio_items:
-                target_account = _normalize_account(getattr(portfolio_items[0], "account", None))
+            if target_account is None:
+                if summary_items:
+                    target_account = _normalize_account(getattr(summary_items[0], "account", None))
+                elif portfolio_items:
+                    target_account = _normalize_account(getattr(portfolio_items[0], "account", None))
 
-        filtered_summary = summary_items
-        filtered_portfolio = portfolio_items
-        if target_account:
-            filtered_summary = [
-                item for item in summary_items if _normalize_account(getattr(item, "account", None)) == target_account
-            ]
-            filtered_portfolio = [
-                item for item in portfolio_items if _normalize_account(getattr(item, "account", None)) == target_account
-            ]
+            filtered_summary = summary_items
+            filtered_portfolio = portfolio_items
+            if target_account:
+                filtered_summary = [
+                    item for item in summary_items if _normalize_account(getattr(item, "account", None)) == target_account
+                ]
+                filtered_portfolio = [
+                    item for item in portfolio_items if _normalize_account(getattr(item, "account", None)) == target_account
+                ]
 
-        values: dict[str, str] = {}
-        value_currencies: dict[str, str] = {}
-        values_float: dict[str, float] = {}
-        for item in filtered_summary:
-            tag = str(getattr(item, "tag", "")).strip()
-            if not tag:
-                continue
-            value = str(getattr(item, "value", "")).strip()
-            currency = str(getattr(item, "currency", "")).strip()
-            values[tag] = value
-            if currency:
-                value_currencies[tag] = currency
-            parsed = _to_float_or_none(value)
-            if parsed is not None:
-                values_float[tag] = parsed
+            values: dict[str, str] = {}
+            value_currencies: dict[str, str] = {}
+            values_float: dict[str, float] = {}
+            for item in filtered_summary:
+                tag = str(getattr(item, "tag", "")).strip()
+                if not tag:
+                    continue
+                value = str(getattr(item, "value", "")).strip()
+                currency = str(getattr(item, "currency", "")).strip()
+                values[tag] = value
+                if currency:
+                    value_currencies[tag] = currency
+                parsed = _to_float_or_none(value)
+                if parsed is not None:
+                    values_float[tag] = parsed
 
-        positions: list[AccountPosition] = []
-        for item in filtered_portfolio:
-            contract = getattr(item, "contract", None)
-            if contract is None:
-                continue
-            positions.append(
-                AccountPosition(
-                    account=str(getattr(item, "account", "")).strip(),
-                    contract_id=_to_int_or_none(getattr(contract, "conId", None)),
-                    symbol=str(getattr(contract, "symbol", "")).strip(),
-                    local_symbol=str(getattr(contract, "localSymbol", "")).strip(),
-                    sec_type=str(getattr(contract, "secType", "")).strip(),
-                    currency=str(getattr(contract, "currency", "")).strip(),
-                    exchange=str(getattr(contract, "exchange", "")).strip(),
-                    position=float(getattr(item, "position", 0.0)),
-                    market_price=float(getattr(item, "marketPrice", 0.0)),
-                    market_value=float(getattr(item, "marketValue", 0.0)),
-                    average_cost=float(getattr(item, "averageCost", 0.0)),
-                    unrealized_pnl=float(getattr(item, "unrealizedPNL", 0.0)),
-                    realized_pnl=float(getattr(item, "realizedPNL", 0.0)),
+            positions: list[AccountPosition] = []
+            for item in filtered_portfolio:
+                contract = getattr(item, "contract", None)
+                if contract is None:
+                    continue
+                positions.append(
+                    AccountPosition(
+                        account=str(getattr(item, "account", "")).strip(),
+                        contract_id=_to_int_or_none(getattr(contract, "conId", None)),
+                        symbol=str(getattr(contract, "symbol", "")).strip(),
+                        local_symbol=str(getattr(contract, "localSymbol", "")).strip(),
+                        sec_type=str(getattr(contract, "secType", "")).strip(),
+                        currency=str(getattr(contract, "currency", "")).strip(),
+                        exchange=str(getattr(contract, "exchange", "")).strip(),
+                        position=float(getattr(item, "position", 0.0)),
+                        market_price=float(getattr(item, "marketPrice", 0.0)),
+                        market_value=float(getattr(item, "marketValue", 0.0)),
+                        average_cost=float(getattr(item, "averageCost", 0.0)),
+                        unrealized_pnl=float(getattr(item, "unrealizedPNL", 0.0)),
+                        realized_pnl=float(getattr(item, "realizedPNL", 0.0)),
+                    )
                 )
-            )
 
-        return AccountSnapshot(
-            account_code=target_account,
-            fetched_at=datetime.now(UTC),
-            values=values,
-            value_currencies=value_currencies,
-            values_float=values_float,
-            positions=positions,
-        )
+            return AccountSnapshot(
+                account_code=target_account,
+                fetched_at=datetime.now(UTC),
+                values=values,
+                value_currencies=value_currencies,
+                values_float=values_float,
+                positions=positions,
+            )
 
     def __enter__(self) -> IBDataService:
         self.connect()

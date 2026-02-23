@@ -109,6 +109,8 @@ export type EventItem = {
 export type PortfolioSummary = {
   net_liquidation: number
   available_funds: number
+  unrealized_pnl: number
+  realized_pnl: number
   daily_pnl: number
   updated_at: string
 }
