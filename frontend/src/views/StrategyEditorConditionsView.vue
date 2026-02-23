@@ -13,9 +13,9 @@ const strategyId = computed(() => String(route.params.id || ''))
 const MAX_CONDITIONS = 2
 
 const CONDITION_TYPES = ['SINGLE_PRODUCT', 'PAIR_PRODUCTS'] as const
-const EVALUATION_WINDOWS = ['1m', '2m', '5m', '1h', '2h', '4h', '1d', '2d', '5d'] as const
-const FAST_EVALUATION_WINDOWS: EvaluationWindow[] = ['1m', '2m', '5m']
-const RATIO_EVALUATION_WINDOWS: EvaluationWindow[] = ['1h', '2h', '4h', '1d', '2d', '5d']
+const EVALUATION_WINDOWS = ['1m', '5m', '30m', '1h', '2h', '4h', '1d', '2d'] as const
+const FAST_EVALUATION_WINDOWS: EvaluationWindow[] = ['1m', '5m', '30m', '1h']
+const RATIO_EVALUATION_WINDOWS: EvaluationWindow[] = ['1h', '2h', '4h', '1d', '2d']
 const WINDOW_PRICE_BASIS_OPTIONS = ['CLOSE', 'HIGH', 'LOW', 'AVG'] as const
 
 type ConditionType = (typeof CONDITION_TYPES)[number]
@@ -25,31 +25,51 @@ type Metric = 'PRICE' | 'DRAWDOWN_PCT' | 'RALLY_PCT' | 'VOLUME_RATIO' | 'AMOUNT_
 type ValueType = 'USD' | 'RATIO'
 
 type TriggerRuleDef = {
-  triggerMode: 'LEVEL' | 'CROSS_UP' | 'CROSS_DOWN'
+  triggerMode: 'LEVEL_INSTANT' | 'LEVEL_CONFIRM' | 'CROSS_UP_INSTANT' | 'CROSS_UP_CONFIRM' | 'CROSS_DOWN_INSTANT' | 'CROSS_DOWN_CONFIRM'
   operator: '>=' | '<='
   label: string
 }
 
 const TRIGGER_RULE_DEFS = {
   LEVEL_GTE: {
-    triggerMode: 'LEVEL',
+    triggerMode: 'LEVEL_INSTANT',
     operator: '>=',
-    label: '达到/高于阈值（LEVEL + >=）',
+    label: '达到/高于阈值（LEVEL_INSTANT + >=）',
   },
   LEVEL_LTE: {
-    triggerMode: 'LEVEL',
+    triggerMode: 'LEVEL_INSTANT',
     operator: '<=',
-    label: '达到/低于阈值（LEVEL + <=）',
+    label: '达到/低于阈值（LEVEL_INSTANT + <=）',
+  },
+  LEVEL_CONFIRM_GTE: {
+    triggerMode: 'LEVEL_CONFIRM',
+    operator: '>=',
+    label: '确认达到/高于阈值（LEVEL_CONFIRM + >=）',
+  },
+  LEVEL_CONFIRM_LTE: {
+    triggerMode: 'LEVEL_CONFIRM',
+    operator: '<=',
+    label: '确认达到/低于阈值（LEVEL_CONFIRM + <=）',
   },
   CROSS_UP: {
-    triggerMode: 'CROSS_UP',
+    triggerMode: 'CROSS_UP_INSTANT',
     operator: '>=',
-    label: '上穿阈值（CROSS_UP + >=）',
+    label: '上穿阈值（CROSS_UP_INSTANT + >=）',
+  },
+  CROSS_UP_CONFIRM: {
+    triggerMode: 'CROSS_UP_CONFIRM',
+    operator: '>=',
+    label: '确认上穿阈值（CROSS_UP_CONFIRM + >=）',
   },
   CROSS_DOWN: {
-    triggerMode: 'CROSS_DOWN',
+    triggerMode: 'CROSS_DOWN_INSTANT',
     operator: '<=',
-    label: '下穿阈值（CROSS_DOWN + <=）',
+    label: '下穿阈值（CROSS_DOWN_INSTANT + <=）',
+  },
+  CROSS_DOWN_CONFIRM: {
+    triggerMode: 'CROSS_DOWN_CONFIRM',
+    operator: '<=',
+    label: '确认下穿阈值（CROSS_DOWN_CONFIRM + <=）',
   },
 } as const satisfies Record<string, TriggerRuleDef>
 
@@ -58,27 +78,24 @@ type TriggerRuleKey = keyof typeof TRIGGER_RULE_DEFS
 type MetricOption = {
   metric: Metric
   label: string
-  priceReference: string
 }
 
 const METRIC_OPTIONS_BY_TYPE: Record<ConditionType, MetricOption[]> = {
   SINGLE_PRODUCT: [
-    { metric: 'PRICE', label: '价格（PRICE）', priceReference: '' },
+    { metric: 'PRICE', label: '价格（PRICE）' },
     {
       metric: 'DRAWDOWN_PCT',
       label: '回撤比例（DRAWDOWN_PCT，基准=激活后最高价）',
-      priceReference: 'HIGHEST_SINCE_ACTIVATION',
     },
     {
       metric: 'RALLY_PCT',
       label: '上涨比例（RALLY_PCT，基准=激活后最低价）',
-      priceReference: 'LOWEST_SINCE_ACTIVATION',
     },
   ],
   PAIR_PRODUCTS: [
-    { metric: 'VOLUME_RATIO', label: '成交量比值（VOLUME_RATIO）', priceReference: '' },
-    { metric: 'AMOUNT_RATIO', label: '成交额比值（AMOUNT_RATIO）', priceReference: '' },
-    { metric: 'SPREAD', label: '价差（SPREAD）', priceReference: '' },
+    { metric: 'VOLUME_RATIO', label: '成交量比值（VOLUME_RATIO）' },
+    { metric: 'AMOUNT_RATIO', label: '成交额比值（AMOUNT_RATIO）' },
+    { metric: 'SPREAD', label: '价差（SPREAD）' },
   ],
 }
 
@@ -86,9 +103,9 @@ const METRIC_TRIGGER_RULES: Record<Metric, TriggerRuleKey[]> = {
   PRICE: ['LEVEL_GTE', 'LEVEL_LTE', 'CROSS_UP', 'CROSS_DOWN'],
   DRAWDOWN_PCT: ['LEVEL_GTE'],
   RALLY_PCT: ['LEVEL_GTE'],
-  VOLUME_RATIO: ['LEVEL_GTE', 'LEVEL_LTE'],
-  AMOUNT_RATIO: ['LEVEL_GTE', 'LEVEL_LTE'],
-  SPREAD: ['LEVEL_GTE', 'LEVEL_LTE', 'CROSS_UP', 'CROSS_DOWN'],
+  VOLUME_RATIO: ['LEVEL_CONFIRM_GTE', 'LEVEL_CONFIRM_LTE'],
+  AMOUNT_RATIO: ['LEVEL_CONFIRM_GTE', 'LEVEL_CONFIRM_LTE'],
+  SPREAD: ['LEVEL_CONFIRM_GTE', 'LEVEL_CONFIRM_LTE', 'CROSS_UP_CONFIRM', 'CROSS_DOWN_CONFIRM'],
 }
 
 const METRIC_VALUE_TYPES: Record<Metric, ValueType> = {
@@ -104,7 +121,6 @@ type ConditionRow = {
   conditionId: string
   conditionType: ConditionType
   product: string
-  productA: string
   productB: string
   evaluationWindow: EvaluationWindow
   windowPriceBasis: WindowPriceBasis
@@ -175,11 +191,6 @@ function getDefaultEvaluationWindow(metric: Metric): EvaluationWindow {
   return getEvaluationWindowOptions(metric)[0]!
 }
 
-function getPriceReference(conditionType: ConditionType, metric: Metric) {
-  const option = getMetricOptions(conditionType).find((item) => item.metric === metric)
-  return option?.priceReference || ''
-}
-
 function getValuePlaceholder(metric: Metric) {
   return getValueType(metric) === 'RATIO' ? '例如 10' : '例如 88.5'
 }
@@ -233,14 +244,6 @@ function normalizeRow(row: ConditionRow) {
   if (isRatioMetric(row.metric)) {
     row.windowPriceBasis = 'CLOSE'
   }
-
-  if (row.conditionType === 'SINGLE_PRODUCT') {
-    if (!row.product && row.productA) row.product = row.productA
-  }
-
-  if (row.conditionType === 'PAIR_PRODUCTS') {
-    if (!row.productA && row.product) row.productA = row.product
-  }
 }
 
 function addConditionRow(initial?: Partial<ConditionRow>) {
@@ -258,7 +261,6 @@ function addConditionRow(initial?: Partial<ConditionRow>) {
     conditionId: initial?.conditionId || createConditionId(),
     conditionType,
     product: initial?.product || '',
-    productA: initial?.productA || '',
     productB: initial?.productB || '',
     evaluationWindow: initial?.evaluationWindow || getDefaultEvaluationWindow(metric),
     windowPriceBasis: initial?.windowPriceBasis || 'CLOSE',
@@ -338,17 +340,14 @@ function buildConditionPayload(row: ConditionRow) {
     if (!symbolCodeSet.value.has(product)) throw new Error(`条件 ${conditionId} 的 product 不在策略 symbols 中`)
     payload.product = product
   } else {
-    const productA = row.productA.trim().toUpperCase()
+    const product = row.product.trim().toUpperCase()
     const productB = row.productB.trim().toUpperCase()
-    if (!productA || !productB) throw new Error(`条件 ${conditionId} 缺少 product_a 或 product_b`)
-    if (!symbolCodeSet.value.has(productA)) throw new Error(`条件 ${conditionId} 的 product_a 不在策略 symbols 中`)
+    if (!product || !productB) throw new Error(`条件 ${conditionId} 缺少 product 或 product_b`)
+    if (!symbolCodeSet.value.has(product)) throw new Error(`条件 ${conditionId} 的 product 不在策略 symbols 中`)
     if (!symbolCodeSet.value.has(productB)) throw new Error(`条件 ${conditionId} 的 product_b 不在策略 symbols 中`)
-    payload.product_a = productA
+    payload.product = product
     payload.product_b = productB
   }
-
-  const priceReference = getPriceReference(row.conditionType, row.metric)
-  if (priceReference) payload.price_reference = priceReference
 
   return payload
 }
@@ -402,8 +401,7 @@ async function loadDetail() {
       addConditionRow({
         conditionId: asString(condition.condition_id) || createConditionId(),
         conditionType,
-        product: asString(condition.product),
-        productA: asString(condition.product_a),
+        product: asString(condition.product) || asString(condition.product_a),
         productB: asString(condition.product_b),
         evaluationWindow: (EVALUATION_WINDOWS as readonly string[]).includes(asString(condition.evaluation_window))
           ? (asString(condition.evaluation_window) as EvaluationWindow)
@@ -536,13 +534,13 @@ onMounted(loadDetail)
                 </div>
                 <div v-else class="pair-products">
                   <el-select
-                    v-model="row.productA"
+                    v-model="row.product"
                     size="small"
                     class="full-width"
                     :disabled="symbolOptions.length === 0"
                     :empty-values="[]"
                     no-data-text="策略 symbols 为空"
-                    placeholder="选择 product_a"
+                    placeholder="选择 product"
                   >
                     <el-option
                       v-for="symbol in symbolOptions"

@@ -1,5 +1,7 @@
 export type StrategyStatus =
   | 'PENDING_ACTIVATION'
+  | 'VERIFYING'
+  | 'VERIFY_FAILED'
   | 'ACTIVE'
   | 'PAUSED'
   | 'TRIGGERED'
@@ -11,10 +13,12 @@ export type StrategyStatus =
 
 export type StrategyTradeType = 'buy' | 'sell' | 'switch' | 'open' | 'close' | 'spread'
 export type SymbolTradeType = 'buy' | 'sell' | 'open' | 'close' | 'ref'
+export type StrategyMarket = 'US_STOCK' | 'COMEX_FUTURES'
 
 export type StrategySymbolItem = {
   code: string
   trade_type: SymbolTradeType
+  contract_id: number | null
 }
 
 export type StrategySummary = {
@@ -66,9 +70,11 @@ export type NextStrategyProjection = {
 export type StrategyDetail = {
   id: string
   description: string
+  market: StrategyMarket
+  sec_type: string
+  exchange: string
   trade_type: StrategyTradeType
   symbols: StrategySymbolItem[]
-  currency: 'USD'
   upstream_only_activation: boolean
   activated_at: string | null
   logical_activated_at: string | null
@@ -141,9 +147,9 @@ export type StrategyCreatePayload = {
   id?: string
   idempotency_key?: string
   description: string
+  market?: StrategyMarket
   trade_type: StrategyTradeType
   symbols: StrategySymbolItem[]
-  currency?: 'USD'
   upstream_only_activation?: boolean
   expire_mode: 'relative' | 'absolute'
   expire_in_seconds?: number | null
@@ -157,6 +163,7 @@ export type StrategyCreatePayload = {
 
 export type StrategyBasicPatchPayload = {
   description?: string
+  market?: StrategyMarket
   trade_type?: StrategyTradeType
   symbols?: StrategySymbolItem[]
   upstream_only_activation?: boolean

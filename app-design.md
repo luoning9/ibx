@@ -94,27 +94,97 @@ flowchart LR
 - `PAUSED` 策略不参与触发评估（R4.2, R4.3）。
 
 ### 4.3 Trigger Evaluator
+行情监测模块与触发判定解耦，模块职责仅提供历史数据查询：
+- 主接口：`SQLiteMarketDataCache.get_historical_bars(request)`（`app/market_data.py`）
+- 请求参数：`contract/start_time/end_time/bar_size/what_to_show/use_rth/include_partial_bar/max_bars/page_size`
+- 时间语义：统一 `UTC`
+- 缓存语义：SQLite 本地缓存 + 覆盖区间管理；若请求区间部分已缓存，仅拉取缺失分段
+- 返回结构：`bars + meta`（命中率、拉取分段、覆盖区间、截断标记）
+
 统一按条件列表评估（R4.1）：
 - 顶层：`condition_logic`（`AND` / `OR`）
 - 条件项：`condition_type`（`SINGLE_PRODUCT` / `PAIR_PRODUCTS`）
 - 条件项字段：`condition_id`、`metric`、`trigger_mode`、`evaluation_window`、`window_price_basis`、`operator`、`value` 以及产品字段
+- `trigger_mode` 取值：`LEVEL_INSTANT` / `LEVEL_CONFIRM` / `CROSS_UP_INSTANT` / `CROSS_UP_CONFIRM` / `CROSS_DOWN_INSTANT` / `CROSS_DOWN_CONFIRM`
 - `value` 语义按 `metric` 解释：`PRICE/SPREAD` 为 USD，`DRAWDOWN_PCT/RALLY_PCT/VOLUME_RATIO/AMOUNT_RATIO` 为比例
 - 条件文本渲染：生成 `condition_nl`（统一文案模板，供详情/日志直接展示）
+
+`ConditionEvaluator` 两阶段接口（当前实现）：
+- `ConditionEvaluator(condition)`：
+- 构造时传入单条条件字典（业务字段 + 可选 `contract_id` / `contract_id_b`）。
+- `prepare()` 输出：`ConditionDataRequirement`
+- `condition_id`
+- `require_time_alignment`
+- `missing_data_policy`
+- `contracts[]`（每项：`contract_id`、`base_bar`、`required_points`、`state_requirements`、`include_partial_bar`）
+- 同时在实例内缓存 `PreparedCondition`（供 `evaluate()` 使用）
+- `condition_id`、`metric`、`trigger_mode`、`evaluation_window`、`operator`、`threshold`
+- `evaluate(evaluation_input)` 输入：
+- `evaluation_input.values_by_contract`：按 `contract_id` 提供数值序列
+- `evaluation_input.state_values`：提供运行时状态值（如 `since_activation_high/low`）
+- `evaluate` 输出：`ConditionEvaluationResult`
+- `state`：`TRUE` / `FALSE` / `WAITING`
+- `observed_value`
+- `reason`
 
 条件原子支持（R4.1）：
 - `SINGLE_PRODUCT`：`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT`
 - `PAIR_PRODUCTS`：`VOLUME_RATIO` / `AMOUNT_RATIO` / `SPREAD`
 - 比值定义：
-- `VOLUME_RATIO = volume(product_a) / volume(product_b)`
-- `AMOUNT_RATIO = amount(product_a) / amount(product_b)`（成交额比值）
+- `VOLUME_RATIO = volume(product) / volume(product_b)`
+- `AMOUNT_RATIO = amount(product) / amount(product_b)`（成交额比值）
 
 触发语义：
 - 本系统固定 `ONCE`，不提供 `on_trigger` 配置（R4.12）。
-- `evaluation_window` 为滚动窗口，`MONITOR_INTERVAL_SECONDS` 为调度频率，二者独立（R4.3, R4.14）。
+- `evaluation_window` 为滚动窗口，`worker.monitor_interval_seconds` 为调度频率，二者独立（R4.3, R4.14）。
 - `evaluation_window` 按 `metric` 约束：
-- 分钟级（`1m/2m/5m`）：`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `SPREAD`
-- 小时/天级（`1h/2h/4h/1d/2d/5d`）：`VOLUME_RATIO` / `AMOUNT_RATIO`
+- `PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `SPREAD`：`1m/5m/30m/1h`
+- `VOLUME_RATIO` / `AMOUNT_RATIO`：`1h/2h/4h/1d/2d`
+- 触发组合约束：
+- `PRICE`：`LEVEL_INSTANT/LEVEL_CONFIRM`（`>=`,`<=`），`CROSS_UP_INSTANT/CROSS_UP_CONFIRM`（`>=`），`CROSS_DOWN_INSTANT/CROSS_DOWN_CONFIRM`（`<=`）
+- `DRAWDOWN_PCT` / `RALLY_PCT`：`LEVEL_INSTANT/LEVEL_CONFIRM`（`>=`）
+- `VOLUME_RATIO` / `AMOUNT_RATIO`：仅 `LEVEL_CONFIRM`（`>=`,`<=`）
+- `SPREAD`：仅 `LEVEL_CONFIRM`（`>=`,`<=`）、`CROSS_UP_CONFIRM`（`>=`）、`CROSS_DOWN_CONFIRM`（`<=`）
 - `window_price_basis` 用于指定评估窗口取值口径（`CLOSE/HIGH/LOW/AVG`，默认 `CLOSE`）。
+
+价格与价差突破口径（本版本收敛定义）：
+- 基础数据统一为 `1m`；有效突破窗口统一为 `5m/30m/1h`。
+- 有效突破统一参数：`confirm_consecutive` + `confirm_ratio`。
+- 默认参数：
+- `5m`：`4` + `0.8`
+- `30m`：`2` + `0.5`
+- `1h`：`2` + `0.5`
+
+价格瞬时判定（`LEVEL_INSTANT` / `CROSS_UP_INSTANT` / `CROSS_DOWN_INSTANT`）：
+- 使用当前进行中的 `1m` bar，可用未完成 bar。
+- 向上：`high_1m_current >= trigger_price`；向下：`low_1m_current <= trigger_price`。
+
+价格确认判定（`LEVEL_CONFIRM` / `CROSS_UP_CONFIRM` / `CROSS_DOWN_CONFIRM`）：
+- 仅使用已完成 bar。
+- `5m` 用最近 `5` 根 `1m`；`30m/1h` 用固定时钟对齐 `5m`（最近 `6/12` 根）。
+- 判定同时满足 `confirm_consecutive` 与 `confirm_ratio`。
+
+价差确认判定（`LEVEL_CONFIRM` / `CROSS_UP_CONFIRM` / `CROSS_DOWN_CONFIRM`）：
+- 仅同类合约；`spread = price_a - price_b`。
+- 仅使用已完成且时间对齐的数据点；任一腿缺失则该点无效。
+- `5m` 用最近 `5` 根 `1m` spread 点；`30m/1h` 用固定对齐 `5m` spread 点（最近 `6/12` 根）。
+- 判定同时满足 `confirm_consecutive` 与 `confirm_ratio`。
+- 展期时机判断优先使用 `SPREAD_CONFIRM`。
+
+突破方向定义（trigger_mode）：
+- `CROSS_UP_INSTANT/CROSS_UP_CONFIRM`：前一有效点 `< threshold`，当前有效点 `>= threshold`。
+- `CROSS_DOWN_INSTANT/CROSS_DOWN_CONFIRM`：前一有效点 `> threshold`，当前有效点 `<= threshold`。
+- 价格瞬时突破（`CROSS_UP_INSTANT/CROSS_DOWN_INSTANT`）：按当前评估点直接做穿越比较。
+- 有效突破（`CROSS_UP_CONFIRM/CROSS_DOWN_CONFIRM`）：先满足 `confirm_consecutive + confirm_ratio`，且窗口内至少发生一次对应方向穿越。
+- 有效点仅指通过数据质量门槛的点（时间对齐、分母门槛等）；缺失点按不满足且不参与穿越对比。
+
+成交量/成交额比值（VOLUME_RATIO / AMOUNT_RATIO）口径：
+- 仅使用已完成且时间对齐的数据点。
+- 最小窗口为 `1h`，支持 `1h/2h/4h/1d/2d`。
+- 统一采用固定时钟对齐 `15m` bar（非滚动）作为基础序列。
+- 某根应有 `15m` base bar 缺失时，按不满足条件（False）处理。
+- 分母低于最小门槛（`min_volume_b` / `min_amount_b`）时按不满足处理。
+- 判定使用 `confirm_consecutive + confirm_ratio`，默认 `2 + 0.5`。
 
 ### 4.4 Chain Activator
 - `next_strategy_id` 有值时激活下游策略（R4.1, R4.10）。
@@ -151,7 +221,8 @@ flowchart LR
 
 ### 5.1 `strategies`
 关键字段（与 R4.1 对齐）：
-- `id`, `idempotency_key`, `description`, `trade_type`, `symbols`, `currency`
+- `id`, `idempotency_key`, `description`, `market`, `trade_type`, `symbols`
+- `sec_type`, `exchange`（由 `market` 映射得到）
 - `conditions_json`, `condition_logic`
 - `trade_action_json`, `next_strategy_id`, `next_strategy_note`, `anchor_price`
 - `upstream_strategy_id`（反向链路，系统维护）
@@ -177,6 +248,7 @@ flowchart LR
 `symbols[*]` 结构：
 - `code`（产品代码）
 - `trade_type`（`buy` / `sell` / `open` / `close` / `ref`，`ref` 仅参考不下单）
+- `contract_id`（可空，IB 合约 ID）
 
 组合约束（与 R4.1 对齐）：
 - `trade_type in {buy,sell,switch}`：`symbols[*].trade_type` 仅允许 `buy/sell/ref`；
@@ -224,8 +296,8 @@ flowchart LR
 - `window_price_basis`
 - `operator`
 - `value`
-- `product` 或 `product_a/product_b`
-- `price_reference`（比例类指标，按 `metric` 联动：`DRAWDOWN_PCT->HIGHEST_SINCE_ACTIVATION`，`RALLY_PCT->LOWEST_SINCE_ACTIVATION`）
+- `product`（`PAIR_PRODUCTS` 时配合 `product_b`）
+- `product_b`（仅 `PAIR_PRODUCTS`）
 
 ### 5.4 `orders`
 - `id`, `strategy_id`, `ib_order_id`, `status`, `qty`, `avg_fill_price`, `filled_qty`, `error_message`, `created_at`, `updated_at`
@@ -247,6 +319,8 @@ flowchart LR
 
 策略状态沿用需求定义（R7）：
 - `PENDING_ACTIVATION`
+- `VERIFYING`
+- `VERIFY_FAILED`
 - `ACTIVE`
 - `PAUSED`
 - `TRIGGERED`
@@ -257,10 +331,11 @@ flowchart LR
 - `FAILED`
 
 状态迁移（最小）：
-- `PENDING_ACTIVATION -> ACTIVE`（手动激活或上游激活）
+- `PENDING_ACTIVATION/VERIFY_FAILED -> VERIFYING -> ACTIVE`（手动激活或上游激活）
+- `VERIFYING -> VERIFY_FAILED`（校验失败）
 - `ACTIVE -> PAUSED -> ACTIVE`
 - `ACTIVE -> TRIGGERED -> ORDER_SUBMITTED -> FILLED`
-- `PENDING_ACTIVATION/ACTIVE/PAUSED -> CANCELLED`
+- `PENDING_ACTIVATION/VERIFYING/VERIFY_FAILED/ACTIVE/PAUSED -> CANCELLED`
 - `ACTIVE/PAUSED -> EXPIRED`
 - `ORDER_SUBMITTED` 到期后不转 `EXPIRED`，走撤单或继续跟踪
 - 任意执行阶段异常 -> `FAILED`
@@ -283,9 +358,9 @@ flowchart LR
 2. 激活前完整性校验：
 - `conditions_json` 至少 1 条；
 - `trade_action_json` 与 `next_strategy_id` 至少存在一个（避免空动作激活）。
-3. 激活时写入 `activated_at`。
-4. 若使用 `expire_in_seconds`，计算 `expire_at = activated_at + expire_in_seconds`（R4.1, R4.5）。
-5. 状态转为 `ACTIVE`。
+3. 进入 `VERIFYING`，执行激活前校验（配置一致性、市场映射、symbols 字段合法性等）。
+4. 校验失败：状态转 `VERIFY_FAILED`，并写入事件日志。
+5. 校验通过：写入 `activated_at`，若使用 `expire_in_seconds`，计算 `expire_at = activated_at + expire_in_seconds`（R4.1, R4.5），状态转 `ACTIVE`。
 
 ### 7.2A 暂停与恢复策略
 1. `pause`：仅 `ACTIVE` 允许，状态转 `PAUSED`（R4.2）。
@@ -293,7 +368,7 @@ flowchart LR
 3. 暂停不影响已提交订单回报跟踪（`ORDER_SUBMITTED` 不可 pause/resume）。
 
 ### 7.2B 三段编辑保存
-1. 编辑门控：`PATCH basic`、`PUT conditions`、`PUT actions` 仅 `PENDING_ACTIVATION/PAUSED` 允许（R4.13）。
+1. 编辑门控：`PATCH basic`、`PUT conditions`、`PUT actions` 仅 `PENDING_ACTIVATION/PAUSED/VERIFY_FAILED` 允许（R4.13）。
 2. 若状态不允许编辑，返回 `409`，附 `editable=false` 与原因文案。
 3. `PUT conditions`：
 - 校验 `len(conditions) <= MAX_CONDITIONS_PER_STRATEGY`；
@@ -309,11 +384,12 @@ flowchart LR
 - 支持更新 `description`、过期方式、`upstream_only_activation` 等；
 - 若策略当前存在上游（`upstream_strategy_id` 非空），不允许将 `upstream_only_activation` 改为 `false`；
 - `expire_in_seconds` 相对时间仍以“激活时”计算绝对到期（R4.5）。
+6. 任一配置变更（`basic/conditions/actions`）后，状态重置为 `PENDING_ACTIVATION`，需重新激活校验。
 
 ### 7.3 监测与触发
-1. 每 `MONITOR_INTERVAL_SECONDS` 扫描策略（R4.3）。
+1. 每 `worker.monitor_interval_seconds` 扫描策略（R4.3）。
 2. 计算触发条件（R4.1）：
-- 对 `price_reference=HIGHEST_SINCE_ACTIVATION/LOWEST_SINCE_ACTIVATION`，使用 `logical_activated_at` 作为统计起点。
+- 对 `DRAWDOWN_PCT/RALLY_PCT`，使用 `logical_activated_at` 作为统计起点。
 3. 命中后执行 `Risk Engine` 与 `Verification Engine`（R4.4, R4.11）。
 4. 通过则下单；失败则记 `FAILED` 并保留原因（R5.2）。
 
@@ -342,7 +418,7 @@ flowchart LR
 3. 展期只执行一次，失败告警并记录（R4.8, R5.3）。
 
 ### 7.7 重启恢复
-- 启动恢复 `ACTIVE` 监测与 `PENDING_ACTIVATION/PAUSED` 原样状态。
+- 启动恢复 `ACTIVE` 监测与 `PENDING_ACTIVATION/PAUSED/VERIFY_FAILED` 原样状态。
 - 对 `ORDER_SUBMITTED` 执行补偿查询并回写（R4.7）。
 
 ---
@@ -350,7 +426,7 @@ flowchart LR
 ## 8. 配置设计
 
 ### 8.1 监测配置
-- `MONITOR_INTERVAL_SECONDS`：`20~300`，默认 `60`（R4.3）。
+- `worker.monitor_interval_seconds`：`20~300`，默认 `60`（R4.3）。
 
 ### 8.4 条件配置
 - `MAX_CONDITIONS_PER_STRATEGY`：默认建议 `5`（R4.14）。
@@ -384,7 +460,7 @@ flowchart LR
 - 当条件/动作为空时，详情页对应区块显示表头单一入口按钮（文案“设置触发条件/设置后续动作”）与空态提示
 - `conditions_json[*].condition_nl` 由后端返回，前端直接展示
 - 基础信息区返回并展示策略控制能力：`cancel/pause/resume/activate` 的可用性
-- 编辑门控：仅 `PENDING_ACTIVATION` / `PAUSED` 状态允许进入 `触发条件编辑` 与 `后续动作编辑`
+- 编辑门控：仅 `PENDING_ACTIVATION` / `PAUSED` / `VERIFY_FAILED` 状态允许进入 `触发条件编辑` 与 `后续动作编辑`
 - 其它状态返回 `editable=false`，前端禁用编辑入口并提示“ACTIVE 请先暂停”
 - 返回条件运行态：
   - `trigger_group_status`（`NOT_CONFIGURED/MONITORING/TRIGGERED/EXPIRED`）
@@ -409,7 +485,7 @@ flowchart LR
 - 支持编辑 `window_price_basis`（收盘/最高/最低/平均，默认收盘价）
 - `trigger_mode/operator` 通过“触发判定”联动控件编辑，且选项按 `metric` 动态收敛
 - `condition_type=SINGLE_PRODUCT/PAIR_PRODUCTS` 切换时动态显示对应字段
-- 单产品比例类条件使用“指标（含基准）”组合控件选择，`price_reference` 不单独暴露输入
+- 单产品比例类条件由系统自动维护激活后基准，不单独暴露额外基准字段输入
 
 - 后续动作编辑页（`strategy-editor-actions.html`）：
 - 支持编辑 `trade_action_json` 与 `next_strategy_id`
@@ -450,7 +526,7 @@ flowchart LR
 
 2. `GET /v1/strategies/{id}`（详情页）
 - 最小字段：
-  - 基本信息：`id`、`description`、`trade_type`、`symbols`、`currency`、`upstream_only_activation`、`activated_at`、`expire_in_seconds`、`expire_at`、`status`
+  - 基本信息：`id`、`description`、`market`、`sec_type`、`exchange`、`trade_type`、`symbols`、`upstream_only_activation`、`activated_at`、`expire_in_seconds`、`expire_at`、`status`
   - 编辑与操作能力：`editable`、`editable_reason`、`capabilities(can_activate/can_pause/can_resume/can_cancel/can_delete)`、`capability_reasons`
   - `can_activate=false` 的典型原因：`upstream_only_activation=true`、`upstream_strategy_id` 非空（下游策略）、条件未配置、后续动作未配置
   - 触发条件：`condition_logic`、`conditions_json[*]`（含 `condition_nl`）
@@ -459,13 +535,13 @@ flowchart LR
   - 事件日志：`events[*]`（`timestamp`、`event_type`、`detail`）
 
 3. `PATCH /v1/strategies/{id}/basic`
-- 请求体：`description`、`upstream_only_activation`、`expire_mode`、`expire_in_seconds|expire_at`、`trade_type`、`symbols`
+- 请求体：`description`、`market`、`upstream_only_activation`、`expire_mode`、`expire_in_seconds|expire_at`、`trade_type`、`symbols`
 - 响应体：更新后的策略摘要 + `editable/capabilities`
 
 4. `PUT /v1/strategies/{id}/conditions`
 - 请求体：
   - `condition_logic`
-  - `conditions[]`（项字段：`condition_id?`、`condition_type`、`metric`、`trigger_mode`、`evaluation_window`、`window_price_basis`、`operator`、`value`、`product|product_a+product_b`）
+  - `conditions[]`（项字段：`condition_id?`、`condition_type`、`metric`、`trigger_mode`、`evaluation_window`、`window_price_basis`、`operator`、`value`、单产品用 `product` / 双产品用 `product + product_b`）
 - 响应体：`condition_logic`、`conditions_json`（含后端生成 `condition_nl` 与补齐的 `condition_id`）
 
 5. `PUT /v1/strategies/{id}/actions`

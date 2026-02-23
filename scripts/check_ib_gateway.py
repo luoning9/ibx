@@ -15,7 +15,14 @@ import struct
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.config import infer_ib_api_port, load_app_config
 
 
 @dataclass
@@ -100,28 +107,33 @@ def fmt_ports(ports: Iterable[int]) -> str:
 
 
 def main() -> int:
+    cfg = load_app_config().ib_gateway
+    trading_mode = os.getenv("TRADING_MODE", cfg.trading_mode).strip().lower()
+    default_api_port = infer_ib_api_port(trading_mode)
+    default_ports = str(default_api_port)
+
     parser = argparse.ArgumentParser(description="Check IB Gateway TCP/API health")
     parser.add_argument(
         "--host",
-        default=os.getenv("IB_HOST", "127.0.0.1"),
+        default=os.getenv("IB_HOST", cfg.host),
         help="Gateway host (default: IB_HOST env or 127.0.0.1)",
     )
     parser.add_argument(
         "--ports",
         type=parse_ports,
-        default=parse_ports(os.getenv("IB_PORTS", "4002,4001")),
-        help="Comma-separated TCP ports to probe (default: 4002,4001)",
+        default=parse_ports(os.getenv("IB_PORTS", default_ports)),
+        help="Comma-separated TCP ports to probe (default: TRADING_MODE selected port)",
     )
     parser.add_argument(
         "--api-port",
         type=int,
-        default=int(os.getenv("IB_API_PORT", "4002")),
-        help="Port used for IB API handshake check (default: 4002)",
+        default=int(os.getenv("IB_API_PORT", str(default_api_port))),
+        help="Port used for IB API handshake check (default: TRADING_MODE selected port)",
     )
     parser.add_argument(
         "--timeout",
         type=float,
-        default=float(os.getenv("IB_TIMEOUT", "3")),
+        default=float(os.getenv("IB_TIMEOUT", str(cfg.timeout_seconds))),
         help="Socket timeout seconds (default: 3)",
     )
     parser.add_argument(

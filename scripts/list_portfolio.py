@@ -11,7 +11,14 @@ import json
 import os
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.config import infer_ib_api_port, load_app_config
 
 try:
     from ib_insync import IB
@@ -40,13 +47,15 @@ class Holding:
 
 
 def infer_default_port() -> int:
-    mode = os.getenv("TRADING_MODE", "paper").strip().lower()
-    return 4001 if mode == "live" else 4002
+    cfg = load_app_config().ib_gateway
+    mode = os.getenv("TRADING_MODE", cfg.trading_mode).strip().lower()
+    return infer_ib_api_port(mode)
 
 
 def parse_args() -> argparse.Namespace:
+    cfg = load_app_config().ib_gateway
     parser = argparse.ArgumentParser(description="List current IB portfolio holdings")
-    parser.add_argument("--host", default=os.getenv("IB_HOST", "127.0.0.1"), help="IB host")
+    parser.add_argument("--host", default=os.getenv("IB_HOST", cfg.host), help="IB host")
     parser.add_argument(
         "--port",
         type=int,
@@ -56,18 +65,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--client-id",
         type=int,
-        default=int(os.getenv("IB_CLIENT_ID", "99")),
+        default=int(os.getenv("IB_CLIENT_ID", str(cfg.client_id))),
         help="IB client id",
     )
     parser.add_argument(
         "--account",
-        default=os.getenv("IB_ACCOUNT_CODE", ""),
+        default=os.getenv("IB_ACCOUNT_CODE", cfg.account_code),
         help="Filter by account code (optional)",
     )
     parser.add_argument(
         "--timeout",
         type=float,
-        default=float(os.getenv("IB_TIMEOUT", "5")),
+        default=float(os.getenv("IB_TIMEOUT", str(cfg.timeout_seconds))),
         help="Connect timeout seconds",
     )
     parser.add_argument(

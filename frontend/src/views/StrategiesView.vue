@@ -14,8 +14,9 @@ const router = useRouter()
 
 function statusType(status: string) {
   if (status === 'ACTIVE') return 'success'
+  if (status === 'VERIFYING') return 'warning'
   if (status === 'PENDING_ACTIVATION') return 'info'
-  if (status === 'CANCELLED' || status === 'FAILED' || status === 'EXPIRED') return 'danger'
+  if (status === 'VERIFY_FAILED' || status === 'CANCELLED' || status === 'FAILED' || status === 'EXPIRED') return 'danger'
   return 'warning'
 }
 

@@ -51,11 +51,11 @@
 ### 4.1 策略创建
 系统必须支持创建策略，最小字段包括：
 - `idempotency_key`
+- `market`（如 `US_STOCK` / `COMEX_FUTURES`）
 - `trade_type`（`buy` / `sell` / `switch` / `open` / `close` / `spread`）
 - `symbols`（产品列表）
 - `condition_logic`（`AND` / `OR`）
 - `conditions`（触发条件列表；“仅基础信息新建”阶段可为空，激活前至少 1 项）
-- `currency`（固定为 `USD`）
 - `trade_action`（交易动作对象，结构见 4.12）
 - `expire_at` 或 `expire_in_seconds`（二选一）
 - `next_strategy_id`（可选，下游策略 ID；为空表示无后续策略）
@@ -65,6 +65,7 @@
 `symbols` 列表项结构：
 - `code`：产品代码（如 `SLV`）
 - `trade_type`：`buy` / `sell` / `open` / `close` / `ref`（`ref` 表示仅参考，不参与买卖）
+- `contract_id`：IB 合约 ID（可空）
 
 策略级 `trade_type` 与 `symbols[*].trade_type` 约束：
 - `trade_type in {buy,sell,switch}`：仅允许 `buy/sell/ref`；
@@ -81,29 +82,34 @@
 - `condition_nl`：条件自然语言描述（系统生成，只读；创建请求可省略）
 - `condition_type`：`SINGLE_PRODUCT` 或 `PAIR_PRODUCTS`
 - `metric`：例如 `PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `VOLUME_RATIO` / `AMOUNT_RATIO` / `SPREAD`
-- `trigger_mode`：`LEVEL` / `CROSS_UP` / `CROSS_DOWN`
+- `trigger_mode`：`LEVEL_INSTANT` / `LEVEL_CONFIRM` / `CROSS_UP_INSTANT` / `CROSS_UP_CONFIRM` / `CROSS_DOWN_INSTANT` / `CROSS_DOWN_CONFIRM`
 - `evaluation_window`：滚动评估窗口（按 `metric` 约束）
-- 分钟级（`1m` / `2m` / `5m`）：`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `SPREAD`
-- 小时/天级（`1h` / `2h` / `4h` / `1d` / `2d` / `5d`）：`VOLUME_RATIO` / `AMOUNT_RATIO`
+- 价格类与价差（`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT` / `SPREAD`）：`1m` / `5m` / `30m` / `1h`
+- 比值类（`VOLUME_RATIO` / `AMOUNT_RATIO`）：`1h` / `2h` / `4h` / `1d` / `2d`
 - `window_price_basis`：窗口价格基准（`CLOSE` / `HIGH` / `LOW` / `AVG`，默认 `CLOSE`）
-- `operator`：`<=` / `>=` / `<` / `>` / `==`
+- `operator`：`<=` / `>=`
 - `value`：阈值
 - `value` 类型由 `metric` 决定：`PRICE/SPREAD` 使用美元值，`DRAWDOWN_PCT/RALLY_PCT/VOLUME_RATIO/AMOUNT_RATIO` 使用比例值
+
+`metric`、`trigger_mode`、`operator` 组合约束：
+- `PRICE`：允许 `LEVEL_INSTANT/LEVEL_CONFIRM`（`>=`,`<=`），`CROSS_UP_INSTANT/CROSS_UP_CONFIRM`（`>=`），`CROSS_DOWN_INSTANT/CROSS_DOWN_CONFIRM`（`<=`）
+- `DRAWDOWN_PCT`：允许 `LEVEL_INSTANT/LEVEL_CONFIRM`（`>=`）
+- `RALLY_PCT`：允许 `LEVEL_INSTANT/LEVEL_CONFIRM`（`>=`）
+- `VOLUME_RATIO` / `AMOUNT_RATIO`：仅允许 `LEVEL_CONFIRM`（`>=`,`<=`）
+- `SPREAD`：仅允许 `LEVEL_CONFIRM`（`>=`,`<=`）、`CROSS_UP_CONFIRM`（`>=`）、`CROSS_DOWN_CONFIRM`（`<=`）
 
 当 `condition_type=SINGLE_PRODUCT`：
 - `metric` 仅允许：`PRICE` / `DRAWDOWN_PCT` / `RALLY_PCT`
 - `product`（产品标识）
-- `price_reference`（仅比例类指标需要，且与 `metric` 联动）：
-- `DRAWDOWN_PCT` -> `HIGHEST_SINCE_ACTIVATION`
-- `RALLY_PCT` -> `LOWEST_SINCE_ACTIVATION`
+- `DRAWDOWN_PCT` / `RALLY_PCT` 的统计基准由系统按“激活后最高/最低”自动维护
 
 当 `condition_type=PAIR_PRODUCTS`：
 - `metric` 仅允许：`VOLUME_RATIO` / `AMOUNT_RATIO` / `SPREAD`
-- `product_a`（产品 A 标识）
+- `product`（产品 A 标识）
 - `product_b`（产品 B 标识）
 - 比值定义：
-- `VOLUME_RATIO = volume(product_a) / volume(product_b)`
-- `AMOUNT_RATIO = amount(product_a) / amount(product_b)`（成交额比值）
+- `VOLUME_RATIO = volume(product) / volume(product_b)`
+- `AMOUNT_RATIO = amount(product) / amount(product_b)`（成交额比值）
 
 过期时间规则：
 - 支持绝对时间：`expire_at`（ISO 8601，带时区）
@@ -112,6 +118,7 @@
 - 超过 1 周拒绝创建
 - 策略创建后默认不立即激活，需手动激活或由上游策略激活
 - 新建策略即使尚未设置触发条件与后续动作，状态仍为 `PENDING_ACTIVATION`。
+- `market -> sec_type/exchange/currency` 的映射由配置文件维护（`conf/markets.json`）。
 
 ### 4.2 策略查询与控制
 系统必须支持：
@@ -125,26 +132,106 @@
 - 若存在未终止交易（如仍有活动中的交易指令），不可删除。
 - 手动激活策略（仅当 `upstream_only_activation=false` 且 `upstream_strategy_id` 为空时允许）。
 - 若策略存在上游（`upstream_strategy_id` 非空），系统必须拒绝手动激活。
+- 激活流程必须先进入 `VERIFYING`，校验通过后才能转 `ACTIVE`。
+- 若激活校验失败，状态必须转 `VERIFY_FAILED`。
 - 手动暂停策略（仅 `ACTIVE` 可暂停，暂停后转 `PAUSED`）。
 - 手动恢复策略（仅 `PAUSED` 可恢复，恢复后转 `ACTIVE`）。
+- 配置修改（basic/conditions/actions）后，状态必须重置为 `PENDING_ACTIVATION`，需重新激活校验。
 
 ### 4.3 行情监测
-系统必须按配置间隔轮询/获取行情，并评估所有已激活策略（`ACTIVE`）。
+行情监测模块职责仅为“按参数返回历史行情数据”，不负责触发条件判断。
+
+行情历史数据主接口参数：
+- `start_time`
+- `end_time`
+- `bar_size`
+- `contract`
+- `what_to_show`
+- `use_rth`
+- `include_partial_bar`
+- `max_bars`（可选）
+- `page_size`（可选）
+
+缓存与查询要求：
+- 使用 SQLite 做本地行情缓存。
+- 若请求区间部分已有缓存，必须只请求未缓存分段。
+- 时间语义统一为 `UTC`。
+
+触发条件评估由上层调度/策略执行模块负责：
+- 系统按配置间隔轮询并评估所有已激活策略（`ACTIVE`）。
 - `PAUSED` 策略不参与触发条件评估。
 
 监测间隔要求：
-- 配置项：`MONITOR_INTERVAL_SECONDS`
+- 配置项：`worker.monitor_interval_seconds`
 - 最小值：`20`
 - 最大值：`300`（5分钟）
 - 默认值：`60`
 - 越界处理：自动夹紧到边界并记录 warning
-- 说明：`MONITOR_INTERVAL_SECONDS` 是调度频率，`evaluation_window` 是条件计算窗口，二者独立配置。
+- 说明：`worker.monitor_interval_seconds` 是调度频率，`evaluation_window` 是条件计算窗口，二者独立配置。
+
+价格与价差突破定义（本版本）：
+- 基础数据粒度：统一以 `1m` 作为底层数据。
+- 确认窗口仅支持：`5m`、`30m`、`1h`。
+- 有效突破统一采用两个参数：
+- `confirm_consecutive`（连续确认根数）
+- `confirm_ratio`（窗口满足占比）
+- 默认值：
+- `5m`：`confirm_consecutive=4`，`confirm_ratio=0.8`
+- `30m`：`confirm_consecutive=2`，`confirm_ratio=0.5`
+- `1h`：`confirm_consecutive=2`，`confirm_ratio=0.5`
+
+价格瞬时突破（PRICE_INSTANT）：
+- 含义：用于快速发现触碰/刺穿阈值。
+- 数据口径：允许使用当前未完成 `1m` bar。
+- 向上：`high_1m_current >= trigger_price`；向下：`low_1m_current <= trigger_price`。
+
+价格有效突破（PRICE_CONFIRM）：
+- 含义：用于确认突破有效性并过滤噪声。
+- 数据口径：仅使用已完成 bar。
+- `5m` 窗口：使用最近 `5` 根已完成 `1m` bar。
+- `30m/1h` 窗口：使用固定时钟对齐 `5m` bar（非滚动），分别取最近 `6/12` 根。
+- 判定：同时满足 `confirm_consecutive` 与 `confirm_ratio`。
+
+价差有效突破（SPREAD_CONFIRM）：
+- 适用范围：仅同类合约（用于展期时机判断时优先使用本定义）。
+- 价差定义：`spread = price_a - price_b`。
+- 数据口径：仅使用已完成 bar，且两腿必须同时间戳对齐；任一腿缺失则该点无效。
+- `5m` 窗口：最近 `5` 根已完成 `1m` spread 点。
+- `30m/1h` 窗口：固定时钟对齐 `5m` spread 点，分别最近 `6/12` 根。
+- 判定：同时满足 `confirm_consecutive` 与 `confirm_ratio`。
+- 建议叠加两腿最小成交量/成交额门槛以抑制低流动性误触发。
+
+突破方向定义（CROSS_UP / CROSS_DOWN）：
+- 统一基于“阈值穿越”判定。
+- `CROSS_UP`（自下向上）：
+- 穿越条件：前一有效点 `< threshold` 且当前有效点 `>= threshold`。
+- `CROSS_DOWN`（自上向下）：
+- 穿越条件：前一有效点 `> threshold` 且当前有效点 `<= threshold`。
+- 价格瞬时突破（`CROSS_UP_INSTANT`/`CROSS_DOWN_INSTANT`）：
+- 使用当前评估点执行上述穿越判定。
+- 有效突破（`CROSS_UP_CONFIRM`/`CROSS_DOWN_CONFIRM`）：
+- 必须先满足窗口确认（`confirm_consecutive + confirm_ratio`），并且窗口内至少发生一次对应方向穿越。
+- 有效点定义：通过数据质量门槛（时间对齐、分母门槛等）后的点；缺失点按不满足，不参与穿越对比。
+
+成交量/成交额比值判定（VOLUME_RATIO / AMOUNT_RATIO）：
+- 最小窗口：`1h`；允许窗口：`1h/2h/4h/1d/2d`。
+- 基础聚合粒度：统一使用固定时钟对齐的 `15m` bar（非滚动）。
+- 比值定义：
+- `VOLUME_RATIO = volume(product) / volume(product_b)`
+- `AMOUNT_RATIO = amount(product) / amount(product_b)`
+- 数据口径：仅使用已完成且时间对齐的数据点。
+- 缺失处理：某根应有 `15m` base bar 缺失，按“不满足条件（False）”处理。
+- 分母保护：分母低于最小门槛（`min_volume_b` 或 `min_amount_b`）时，该点按不满足处理。
+- 确认参数：沿用 `confirm_consecutive` + `confirm_ratio`；默认 `2 + 0.5`。
+- 示例样本数（RTH）：
+- `1h = 4` 根 `15m` bar
+- `1d = 26` 根 `15m` bar
 
 ### 4.4 触发与下单
 当策略条件满足时，系统必须：
 1. 执行下单前风控校验与交易核验。
 2. 基于 `trade_action` 计算最终下单参数（统一按数量下单）。
-3. 校验产品交易币种为 `USD`，非 `USD` 必须拒绝。
+3. 按 `market` 映射得到的交易参数（`sec_type/exchange/currency`）做交易校验。
 4. 提交订单到 IB Gateway。
 5. 记录订单与回报状态。
 
@@ -195,7 +282,7 @@
 - `MAX_CONDITIONS_PER_STRATEGY`：单策略最大条件数（全局配置，默认建议 `5`）。
 - 创建/更新策略时，`len(conditions)` 不得超过 `MAX_CONDITIONS_PER_STRATEGY`。
 - `evaluation_window` 采用滚动窗口语义（每次评估时按“当前时刻向前 N 时间”取数据）。
-- `evaluation_window` 按 `metric` 约束：价格与价差类使用分钟级；成交量/成交额比值使用小时或天级窗口。
+- `evaluation_window` 按 `metric` 约束：`PRICE/DRAWDOWN_PCT/RALLY_PCT/SPREAD` 仅支持 `1m/5m/30m/1h`；`VOLUME_RATIO/AMOUNT_RATIO` 仅支持 `1h/2h/4h/1d/2d`。
 
 ### 4.13 UI 页面与信息展示要求
 主菜单仅包含：
@@ -209,12 +296,12 @@
 
 策略编辑要求（拆分为三部分）：
 - `基本信息编辑`：仅编辑策略基础字段（如 `id`、`trade_type`、`symbols`、描述、激活限制、过期方式）。
-- `触发条件编辑`：编辑 `condition_id`、`trigger_mode`、`evaluation_window`，并支持按 `condition_type` 切换单产品/双产品字段；单产品比例类场景使用“指标（含基准）”组合选择，不单独暴露 `price_reference` 输入。
+- `触发条件编辑`：编辑 `condition_id`、`trigger_mode`、`evaluation_window`，并支持按 `condition_type` 切换单产品/双产品字段；单产品比例类场景由系统自动维护基准，不单独暴露额外基准字段输入。
 - `触发条件编辑`：支持 `window_price_basis` 下拉（收盘/最高/最低/平均），默认收盘价。
 - `触发条件编辑`：`触发判定`选项需按 `metric` 动态约束，避免无效组合。
 - `后续动作编辑`：编辑 `trade_action` 与 `next_strategy_id`（链式控制）。
 - `后续动作编辑`：`next_strategy_id` 候选必须过滤为“无上游策略（`upstream_strategy_id` 为空）且状态可链接”的策略；已有关联上游的策略不可选择。
-- `触发条件编辑`与`后续动作编辑`仅在策略状态为 `PENDING_ACTIVATION` 或 `PAUSED` 时允许。
+- `触发条件编辑`与`后续动作编辑`仅在策略状态为 `PENDING_ACTIVATION` / `PAUSED` / `VERIFY_FAILED` 时允许。
 - 当状态为 `ACTIVE` 时，需先暂停后再编辑。
 - “新增策略”时只进入 `基本信息编辑`；保存后进入该策略详情页，初始状态不含触发条件和后续动作。
 - 在上述初始详情状态中：
@@ -240,7 +327,7 @@
 - 包含该策略的 `事件日志`（时间、事件类型、详情）。
 - 在基础信息区域提供策略操作按钮：`取消执行` / `暂停执行` / `恢复执行` / `激活策略`（按当前状态控制可用性）。
 - 对下游策略（`upstream_strategy_id` 非空），`激活策略`按钮必须禁用并展示“仅允许上游激活”的原因提示。
-- 编辑入口在 `PENDING_ACTIVATION` / `PAUSED` 可用，其它状态禁用。
+- 编辑入口在 `PENDING_ACTIVATION` / `PAUSED` / `VERIFY_FAILED` 可用，其它状态禁用。
 
 运行事件页要求：
 - 作为全局事件日志，格式与策略详情中的 `事件日志` 基本一致。
@@ -294,6 +381,7 @@ verification:
 系统重启后必须：
 - 恢复 `ACTIVE` 策略监测。
 - 保持 `PAUSED` 策略为暂停状态，不得误恢复为 `ACTIVE`。
+- 保持 `VERIFY_FAILED` 策略状态不变，允许后续修复并重新激活。
 - 对 `ORDER_SUBMITTED` 状态做订单状态补偿查询。
 - 保留并恢复“待激活”策略，不得误激活。
 
@@ -332,7 +420,7 @@ verification:
 - 只要策略存在上游（`upstream_strategy_id` 非空），即视为下游策略，必须禁止手动激活。
 - 当策略被设置为下游（`upstream_strategy_id` 写入）时，系统必须自动将 `upstream_only_activation` 置为 `true`。
 - 在“每个策略最多一个上游 + 下游禁止手动激活 + 策略只激活一次”的约束下，若策略已激活且 `upstream_strategy_id` 非空，可判定该策略由该上游激活。
-- 对于使用 `price_reference=HIGHEST_SINCE_ACTIVATION/LOWEST_SINCE_ACTIVATION` 的策略，必须以 `logical_activated_at` 为统计起点，而非仅以数据库落库时间为起点。
+- 对于使用 `DRAWDOWN_PCT/RALLY_PCT` 的策略，必须以 `logical_activated_at` 为统计起点，而非仅以数据库落库时间为起点。
 
 ---
 
@@ -361,7 +449,7 @@ verification:
 ## 6. 约束与假设
 - 永久单账户约束：系统仅服务一个固定 IB 账户，不提供账户切换、账户路由或账户间分配能力。
 - 所有价格字段（触发价、限价）均为 USD。
-- 仅允许交易币种为 USD 的产品；非 USD 产品直接拒绝。
+- 当前支持的 `market` 映射结果均为 USD；执行层按 `market` 映射结果下单。
 - 不做任何汇率换算与跨币种处理。
 - 若为限价单，`limit_price` 必须为正数且符合交易最小价格变动单位（tick）约束。
 - 期货仅支持现金结算或可安全平仓品种；不做实物交割流程管理。
@@ -370,6 +458,8 @@ verification:
 
 ## 7. 状态定义（策略）
 - `PENDING_ACTIVATION`（已创建，待激活）
+- `VERIFYING`（激活前校验中）
+- `VERIFY_FAILED`（激活校验失败）
 - `ACTIVE`
 - `PAUSED`（已暂停，不参与条件监测）
 - `TRIGGERED`
@@ -432,13 +522,13 @@ verification:
 - `next_strategy_id`：`S1`，并写入 `anchor_price`
 
 2. 中间策略 `S1`
-- 条件：`drawdown_pct(SLV, HIGHEST_SINCE_ACTIVATION) >= 0.1`
+- 条件：`drawdown_pct(SLV) >= 0.1`
 - 标志：`upstream_only_activation=true`
 - `trade_action`：`SELL 100` 股
 - `next_strategy_id`：`S2`（同一触发事件同时执行）
 
 3. 下游策略 `S2`
-- 条件：`drawdown_pct(SLV, HIGHEST_SINCE_ACTIVATION) >= 0.2`
+- 条件：`drawdown_pct(SLV) >= 0.2`
 - 标志：`upstream_only_activation=true`
 - `trade_action`：`SELL 100` 股
 - `next_strategy_id`：空
@@ -450,7 +540,7 @@ verification:
 ### 示例 C：双产品调仓（任意两个 USD 产品）
 目标：在两个产品之间按组合条件自动调仓。
 
-- `product_a=SPY`
+- `product=SPY`
 - `product_b=QQQ`
 - 条件逻辑：`AND`
 - 条件 1：`volume(QQQ) / volume(SPY) >= 1.1`（或 `amount(QQQ) / amount(SPY) >= 1.1`）
@@ -462,7 +552,7 @@ verification:
 目标：对期货持仓在满足市场条件时自动从当前合约切到目标合约。
 
 - `trade_type=spread`
-- 待切换合约：`product_a`
+- 待切换合约：`product`
 - 目标合约：`product_b`
 - 触发可组合：
   - 到期天数条件（`ROLL_DAYS_BEFORE_EXPIRY`）
@@ -483,5 +573,5 @@ verification:
 
 - 条件：`metric=RALLY_PCT`
 - 参数：`metric=RALLY_PCT`, `value=0.08`（上涨 8%）
-- 基准：`price_reference=LOWEST_SINCE_ACTIVATION`（`RALLY_PCT` 场景）
+- 基准：系统自动使用激活后的最低价（`RALLY_PCT` 场景）
 - 动作：可配置 `BUY` 或 `SELL`

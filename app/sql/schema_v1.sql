@@ -12,10 +12,16 @@ CREATE TABLE IF NOT EXISTS strategies (
   id TEXT PRIMARY KEY,
   idempotency_key TEXT UNIQUE,
   description TEXT NOT NULL,
+  market TEXT NOT NULL DEFAULT "US_STOCK"
+    CHECK (length(trim(market)) > 0),
+  sec_type TEXT NOT NULL DEFAULT "STK"
+    CHECK (length(trim(sec_type)) > 0),
+  exchange TEXT NOT NULL DEFAULT "SMART"
+    CHECK (length(trim(exchange)) > 0),
   trade_type TEXT NOT NULL
     CHECK (trade_type IN ("buy", "sell", "switch", "open", "close", "spread")),
   currency TEXT NOT NULL DEFAULT "USD"
-    CHECK (currency = "USD"),
+    CHECK (length(trim(currency)) > 0),
   upstream_only_activation INTEGER NOT NULL DEFAULT 0
     CHECK (upstream_only_activation IN (0, 1)),
   expire_mode TEXT NOT NULL
@@ -25,7 +31,8 @@ CREATE TABLE IF NOT EXISTS strategies (
   expire_at TEXT,
   status TEXT NOT NULL
     CHECK (status IN (
-      "PENDING_ACTIVATION", "ACTIVE", "PAUSED", "TRIGGERED", "ORDER_SUBMITTED",
+      "PENDING_ACTIVATION", "VERIFYING", "VERIFY_FAILED",
+      "ACTIVE", "PAUSED", "TRIGGERED", "ORDER_SUBMITTED",
       "FILLED", "EXPIRED", "CANCELLED", "FAILED"
     )),
   condition_logic TEXT NOT NULL DEFAULT "AND"
@@ -63,6 +70,7 @@ CREATE TABLE IF NOT EXISTS strategy_symbols (
   code TEXT NOT NULL,
   trade_type TEXT NOT NULL
     CHECK (trade_type IN ("buy", "sell", "open", "close", "ref")),
+  contract_id INTEGER,
   created_at TEXT NOT NULL,
   UNIQUE (strategy_id, position)
 );
@@ -94,6 +102,15 @@ CREATE TABLE IF NOT EXISTS strategy_runs (
   condition_met INTEGER NOT NULL CHECK (condition_met IN (0, 1)),
   decision_reason TEXT NOT NULL,
   metrics_json TEXT NOT NULL CHECK (json_valid(metrics_json))
+);
+
+CREATE TABLE IF NOT EXISTS strategy_runtime_states (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_id TEXT NOT NULL REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  state_key TEXT NOT NULL,
+  state_value TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE (strategy_id, state_key)
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -179,6 +196,8 @@ CREATE INDEX IF NOT EXISTS idx_condition_states_strategy
   ON condition_states (strategy_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_strategy_runs_strategy_eval
   ON strategy_runs (strategy_id, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_strategy_runtime_states_strategy_updated
+  ON strategy_runtime_states (strategy_id, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_orders_strategy_status_updated
   ON orders (strategy_id, status, updated_at DESC);

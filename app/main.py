@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api import router as v1_router
 from .logging_config import configure_logging
 from .runtime_paths import ensure_runtime_dirs
+from .worker import worker_engine
 
 
 def create_app() -> FastAPI:
@@ -32,6 +33,11 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def on_startup() -> None:
         logging.getLogger("").info("IBX API startup complete; logs=%s", log_path)
+        worker_engine.start_if_enabled()
+
+    @app.on_event("shutdown")
+    def on_shutdown() -> None:
+        worker_engine.stop()
 
     return app
 

@@ -44,13 +44,12 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                     "condition_nl": "当 SLV 相对激活后最高价回撤达到 10% 时触发。",
                     "condition_type": "SINGLE_PRODUCT",
                     "metric": "DRAWDOWN_PCT",
-                    "trigger_mode": "LEVEL",
+                    "trigger_mode": "LEVEL_INSTANT",
                     "evaluation_window": "5m",
                     "window_price_basis": "CLOSE",
                     "operator": ">=",
                     "value": 0.1,
                     "product": "SLV",
-                    "price_reference": "HIGHEST_SINCE_ACTIVATION",
                 }
             ],
             "trade_action_json": {
@@ -92,7 +91,7 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                     "condition_nl": "当 SLV 价格大于等于 100 美元时触发。",
                     "condition_type": "SINGLE_PRODUCT",
                     "metric": "PRICE",
-                    "trigger_mode": "LEVEL",
+                    "trigger_mode": "LEVEL_INSTANT",
                     "evaluation_window": "1m",
                     "window_price_basis": "CLOSE",
                     "operator": ">=",
@@ -130,12 +129,12 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                     "condition_nl": "当 volume(QQQ)/volume(SPY) >= 1.1 时满足条件。",
                     "condition_type": "PAIR_PRODUCTS",
                     "metric": "VOLUME_RATIO",
-                    "trigger_mode": "LEVEL",
+                    "trigger_mode": "LEVEL_CONFIRM",
                     "evaluation_window": "1d",
                     "window_price_basis": "CLOSE",
                     "operator": ">=",
                     "value": 1.1,
-                    "product_a": "QQQ",
+                    "product": "QQQ",
                     "product_b": "SPY",
                 },
                 {
@@ -143,12 +142,12 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                     "condition_nl": "当 price(QQQ)-price(SPY) <= -120 时满足条件。",
                     "condition_type": "PAIR_PRODUCTS",
                     "metric": "SPREAD",
-                    "trigger_mode": "LEVEL",
+                    "trigger_mode": "LEVEL_INSTANT",
                     "evaluation_window": "5m",
                     "window_price_basis": "CLOSE",
                     "operator": "<=",
                     "value": -120.0,
-                    "product_a": "QQQ",
+                    "product": "QQQ",
                     "product_b": "SPY",
                 },
             ],
@@ -192,12 +191,12 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                     "condition_nl": "当近远月合约成交量比达到 1.2 时触发。",
                     "condition_type": "PAIR_PRODUCTS",
                     "metric": "VOLUME_RATIO",
-                    "trigger_mode": "LEVEL",
+                    "trigger_mode": "LEVEL_CONFIRM",
                     "evaluation_window": "1d",
                     "window_price_basis": "CLOSE",
                     "operator": ">=",
                     "value": 1.2,
-                    "product_a": "SIH6",
+                    "product": "SIH6",
                     "product_b": "SIK6",
                 },
                 {
@@ -205,12 +204,12 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                     "condition_nl": "当近远月价差大于等于 0.2 时触发。",
                     "condition_type": "PAIR_PRODUCTS",
                     "metric": "SPREAD",
-                    "trigger_mode": "LEVEL",
+                    "trigger_mode": "LEVEL_INSTANT",
                     "evaluation_window": "5m",
                     "window_price_basis": "CLOSE",
                     "operator": ">=",
                     "value": 0.2,
-                    "product_a": "SIH6",
+                    "product": "SIH6",
                     "product_b": "SIK6",
                 },
             ],
@@ -256,7 +255,7 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
                     "condition_nl": "当 SLV 价格小于等于 60 美元时触发。",
                     "condition_type": "SINGLE_PRODUCT",
                     "metric": "PRICE",
-                    "trigger_mode": "LEVEL",
+                    "trigger_mode": "LEVEL_INSTANT",
                     "evaluation_window": "1m",
                     "window_price_basis": "CLOSE",
                     "operator": "<=",
@@ -295,6 +294,7 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
             # Reset all runtime rows first, then insert a clean sample dataset.
             cur.execute("DELETE FROM condition_states")
             cur.execute("DELETE FROM strategy_runs")
+            cur.execute("DELETE FROM strategy_runtime_states")
             cur.execute("DELETE FROM verification_events")
             cur.execute("DELETE FROM trade_logs")
             cur.execute("DELETE FROM trade_instructions")
@@ -311,6 +311,9 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
             )
             cur.execute(
                 "DELETE FROM strategy_runs WHERE strategy_id LIKE 'SMP-%'"
+            )
+            cur.execute(
+                "DELETE FROM strategy_runtime_states WHERE strategy_id LIKE 'SMP-%'"
             )
             cur.execute(
                 "DELETE FROM verification_events WHERE strategy_id LIKE 'SMP-%' OR trade_id LIKE 'T-SMP-%'"

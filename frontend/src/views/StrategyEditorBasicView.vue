@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { createStrategy, fetchStrategyDetail, patchStrategyBasic, putStrategyActions } from '../api/services'
-import type { StrategySymbolItem, StrategyTradeType } from '../api/types'
+import type { StrategyMarket, StrategySymbolItem, StrategyTradeType } from '../api/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -25,6 +25,7 @@ const error = ref('')
 const form = reactive({
   id: '',
   description: '',
+  market: 'US_STOCK' as StrategyMarket,
   trade_type: 'buy' as StrategyTradeType,
   upstream_only_activation: false,
   expire_mode: 'relative' as 'relative' | 'absolute',
@@ -32,7 +33,19 @@ const form = reactive({
   expire_at: '',
 })
 
-const tradeTypes: StrategyTradeType[] = ['buy', 'sell', 'switch', 'open', 'close', 'spread']
+const marketOptions: Array<{ label: string; value: StrategyMarket }> = [
+  { label: '美股', value: 'US_STOCK' },
+  { label: 'COMEX期货', value: 'COMEX_FUTURES' },
+]
+const tradeTypesByMarket: Record<StrategyMarket, StrategyTradeType[]> = {
+  US_STOCK: ['buy', 'sell', 'switch'],
+  COMEX_FUTURES: ['open', 'close', 'spread'],
+}
+const defaultTradeTypeByMarket: Record<StrategyMarket, StrategyTradeType> = {
+  US_STOCK: 'buy',
+  COMEX_FUTURES: 'open',
+}
+const tradeTypes = computed(() => tradeTypesByMarket[form.market])
 type CoreSymbolTradeType = Exclude<StrategySymbolItem['trade_type'], 'ref'>
 type RequiredSymbolSpec = { type: CoreSymbolTradeType; label: string; placeholder: string }
 type RelativeExpirePreset = '1h' | '2h' | 'today' | '1d' | '2d' | '3d' | '5d' | '1w'
@@ -259,6 +272,16 @@ function applySymbolsToInputs(symbols: StrategySymbolItem[]) {
   refSymbolInput.value = ''
 }
 
+watch(
+  () => form.market,
+  (nextMarket) => {
+    const availableTypes = tradeTypesByMarket[nextMarket]
+    if (!availableTypes.includes(form.trade_type)) {
+      form.trade_type = defaultTradeTypeByMarket[nextMarket]
+    }
+  },
+)
+
 function appendRefSymbols(raw: string) {
   const tokens = raw
     .split(/[\s,，;；]+/)
@@ -295,12 +318,12 @@ function buildSymbolsPayload() {
   for (const spec of requiredSymbolSpecs.value) {
     const code = coreSymbolCodes[spec.type].trim().toUpperCase()
     if (!code) throw new Error(`请填写${spec.label}`)
-    symbols.push({ code, trade_type: spec.type })
+    symbols.push({ code, trade_type: spec.type, contract_id: null })
   }
 
   for (const code of refSymbolCodes.value) {
     const normalized = code.trim().toUpperCase()
-    if (normalized) symbols.push({ code: normalized, trade_type: 'ref' })
+    if (normalized) symbols.push({ code: normalized, trade_type: 'ref', contract_id: null })
   }
 
   return symbols
@@ -314,6 +337,7 @@ async function loadDetail() {
     const detail = await fetchStrategyDetail(strategyId.value)
     form.id = detail.id
     form.description = detail.description
+    form.market = detail.market || (detail.sec_type === 'FUT' ? 'COMEX_FUTURES' : 'US_STOCK')
     form.trade_type = detail.trade_type
     applySymbolsToInputs(detail.symbols)
     form.upstream_only_activation = detail.upstream_only_activation
@@ -342,9 +366,9 @@ async function saveBasic() {
       const created = await createStrategy({
         id: form.id.trim() || undefined,
         description: form.description,
+        market: form.market,
         trade_type: form.trade_type,
         symbols,
-        currency: 'USD',
         upstream_only_activation: form.upstream_only_activation,
         expire_mode: form.expire_mode,
         expire_in_seconds: form.expire_mode === 'relative' ? form.expire_in_seconds : null,
@@ -377,6 +401,7 @@ async function saveBasic() {
 
     const updated = await patchStrategyBasic(strategyId.value, {
       description: form.description,
+      market: form.market,
       trade_type: form.trade_type,
       symbols,
       upstream_only_activation: form.upstream_only_activation,
@@ -426,6 +451,11 @@ onMounted(loadDetail)
         </el-form-item>
         <el-form-item label="自然语言描述">
           <el-input v-model="form.description" type="textarea" :rows="2" />
+        </el-form-item>
+        <el-form-item label="market">
+          <el-select v-model="form.market" class="trade-type-select">
+            <el-option v-for="opt in marketOptions" :key="opt.value" :value="opt.value" :label="opt.label" />
+          </el-select>
         </el-form-item>
         <el-form-item label="交易类型">
           <div class="trade-type-row">

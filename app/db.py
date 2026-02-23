@@ -4,6 +4,7 @@ import os
 import sqlite3
 from pathlib import Path
 
+from .config import load_app_config
 from .runtime_paths import resolve_data_dir
 
 DEFAULT_DB_PATH = resolve_data_dir() / "ibx.sqlite3"
@@ -16,6 +17,12 @@ def resolve_db_path(db_path: str | Path | None = None) -> Path:
     env_path = os.getenv("IBX_DB_PATH")
     if env_path:
         return Path(env_path)
+    configured = load_app_config().runtime.db_path
+    if configured:
+        path = Path(configured)
+        if not path.is_absolute():
+            return resolve_data_dir() / path
+        return path
     return resolve_data_dir() / "ibx.sqlite3"
 
 
@@ -50,6 +57,19 @@ def _strategies_has_broken_next_fk(conn: sqlite3.Connection) -> bool:
     )
 
 
+def _strategies_supports_verify_statuses(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'strategies'
+        """
+    ).fetchone()
+    if row is None:
+        return False
+    ddl = str(row["sql"] or "")
+    return '"VERIFYING"' in ddl and '"VERIFY_FAILED"' in ddl
+
+
 def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
     conn.execute("DROP VIEW IF EXISTS v_strategies_active")
     conn.execute("PRAGMA foreign_keys = OFF")
@@ -60,10 +80,16 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
           id TEXT PRIMARY KEY,
           idempotency_key TEXT UNIQUE,
           description TEXT NOT NULL,
+          market TEXT NOT NULL DEFAULT "US_STOCK"
+            CHECK (length(trim(market)) > 0),
+          sec_type TEXT NOT NULL DEFAULT "STK"
+            CHECK (length(trim(sec_type)) > 0),
+          exchange TEXT NOT NULL DEFAULT "SMART"
+            CHECK (length(trim(exchange)) > 0),
           trade_type TEXT NOT NULL
             CHECK (trade_type IN ("buy", "sell", "switch", "open", "close", "spread")),
           currency TEXT NOT NULL DEFAULT "USD"
-            CHECK (currency = "USD"),
+            CHECK (length(trim(currency)) > 0),
           upstream_only_activation INTEGER NOT NULL DEFAULT 0
             CHECK (upstream_only_activation IN (0, 1)),
           expire_mode TEXT NOT NULL
@@ -73,7 +99,8 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
           expire_at TEXT,
           status TEXT NOT NULL
             CHECK (status IN (
-              "PENDING_ACTIVATION", "ACTIVE", "PAUSED", "TRIGGERED", "ORDER_SUBMITTED",
+              "PENDING_ACTIVATION", "VERIFYING", "VERIFY_FAILED",
+              "ACTIVE", "PAUSED", "TRIGGERED", "ORDER_SUBMITTED",
               "FILLED", "EXPIRED", "CANCELLED", "FAILED"
             )),
           condition_logic TEXT NOT NULL DEFAULT "AND"
@@ -108,14 +135,32 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT INTO strategies__new (
-          id, idempotency_key, description, trade_type, currency, upstream_only_activation,
+          id, idempotency_key, description, market, sec_type, exchange, trade_type, currency,
+          upstream_only_activation,
           expire_mode, expire_in_seconds, expire_at, status, condition_logic, conditions_json,
           trade_action_json, next_strategy_id, next_strategy_note, upstream_strategy_id,
           is_deleted, deleted_at, anchor_price, activated_at, logical_activated_at,
           created_at, updated_at, version
         )
         SELECT
-          id, idempotency_key, description, trade_type, currency, upstream_only_activation,
+          id,
+          idempotency_key,
+          description,
+          COALESCE(
+            NULLIF(trim(market), ""),
+            CASE WHEN trade_type IN ("open", "close", "spread") THEN "COMEX_FUTURES" ELSE "US_STOCK" END
+          ) AS market,
+          COALESCE(
+            NULLIF(trim(sec_type), ""),
+            CASE WHEN trade_type IN ("open", "close", "spread") THEN "FUT" ELSE "STK" END
+          ) AS sec_type,
+          COALESCE(
+            NULLIF(trim(exchange), ""),
+            CASE WHEN trade_type IN ("open", "close", "spread") THEN "COMEX" ELSE "SMART" END
+          ) AS exchange,
+          trade_type,
+          COALESCE(NULLIF(trim(currency), ""), "USD") AS currency,
+          upstream_only_activation,
           expire_mode, expire_in_seconds, expire_at, status, condition_logic, conditions_json,
           trade_action_json, next_strategy_id, next_strategy_note, upstream_strategy_id,
           COALESCE(is_deleted, 0), deleted_at, anchor_price, activated_at, logical_activated_at,
@@ -130,6 +175,28 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     strategy_columns = _table_columns(conn, "strategies")
+    strategy_symbol_columns = _table_columns(conn, "strategy_symbols")
+    if "market" not in strategy_columns:
+        conn.execute(
+            """
+            ALTER TABLE strategies
+            ADD COLUMN market TEXT
+            """
+        )
+    if "sec_type" not in strategy_columns:
+        conn.execute(
+            """
+            ALTER TABLE strategies
+            ADD COLUMN sec_type TEXT
+            """
+        )
+    if "exchange" not in strategy_columns:
+        conn.execute(
+            """
+            ALTER TABLE strategies
+            ADD COLUMN exchange TEXT
+            """
+        )
     if "upstream_strategy_id" not in strategy_columns:
         conn.execute(
             """
@@ -152,10 +219,59 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             """
         )
 
-    if _strategies_has_upstream_fk(conn) or _strategies_has_broken_next_fk(conn):
+    if (
+        _strategies_has_upstream_fk(conn)
+        or _strategies_has_broken_next_fk(conn)
+        or not _strategies_supports_verify_statuses(conn)
+    ):
         _rebuild_strategies_without_upstream_fk(conn)
+        strategy_columns = _table_columns(conn, "strategies")
 
     conn.execute("UPDATE strategies SET is_deleted = 0 WHERE is_deleted IS NULL")
+    conn.execute(
+        """
+        UPDATE strategies
+        SET market = CASE
+          WHEN trade_type IN ("open", "close", "spread") THEN "COMEX_FUTURES"
+          ELSE "US_STOCK"
+        END
+        WHERE market IS NULL OR trim(market) = ""
+        """
+    )
+    conn.execute(
+        """
+        UPDATE strategies
+        SET sec_type = CASE
+          WHEN market = "COMEX_FUTURES" THEN "FUT"
+          ELSE "STK"
+        END
+        WHERE sec_type IS NULL OR trim(sec_type) = ""
+        """
+    )
+    conn.execute(
+        """
+        UPDATE strategies
+        SET exchange = CASE
+          WHEN market = "COMEX_FUTURES" THEN "COMEX"
+          ELSE "SMART"
+        END
+        WHERE exchange IS NULL OR trim(exchange) = ""
+        """
+    )
+    conn.execute(
+        """
+        UPDATE strategies
+        SET currency = "USD"
+        WHERE currency IS NULL OR trim(currency) = ""
+        """
+    )
+    if "contract_id" not in strategy_symbol_columns:
+        conn.execute(
+            """
+            ALTER TABLE strategy_symbols
+            ADD COLUMN contract_id INTEGER
+            """
+        )
 
     conn.execute(
         """
