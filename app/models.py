@@ -5,8 +5,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .config import resolve_metric_allowed_rules, resolve_metric_allowed_windows
+from .market_config import resolve_market_profile
+
 StrategyStatus = Literal[
     "PENDING_ACTIVATION",
+    "VERIFYING",
+    "VERIFY_FAILED",
     "ACTIVE",
     "PAUSED",
     "TRIGGERED",
@@ -29,9 +34,16 @@ ConditionMetric = Literal[
     "AMOUNT_RATIO",
     "SPREAD",
 ]
-ConditionTriggerMode = Literal["LEVEL", "CROSS_UP", "CROSS_DOWN"]
+ConditionTriggerMode = Literal[
+    "LEVEL_INSTANT",
+    "LEVEL_CONFIRM",
+    "CROSS_UP_INSTANT",
+    "CROSS_UP_CONFIRM",
+    "CROSS_DOWN_INSTANT",
+    "CROSS_DOWN_CONFIRM",
+]
 ConditionOperator = Literal[">=", "<="]
-ConditionEvaluationWindow = Literal["1m", "2m", "5m", "1h", "2h", "4h", "1d", "2d", "5d"]
+ConditionEvaluationWindow = Literal["1m", "5m", "30m", "1h", "2h", "4h", "1d", "2d"]
 
 LEGACY_METRIC_ALIASES: dict[str, ConditionMetric] = {
     "LIQUIDITY_RATIO": "VOLUME_RATIO",
@@ -41,25 +53,6 @@ CONDITION_METRICS_BY_TYPE: dict[str, set[ConditionMetric]] = {
     "SINGLE_PRODUCT": {"PRICE", "DRAWDOWN_PCT", "RALLY_PCT"},
     "PAIR_PRODUCTS": {"VOLUME_RATIO", "AMOUNT_RATIO", "SPREAD"},
 }
-
-METRIC_ALLOWED_RULES: dict[ConditionMetric, set[tuple[ConditionTriggerMode, ConditionOperator]]] = {
-    "PRICE": {("LEVEL", ">="), ("LEVEL", "<="), ("CROSS_UP", ">="), ("CROSS_DOWN", "<=")},
-    "DRAWDOWN_PCT": {("LEVEL", ">=")},
-    "RALLY_PCT": {("LEVEL", ">=")},
-    "VOLUME_RATIO": {("LEVEL", ">="), ("LEVEL", "<=")},
-    "AMOUNT_RATIO": {("LEVEL", ">="), ("LEVEL", "<=")},
-    "SPREAD": {("LEVEL", ">="), ("LEVEL", "<="), ("CROSS_UP", ">="), ("CROSS_DOWN", "<=")},
-}
-
-METRIC_ALLOWED_WINDOWS: dict[ConditionMetric, set[ConditionEvaluationWindow]] = {
-    "PRICE": {"1m", "2m", "5m"},
-    "DRAWDOWN_PCT": {"1m", "2m", "5m"},
-    "RALLY_PCT": {"1m", "2m", "5m"},
-    "SPREAD": {"1m", "2m", "5m"},
-    "VOLUME_RATIO": {"1h", "2h", "4h", "1d", "2d", "5d"},
-    "AMOUNT_RATIO": {"1h", "2h", "4h", "1d", "2d", "5d"},
-}
-
 
 class Capabilities(BaseModel):
     can_activate: bool = False
@@ -87,6 +80,7 @@ class EventLogItem(BaseModel):
 class StrategySymbolItem(BaseModel):
     code: str
     trade_type: SymbolTradeType
+    contract_id: int | None = None
 
     @field_validator("code")
     @classmethod
@@ -95,6 +89,13 @@ class StrategySymbolItem(BaseModel):
         if not v:
             raise ValueError("symbol code cannot be empty")
         return v
+
+    @field_validator("contract_id")
+    @classmethod
+    def validate_contract_id(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("contract_id must be a positive integer")
+        return value
 
 
 def _validate_trade_symbol_combo(
@@ -150,9 +151,21 @@ class ConditionItem(BaseModel):
     operator: ConditionOperator
     value: float
     product: str | None = None
-    product_a: str | None = None
     product_b: str | None = None
-    price_reference: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        # Backward-compatibility: merge legacy product_a into product.
+        if (not data.get("product")) and data.get("product_a"):
+            data["product"] = data.get("product_a")
+        data.pop("product_a", None)
+        # price_reference is no longer part of condition schema.
+        data.pop("price_reference", None)
+        return data
 
     @field_validator("metric", mode="before")
     @classmethod
@@ -160,7 +173,7 @@ class ConditionItem(BaseModel):
         metric = str(value).strip().upper()
         return LEGACY_METRIC_ALIASES.get(metric, metric)
 
-    @field_validator("product", "product_a", "product_b")
+    @field_validator("product", "product_b")
     @classmethod
     def normalize_products(cls, value: str | None) -> str | None:
         if value is None:
@@ -179,12 +192,14 @@ class ConditionItem(BaseModel):
         if self.metric not in allowed_metrics:
             raise ValueError(f"metric={self.metric} is not allowed for condition_type={self.condition_type}")
 
-        if (self.trigger_mode, self.operator) not in METRIC_ALLOWED_RULES[self.metric]:
+        allowed_rules = resolve_metric_allowed_rules(self.metric)
+        if (self.trigger_mode, self.operator) not in allowed_rules:
             raise ValueError(
                 f"metric={self.metric} does not allow trigger_mode={self.trigger_mode} with operator={self.operator}"
             )
 
-        if self.evaluation_window not in METRIC_ALLOWED_WINDOWS[self.metric]:
+        allowed_windows = resolve_metric_allowed_windows(self.metric)
+        if self.evaluation_window not in allowed_windows:
             raise ValueError(
                 f"metric={self.metric} does not allow evaluation_window={self.evaluation_window}"
             )
@@ -192,14 +207,12 @@ class ConditionItem(BaseModel):
         if self.condition_type == "SINGLE_PRODUCT":
             if not self.product:
                 raise ValueError("SINGLE_PRODUCT requires product")
-            self.product_a = None
             self.product_b = None
         else:
-            if not self.product_a or not self.product_b:
-                raise ValueError("PAIR_PRODUCTS requires product_a and product_b")
-            if self.product_a == self.product_b:
-                raise ValueError("PAIR_PRODUCTS requires different product_a and product_b")
-            self.product = None
+            if not self.product or not self.product_b:
+                raise ValueError("PAIR_PRODUCTS requires product and product_b")
+            if self.product == self.product_b:
+                raise ValueError("PAIR_PRODUCTS requires different product and product_b")
         return self
 
 
@@ -235,9 +248,11 @@ class StrategySummaryOut(BaseModel):
 class StrategyDetailOut(BaseModel):
     id: str
     description: str
+    market: str
+    sec_type: str
+    exchange: str
     trade_type: StrategyTradeType
     symbols: list[StrategySymbolItem]
-    currency: str = "USD"
     upstream_only_activation: bool = False
     activated_at: datetime | None = None
     logical_activated_at: datetime | None = None
@@ -270,9 +285,9 @@ class StrategyCreateIn(BaseModel):
     id: str | None = None
     idempotency_key: str | None = None
     description: str
+    market: str | None = None
     trade_type: StrategyTradeType
     symbols: list[StrategySymbolItem]
-    currency: Literal["USD"] = "USD"
     upstream_only_activation: bool = False
     expire_mode: Literal["relative", "absolute"] = "relative"
     expire_in_seconds: int | None = 172800
@@ -286,11 +301,13 @@ class StrategyCreateIn(BaseModel):
     @model_validator(mode="after")
     def validate_trade_type_and_symbols(self) -> "StrategyCreateIn":
         _validate_trade_symbol_combo(self.trade_type, self.symbols)
+        self.market = resolve_market_profile(self.market, self.trade_type).market
         return self
 
 
 class StrategyBasicPatchIn(BaseModel):
     description: str | None = None
+    market: str | None = None
     trade_type: StrategyTradeType | None = None
     symbols: list[StrategySymbolItem] | None = None
     upstream_only_activation: bool | None = None

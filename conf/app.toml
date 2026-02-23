@@ -1,0 +1,26 @@
+[ib_gateway]
+host = "127.0.0.1"
+paper_port = 4002
+live_port = 4001
+client_id = 99
+timeout_seconds = 5
+account_code = ""
+trading_mode = "paper"
+
+[runtime]
+# 留空表示使用缺省路径（项目内 data/）
+data_dir = ""
+db_path = ""
+log_path = ""
+market_data_log_path = ""
+market_cache_db_path = ""
+market_config_path = "conf/markets.json"
+enable_live_trading = false
+
+[worker]
+enabled = false
+monitor_interval_seconds = 60
+threads = 2
+queue_maxsize = 4096
+gateway_not_work_event_throttle_seconds = 300
+waiting_for_market_data_event_throttle_seconds = 120

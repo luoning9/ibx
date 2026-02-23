@@ -1,0 +1,16 @@
+{
+  "markets": {
+    "US_STOCK": {
+      "sec_type": "STK",
+      "exchange": "SMART",
+      "currency": "USD",
+      "allowed_trade_types": ["buy", "sell", "switch"]
+    },
+    "COMEX_FUTURES": {
+      "sec_type": "FUT",
+      "exchange": "COMEX",
+      "currency": "USD",
+      "allowed_trade_types": ["open", "close", "spread"]
+    }
+  }
+}

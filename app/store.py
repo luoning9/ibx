@@ -10,6 +10,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from .db import get_connection, init_db
+from .market_config import resolve_market_profile
 from .models import (
     ActiveTradeInstructionOut,
     Capabilities,
@@ -37,7 +38,7 @@ from .models import (
 
 TERMINAL_STATUSES: set[str] = {"FILLED", "EXPIRED", "CANCELLED", "FAILED"}
 TRADE_INSTRUCTION_TERMINAL_STATUSES: tuple[str, ...] = ("FILLED", "CANCELLED", "FAILED", "EXPIRED")
-EDITABLE_STATUSES: set[str] = {"PENDING_ACTIVATION", "PAUSED"}
+EDITABLE_STATUSES: set[str] = {"PENDING_ACTIVATION", "PAUSED", "VERIFY_FAILED"}
 STOCK_TRADE_TYPES: set[str] = {"buy", "sell", "switch"}
 ACTIVE_STRATEGIES_SOURCE = "v_strategies_active"
 
@@ -66,7 +67,7 @@ def _generate_condition_nl(condition: ConditionItem) -> str:
     if condition.condition_type == "SINGLE_PRODUCT":
         subject = condition.product or "标的"
     else:
-        subject = f"{condition.product_a or 'A'} / {condition.product_b or 'B'}"
+        subject = f"{condition.product or 'A'} / {condition.product_b or 'B'}"
     return (
         f"当 {subject} 的 {condition.metric} 在 {condition.evaluation_window} 窗口满足 "
         f"{condition.trigger_mode} {condition.operator} {condition.value} 时触发。"
@@ -114,7 +115,7 @@ def _normalize_optional_text(value: str | None) -> str | None:
 def _editable(status: str) -> tuple[bool, str | None]:
     if status in EDITABLE_STATUSES:
         return True, None
-    return False, "仅 PENDING_ACTIVATION / PAUSED 可编辑；ACTIVE 请先暂停。"
+    return False, "仅 PENDING_ACTIVATION / PAUSED / VERIFY_FAILED 可编辑；ACTIVE 请先暂停。"
 
 
 def _capabilities(
@@ -126,7 +127,7 @@ def _capabilities(
     has_active_trade_instruction: bool,
     has_upstream_strategy: bool,
 ) -> tuple[Capabilities, CapabilityReasons]:
-    can_activate = status == "PENDING_ACTIVATION"
+    can_activate = status in {"PENDING_ACTIVATION", "VERIFY_FAILED"}
     activate_reason = None
     if upstream_only_activation:
         can_activate = False
@@ -291,14 +292,21 @@ class SQLiteStore:
     def _load_symbols(self, conn: sqlite3.Connection, strategy_id: str) -> list[StrategySymbolItem]:
         rows = conn.execute(
             """
-            SELECT code, trade_type
+            SELECT code, trade_type, contract_id
             FROM strategy_symbols
             WHERE strategy_id = ?
             ORDER BY position ASC
             """,
             (strategy_id,),
         ).fetchall()
-        return [StrategySymbolItem(code=r["code"], trade_type=r["trade_type"]) for r in rows]
+        return [
+            StrategySymbolItem(
+                code=r["code"],
+                trade_type=r["trade_type"],
+                contract_id=r["contract_id"],
+            )
+            for r in rows
+        ]
 
     def _load_conditions(self, row: sqlite3.Row) -> list[ConditionItem]:
         raw = row["conditions_json"] or "[]"
@@ -493,9 +501,11 @@ class SQLiteStore:
         return StrategyDetailOut(
             id=row["id"],
             description=row["description"],
+            market=row["market"],
+            sec_type=row["sec_type"],
+            exchange=row["exchange"],
             trade_type=row["trade_type"],
             symbols=symbols,
-            currency=row["currency"],
             upstream_only_activation=bool(row["upstream_only_activation"]),
             activated_at=parse_iso(row["activated_at"]),
             logical_activated_at=parse_iso(row["logical_activated_at"]),
@@ -544,6 +554,44 @@ class SQLiteStore:
             """,
             (strategy_id, to_iso(ts or utcnow()), event_type, detail),
         )
+
+    def _reset_to_pending_after_config_change(
+        self, conn: sqlite3.Connection, strategy_id: str, now: datetime
+    ) -> None:
+        row = self._get_strategy_row(conn, strategy_id)
+        if row["status"] == "PENDING_ACTIVATION":
+            return
+        conn.execute(
+            """
+            UPDATE strategies
+            SET status = 'PENDING_ACTIVATION',
+                activated_at = NULL,
+                logical_activated_at = NULL,
+                updated_at = ?,
+                version = version + 1
+            WHERE id = ?
+            """,
+            (to_iso(now), strategy_id),
+        )
+        self._append_event(conn, strategy_id, "RESET_TO_PENDING", "配置变更，状态重置为待激活", now)
+
+    def _run_activation_verification(
+        self, conn: sqlite3.Connection, strategy_id: str, row: sqlite3.Row
+    ) -> str | None:
+        try:
+            resolve_market_profile(row["market"], row["trade_type"])
+        except ValueError as exc:
+            return str(exc)
+
+        symbols = self._load_symbols(conn, strategy_id)
+        invalid_codes = [s.code for s in symbols if not s.code.strip()]
+        if invalid_codes:
+            return f"symbols contains invalid code: {','.join(invalid_codes)}"
+
+        invalid_contract_ids = [str(s.contract_id) for s in symbols if s.contract_id is not None and s.contract_id <= 0]
+        if invalid_contract_ids:
+            return f"symbols contains invalid contract_id: {','.join(invalid_contract_ids)}"
+        return None
 
     def list_strategies(self) -> list[StrategySummaryOut]:
         with self._lock, self._conn() as conn:
@@ -616,6 +664,10 @@ class SQLiteStore:
                 raise HTTPException(status_code=409, detail=f"strategy {strategy_id} already exists")
 
             _validate_trade_action_compatibility(payload.trade_type, payload.trade_action_json)
+            try:
+                market_profile = resolve_market_profile(payload.market, payload.trade_type)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
             next_strategy_id = self._validate_next_strategy_target(
                 conn,
                 strategy_id=strategy_id,
@@ -644,18 +696,22 @@ class SQLiteStore:
                 conn.execute(
                     """
                     INSERT INTO strategies (
-                        id, idempotency_key, description, trade_type, currency, upstream_only_activation,
+                        id, idempotency_key, description, market, sec_type, exchange, currency,
+                        trade_type, upstream_only_activation,
                         expire_mode, expire_in_seconds, expire_at, status, condition_logic,
                         conditions_json, trade_action_json, next_strategy_id, next_strategy_note,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         strategy_id,
                         payload.idempotency_key,
                         payload.description,
+                        market_profile.market,
+                        market_profile.sec_type,
+                        market_profile.exchange,
+                        market_profile.currency,
                         payload.trade_type,
-                        payload.currency,
                         int(payload.upstream_only_activation),
                         payload.expire_mode,
                         payload.expire_in_seconds,
@@ -686,10 +742,11 @@ class SQLiteStore:
             for idx, sym in enumerate(payload.symbols, start=1):
                 conn.execute(
                     """
-                    INSERT INTO strategy_symbols (strategy_id, position, code, trade_type, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO strategy_symbols (
+                        strategy_id, position, code, trade_type, contract_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (strategy_id, idx, sym.code, sym.trade_type, to_iso(now)),
+                    (strategy_id, idx, sym.code, sym.trade_type, sym.contract_id, to_iso(now)),
                 )
 
             for cond in conditions:
@@ -727,6 +784,12 @@ class SQLiteStore:
             if next_symbols is None:
                 raise HTTPException(status_code=422, detail="symbols cannot be null")
 
+            market_input = payload.market if "market" in fields_set else row["market"]
+            try:
+                market_profile = resolve_market_profile(market_input, next_trade_type)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+
             _validate_trade_symbol_combo(next_trade_type, next_symbols)
             _validate_trade_action_compatibility(next_trade_type, current_trade_action)
 
@@ -754,13 +817,18 @@ class SQLiteStore:
             conn.execute(
                 """
                 UPDATE strategies
-                SET description = ?, trade_type = ?, upstream_only_activation = ?,
+                SET description = ?, market = ?, sec_type = ?, exchange = ?, currency = ?, trade_type = ?,
+                    upstream_only_activation = ?,
                     expire_mode = ?, expire_in_seconds = ?, expire_at = ?, updated_at = ?,
                     version = version + 1
                 WHERE id = ?
                 """,
                 (
                     description,
+                    market_profile.market,
+                    market_profile.sec_type,
+                    market_profile.exchange,
+                    market_profile.currency,
                     next_trade_type,
                     upstream_only_activation,
                     expire_mode,
@@ -776,13 +844,15 @@ class SQLiteStore:
                 for idx, sym in enumerate(next_symbols, start=1):
                     conn.execute(
                         """
-                        INSERT INTO strategy_symbols (strategy_id, position, code, trade_type, created_at)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO strategy_symbols (
+                            strategy_id, position, code, trade_type, contract_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
                         """,
-                        (strategy_id, idx, sym.code, sym.trade_type, to_iso(now)),
+                        (strategy_id, idx, sym.code, sym.trade_type, sym.contract_id, to_iso(now)),
                     )
 
             self._append_event(conn, strategy_id, "BASIC_UPDATED", "已更新基本信息", now)
+            self._reset_to_pending_after_config_change(conn, strategy_id, now)
             conn.commit()
             row = self._get_strategy_row(conn, strategy_id)
             return self._to_detail(conn, row)
@@ -833,6 +903,7 @@ class SQLiteStore:
                 )
 
             self._append_event(conn, strategy_id, "CONDITIONS_UPDATED", "已更新触发条件", now)
+            self._reset_to_pending_after_config_change(conn, strategy_id, now)
             conn.commit()
             row = self._get_strategy_row(conn, strategy_id)
             return self._to_detail(conn, row)
@@ -883,6 +954,7 @@ class SQLiteStore:
                 raise HTTPException(status_code=422, detail=str(exc))
 
             self._append_event(conn, strategy_id, "ACTIONS_UPDATED", "已更新后续动作", now)
+            self._reset_to_pending_after_config_change(conn, strategy_id, now)
             conn.commit()
             row = self._get_strategy_row(conn, strategy_id)
             return self._to_detail(conn, row)
@@ -890,8 +962,11 @@ class SQLiteStore:
     def activate(self, strategy_id: str) -> ControlResponse:
         with self._lock, self._conn() as conn:
             row = self._get_strategy_row(conn, strategy_id)
-            if row["status"] != "PENDING_ACTIVATION":
-                raise HTTPException(status_code=409, detail="only PENDING_ACTIVATION can activate")
+            if row["status"] not in {"PENDING_ACTIVATION", "VERIFY_FAILED"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="only PENDING_ACTIVATION/VERIFY_FAILED can activate",
+                )
             if bool(row["upstream_only_activation"]):
                 raise HTTPException(status_code=409, detail="upstream_only_activation=true")
 
@@ -903,9 +978,40 @@ class SQLiteStore:
                 raise HTTPException(status_code=409, detail="follow-up actions not configured")
 
             now = utcnow()
+            conn.execute(
+                """
+                UPDATE strategies
+                SET status = 'VERIFYING', updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (to_iso(now), strategy_id),
+            )
+            self._append_event(conn, strategy_id, "VERIFYING", "策略开始激活前校验", now)
+
+            verify_error = self._run_activation_verification(conn, strategy_id, row)
+            if verify_error:
+                fail_now = utcnow()
+                conn.execute(
+                    """
+                    UPDATE strategies
+                    SET status = 'VERIFY_FAILED', updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (to_iso(fail_now), strategy_id),
+                )
+                self._append_event(conn, strategy_id, "VERIFY_FAILED", verify_error, fail_now)
+                conn.commit()
+                return ControlResponse(
+                    strategy_id=strategy_id,
+                    status="VERIFY_FAILED",
+                    message="verify_failed",
+                    updated_at=fail_now,
+                )
+
+            activated_now = utcnow()
             expire_at = row["expire_at"]
             if row["expire_mode"] == "relative" and row["expire_in_seconds"]:
-                expire_at = to_iso(now + timedelta(seconds=row["expire_in_seconds"]))
+                expire_at = to_iso(activated_now + timedelta(seconds=row["expire_in_seconds"]))
 
             conn.execute(
                 """
@@ -914,15 +1020,15 @@ class SQLiteStore:
                     expire_at = ?, updated_at = ?, version = version + 1
                 WHERE id = ?
                 """,
-                (to_iso(now), to_iso(now), expire_at, to_iso(now), strategy_id),
+                (to_iso(activated_now), to_iso(activated_now), expire_at, to_iso(activated_now), strategy_id),
             )
-            self._append_event(conn, strategy_id, "ACTIVATED", "策略已手动激活", now)
+            self._append_event(conn, strategy_id, "ACTIVATED", "策略已通过校验并激活", activated_now)
             conn.commit()
             return ControlResponse(
                 strategy_id=strategy_id,
                 status="ACTIVE",
                 message="activated",
-                updated_at=now,
+                updated_at=activated_now,
             )
 
     def pause(self, strategy_id: str) -> ControlResponse:

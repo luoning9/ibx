@@ -210,7 +210,7 @@ function conditionRowTemplate(conditionId) {
           <div class="pair-field d-none">
             <label class="form-label small mb-1">products（A / B）</label>
             <div class="input-group input-group-sm">
-              <input class="form-control" placeholder="product_a (SPY)" />
+              <input class="form-control" placeholder="product (SPY)" />
               <input class="form-control" placeholder="product_b (QQQ)" />
             </div>
           </div>

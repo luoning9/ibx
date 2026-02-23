@@ -1,0 +1,88 @@
+{
+  "trigger_mode_profiles": {
+    "fallback_base_bar": "1m",
+    "fallback_confirm_consecutive": 1,
+    "fallback_confirm_ratio": 1.0,
+    "fallback_include_partial_bar": false,
+    "fallback_missing_data_policy": "fail",
+    "profiles": [
+      {
+        "trigger_modes": [
+          "LEVEL_INSTANT",
+          "CROSS_UP_INSTANT",
+          "CROSS_DOWN_INSTANT"
+        ],
+        "include_partial_bar": true,
+        "missing_data_policy": "fail",
+        "windows": {
+          "1m": { "base_bar": "1m", "confirm_consecutive": 1, "confirm_ratio": 1.0 },
+          "5m": { "base_bar": "1m", "confirm_consecutive": 1, "confirm_ratio": 1.0 },
+          "30m": { "base_bar": "5m", "confirm_consecutive": 1, "confirm_ratio": 1.0 },
+          "1h": { "base_bar": "5m", "confirm_consecutive": 1, "confirm_ratio": 1.0 }
+        }
+      },
+      {
+        "trigger_modes": [
+          "LEVEL_CONFIRM",
+          "CROSS_UP_CONFIRM",
+          "CROSS_DOWN_CONFIRM"
+        ],
+        "include_partial_bar": false,
+        "missing_data_policy": "fail",
+        "windows": {
+          "5m": { "base_bar": "1m", "confirm_consecutive": 4, "confirm_ratio": 0.8 },
+          "30m": { "base_bar": "5m", "confirm_consecutive": 2, "confirm_ratio": 0.5 },
+          "1h": { "base_bar": "5m", "confirm_consecutive": 2, "confirm_ratio": 0.5 },
+          "2h": { "base_bar": "15m", "confirm_consecutive": 2, "confirm_ratio": 0.5 },
+          "4h": { "base_bar": "15m", "confirm_consecutive": 2, "confirm_ratio": 0.5 },
+          "1d": { "base_bar": "1h", "confirm_consecutive": 2, "confirm_ratio": 0.5 },
+          "2d": { "base_bar": "1h", "confirm_consecutive": 2, "confirm_ratio": 0.5 }
+        }
+      }
+    ]
+  },
+  "metric_trigger_operator_rules": {
+    "allowed_windows": {
+      "PRICE": ["1m", "5m", "30m", "1h"],
+      "DRAWDOWN_PCT": ["1m", "5m", "30m", "1h"],
+      "RALLY_PCT": ["1m", "5m", "30m", "1h"],
+      "SPREAD": ["1m", "5m", "30m", "1h"],
+      "VOLUME_RATIO": ["1h", "2h", "4h", "1d", "2d"],
+      "AMOUNT_RATIO": ["1h", "2h", "4h", "1d", "2d"]
+    },
+    "allowed_rules": {
+      "PRICE": [
+        { "trigger_mode": "LEVEL_INSTANT", "operator": ">=" },
+        { "trigger_mode": "LEVEL_INSTANT", "operator": "<=" },
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": ">=" },
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": "<=" },
+        { "trigger_mode": "CROSS_UP_INSTANT", "operator": ">=" },
+        { "trigger_mode": "CROSS_UP_CONFIRM", "operator": ">=" },
+        { "trigger_mode": "CROSS_DOWN_INSTANT", "operator": "<=" },
+        { "trigger_mode": "CROSS_DOWN_CONFIRM", "operator": "<=" }
+      ],
+      "DRAWDOWN_PCT": [
+        { "trigger_mode": "LEVEL_INSTANT", "operator": ">=" },
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": ">=" }
+      ],
+      "RALLY_PCT": [
+        { "trigger_mode": "LEVEL_INSTANT", "operator": ">=" },
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": ">=" }
+      ],
+      "VOLUME_RATIO": [
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": ">=" },
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": "<=" }
+      ],
+      "AMOUNT_RATIO": [
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": ">=" },
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": "<=" }
+      ],
+      "SPREAD": [
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": ">=" },
+        { "trigger_mode": "LEVEL_CONFIRM", "operator": "<=" },
+        { "trigger_mode": "CROSS_UP_CONFIRM", "operator": ">=" },
+        { "trigger_mode": "CROSS_DOWN_CONFIRM", "operator": "<=" }
+      ]
+    }
+  }
+}

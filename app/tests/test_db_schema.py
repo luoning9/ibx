@@ -20,6 +20,7 @@ def test_init_db_creates_core_tables(tmp_path: Path) -> None:
         "strategies",
         "strategy_symbols",
         "strategy_events",
+        "strategy_runtime_states",
         "orders",
         "verification_events",
         "trade_logs",

@@ -75,6 +75,203 @@ def test_create_strategy_uses_symbols_schema() -> None:
     assert body["symbols"][0]["code"] == "SLV"
 
 
+def test_create_strategy_market_mapping_fields() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    payload = {
+        "id": strategy_id,
+        "description": "market mapping test",
+        "market": "US_STOCK",
+        "trade_type": "buy",
+        "symbols": [{"code": "AAPL", "trade_type": "buy"}],
+        "expire_mode": "relative",
+        "expire_in_seconds": 86400,
+        "conditions": [],
+    }
+    resp = client.post("/v1/strategies", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["market"] == "US_STOCK"
+    assert body["sec_type"] == "STK"
+    assert body["exchange"] == "SMART"
+
+
+def test_reject_market_trade_type_mismatch() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    payload = {
+        "id": strategy_id,
+        "description": "market trade type mismatch",
+        "market": "US_STOCK",
+        "trade_type": "open",
+        "symbols": [{"code": "SIH7", "trade_type": "open"}],
+        "expire_mode": "relative",
+        "expire_in_seconds": 86400,
+        "conditions": [],
+    }
+    resp = client.post("/v1/strategies", json=payload)
+    assert resp.status_code == 422
+
+
+def test_symbols_return_contract_id_nullable() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    payload = {
+        "id": strategy_id,
+        "description": "symbols contract id nullable",
+        "market": "US_STOCK",
+        "trade_type": "buy",
+        "symbols": [{"code": "AAPL", "trade_type": "buy", "contract_id": None}],
+        "expire_mode": "relative",
+        "expire_in_seconds": 86400,
+        "conditions": [],
+    }
+    resp = client.post("/v1/strategies", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["symbols"][0]["contract_id"] is None
+
+
+def test_activate_moves_through_verifying_to_active() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    payload = {
+        "id": strategy_id,
+        "description": "activate verify flow",
+        "market": "US_STOCK",
+        "trade_type": "buy",
+        "symbols": [{"code": "AAPL", "trade_type": "buy", "contract_id": None}],
+        "expire_mode": "relative",
+        "expire_in_seconds": 86400,
+        "conditions": [
+            {
+                "condition_type": "SINGLE_PRODUCT",
+                "metric": "PRICE",
+                "trigger_mode": "LEVEL_INSTANT",
+                "evaluation_window": "1m",
+                "window_price_basis": "CLOSE",
+                "operator": ">=",
+                "value": 1.0,
+                "product": "AAPL",
+            }
+        ],
+        "trade_action_json": {
+            "action_type": "STOCK_TRADE",
+            "symbol": "AAPL",
+            "side": "BUY",
+            "order_type": "MKT",
+            "quantity": 1,
+        },
+    }
+    created = client.post("/v1/strategies", json=payload)
+    assert created.status_code == 200
+
+    activated = client.post(f"/v1/strategies/{strategy_id}/activate")
+    assert activated.status_code == 200
+    assert activated.json()["status"] == "ACTIVE"
+
+    detail = client.get(f"/v1/strategies/{strategy_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "ACTIVE"
+
+    events = client.get(f"/v1/strategies/{strategy_id}/events")
+    assert events.status_code == 200
+    event_types = [item["event_type"] for item in events.json()]
+    assert "VERIFYING" in event_types
+    assert "ACTIVATED" in event_types
+
+
+def test_activate_verify_failed_when_market_mapping_invalid() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    payload = {
+        "id": strategy_id,
+        "description": "verify fail flow",
+        "market": "US_STOCK",
+        "trade_type": "buy",
+        "symbols": [{"code": "AAPL", "trade_type": "buy", "contract_id": None}],
+        "expire_mode": "relative",
+        "expire_in_seconds": 86400,
+        "conditions": [
+            {
+                "condition_type": "SINGLE_PRODUCT",
+                "metric": "PRICE",
+                "trigger_mode": "LEVEL_INSTANT",
+                "evaluation_window": "1m",
+                "window_price_basis": "CLOSE",
+                "operator": ">=",
+                "value": 1.0,
+                "product": "AAPL",
+            }
+        ],
+        "trade_action_json": {
+            "action_type": "STOCK_TRADE",
+            "symbol": "AAPL",
+            "side": "BUY",
+            "order_type": "MKT",
+            "quantity": 1,
+        },
+    }
+    created = client.post("/v1/strategies", json=payload)
+    assert created.status_code == 200
+
+    with get_connection() as conn:
+        conn.execute("UPDATE strategies SET market = 'INVALID_MARKET' WHERE id = ?", (strategy_id,))
+        conn.commit()
+
+    activated = client.post(f"/v1/strategies/{strategy_id}/activate")
+    assert activated.status_code == 200
+    assert activated.json()["status"] == "VERIFY_FAILED"
+
+    detail = client.get(f"/v1/strategies/{strategy_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "VERIFY_FAILED"
+
+
+def test_update_config_resets_status_to_pending_activation() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
+    payload = {
+        "id": strategy_id,
+        "description": "reset to pending after config change",
+        "market": "US_STOCK",
+        "trade_type": "buy",
+        "symbols": [{"code": "AAPL", "trade_type": "buy", "contract_id": None}],
+        "expire_mode": "relative",
+        "expire_in_seconds": 86400,
+        "conditions": [
+            {
+                "condition_type": "SINGLE_PRODUCT",
+                "metric": "PRICE",
+                "trigger_mode": "LEVEL_INSTANT",
+                "evaluation_window": "1m",
+                "window_price_basis": "CLOSE",
+                "operator": ">=",
+                "value": 1.0,
+                "product": "AAPL",
+            }
+        ],
+        "trade_action_json": {
+            "action_type": "STOCK_TRADE",
+            "symbol": "AAPL",
+            "side": "BUY",
+            "order_type": "MKT",
+            "quantity": 1,
+        },
+    }
+    created = client.post("/v1/strategies", json=payload)
+    assert created.status_code == 200
+
+    activated = client.post(f"/v1/strategies/{strategy_id}/activate")
+    assert activated.status_code == 200
+    paused = client.post(f"/v1/strategies/{strategy_id}/pause")
+    assert paused.status_code == 200
+
+    updated = client.patch(
+        f"/v1/strategies/{strategy_id}/basic",
+        json={
+            "description": "changed description",
+            "symbols": [{"code": "MSFT", "trade_type": "buy", "contract_id": None}],
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "PENDING_ACTIVATION"
+
+
 def test_create_futures_open_strategy_with_open_symbol_leg() -> None:
     strategy_id = f"S-UT-{uuid4().hex[:8].upper()}"
     payload = {
@@ -129,12 +326,12 @@ def test_create_strategy_accepts_volume_ratio_condition() -> None:
             {
                 "condition_type": "PAIR_PRODUCTS",
                 "metric": "VOLUME_RATIO",
-                "trigger_mode": "LEVEL",
+                "trigger_mode": "LEVEL_CONFIRM",
                 "evaluation_window": "1h",
                 "window_price_basis": "CLOSE",
                 "operator": ">=",
                 "value": 1.1,
-                "product_a": "QQQ",
+                "product": "QQQ",
                 "product_b": "SPY",
             }
         ],
@@ -163,12 +360,12 @@ def test_create_strategy_accepts_amount_ratio_condition() -> None:
             {
                 "condition_type": "PAIR_PRODUCTS",
                 "metric": "AMOUNT_RATIO",
-                "trigger_mode": "LEVEL",
+                "trigger_mode": "LEVEL_CONFIRM",
                 "evaluation_window": "1h",
                 "window_price_basis": "CLOSE",
                 "operator": "<=",
                 "value": 0.95,
-                "product_a": "QQQ",
+                "product": "QQQ",
                 "product_b": "SPY",
             }
         ],
@@ -197,12 +394,12 @@ def test_create_strategy_maps_legacy_liquidity_ratio_to_volume_ratio() -> None:
             {
                 "condition_type": "PAIR_PRODUCTS",
                 "metric": "LIQUIDITY_RATIO",
-                "trigger_mode": "LEVEL",
+                "trigger_mode": "LEVEL_CONFIRM",
                 "evaluation_window": "1h",
                 "window_price_basis": "CLOSE",
                 "operator": ">=",
                 "value": 1.0,
-                "product_a": "QQQ",
+                "product": "QQQ",
                 "product_b": "SPY",
             }
         ],
@@ -228,7 +425,7 @@ def test_reject_invalid_metric_for_condition_type() -> None:
             {
                 "condition_type": "SINGLE_PRODUCT",
                 "metric": "AMOUNT_RATIO",
-                "trigger_mode": "LEVEL",
+                "trigger_mode": "LEVEL_CONFIRM",
                 "evaluation_window": "1m",
                 "window_price_basis": "CLOSE",
                 "operator": ">=",
@@ -259,12 +456,12 @@ def test_reject_invalid_trigger_rule_for_amount_ratio() -> None:
             {
                 "condition_type": "PAIR_PRODUCTS",
                 "metric": "AMOUNT_RATIO",
-                "trigger_mode": "CROSS_UP",
+                "trigger_mode": "CROSS_UP_INSTANT",
                 "evaluation_window": "1h",
                 "window_price_basis": "CLOSE",
                 "operator": ">=",
                 "value": 1.0,
-                "product_a": "QQQ",
+                "product": "QQQ",
                 "product_b": "SPY",
             }
         ],
@@ -291,12 +488,12 @@ def test_reject_minute_window_for_volume_ratio() -> None:
             {
                 "condition_type": "PAIR_PRODUCTS",
                 "metric": "VOLUME_RATIO",
-                "trigger_mode": "LEVEL",
+                "trigger_mode": "LEVEL_CONFIRM",
                 "evaluation_window": "5m",
                 "window_price_basis": "CLOSE",
                 "operator": ">=",
                 "value": 1.0,
-                "product_a": "QQQ",
+                "product": "QQQ",
                 "product_b": "SPY",
             }
         ],

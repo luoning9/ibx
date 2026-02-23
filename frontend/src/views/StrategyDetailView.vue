@@ -82,16 +82,11 @@ function buildConditionExpression(condition: Record<string, unknown>) {
   const metric = asString(condition.metric)
   const operator = asString(condition.operator)
   const value = formatConditionValue(condition.value)
-  const product = asString(condition.product)
-  const productA = asString(condition.product_a)
+  const product = asString(condition.product) || asString(condition.product_a)
   const productB = asString(condition.product_b)
-  const priceRef = asString(condition.price_reference)
 
-  if (metric && product && priceRef && operator && value) {
-    return `${metric.toLowerCase()}(${product}, ${priceRef}) ${operator} ${value}`
-  }
-  if (metric && productA && productB && operator && value) {
-    return `${metric.toLowerCase()}(${productA}, ${productB}) ${operator} ${value}`
+  if (metric && product && productB && operator && value) {
+    return `${metric.toLowerCase()}(${product}, ${productB}) ${operator} ${value}`
   }
   if (metric && product && operator && value) {
     return `${metric.toLowerCase()}(${product}) ${operator} ${value}`
@@ -194,9 +189,10 @@ function orderTypeLabel(orderType: string) {
 function statusTagType(statusRaw: string) {
   const status = statusRaw.trim().toUpperCase()
   if (status === 'ACTIVE' || status === 'TRIGGERED' || status === 'FILLED') return 'success'
+  if (status === 'VERIFYING') return 'warning'
   if (status === 'PAUSED' || status === 'ORDER_SUBMITTED') return 'warning'
   if (status === 'PENDING_ACTIVATION') return 'info'
-  if (status === 'EXPIRED' || status === 'CANCELLED' || status === 'FAILED') return 'danger'
+  if (status === 'VERIFY_FAILED' || status === 'EXPIRED' || status === 'CANCELLED' || status === 'FAILED') return 'danger'
   return 'info'
 }
 
@@ -424,6 +420,9 @@ onMounted(loadDetail)
         <template #default>
           <div v-if="detail" class="detail-top">
             <el-descriptions :column="2" size="small" border>
+              <el-descriptions-item label="market">
+                {{ detail.market }} ({{ detail.sec_type }}/{{ detail.exchange }})
+              </el-descriptions-item>
               <el-descriptions-item label="交易类型">{{ detail.trade_type }}</el-descriptions-item>
               <el-descriptions-item label="产品列表">
                 <el-space wrap>

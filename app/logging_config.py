@@ -4,9 +4,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from .runtime_paths import ensure_runtime_dirs, resolve_log_path
+from .runtime_paths import ensure_runtime_dirs, resolve_log_path, resolve_market_data_log_path
 
 _CONFIGURED = False
+_MARKET_DATA_CONFIGURED = False
 
 
 def _has_file_handler(logger: logging.Logger, path: Path) -> bool:
@@ -55,4 +56,37 @@ def configure_logging() -> Path:
 
     root_logger.info("File logging initialized at %s", log_path)
     _CONFIGURED = True
+    return log_path
+
+
+def configure_market_data_logging() -> Path:
+    global _MARKET_DATA_CONFIGURED
+    if _MARKET_DATA_CONFIGURED:
+        return resolve_market_data_log_path()
+
+    ensure_runtime_dirs()
+    log_path = resolve_market_data_log_path().resolve()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler = RotatingFileHandler(
+        filename=log_path,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=7,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    logger = logging.getLogger("ibx.market_data")
+    if not _has_file_handler(logger, log_path):
+        logger.addHandler(file_handler)
+    logger.propagate = False
+    if logger.level == logging.NOTSET or logger.level > logging.INFO:
+        logger.setLevel(logging.INFO)
+
+    logger.info("Market data file logging initialized at %s", log_path)
+    _MARKET_DATA_CONFIGURED = True
     return log_path
