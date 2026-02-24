@@ -30,6 +30,7 @@ class IBGatewayConfig:
     client_id: int
     client_ids: "IBClientIDsConfig"
     timeout_seconds: float
+    session_idle_ttl_seconds: float
     account_code: str
     trading_mode: str
 
@@ -542,6 +543,7 @@ def load_app_config() -> AppConfig:
             cli=_as_int(client_ids_raw.get("cli"), base_client_id, minimum=1),
         ),
         timeout_seconds=_as_float(ib_raw.get("timeout_seconds"), 5.0, minimum=0.1),
+        session_idle_ttl_seconds=_as_float(ib_raw.get("session_idle_ttl_seconds"), 30.0, minimum=1.0),
         account_code=_as_str(ib_raw.get("account_code"), ""),
         trading_mode=_normalize_trading_mode(_as_str(ib_raw.get("trading_mode"), "paper")),
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 from threading import Lock
 
 from .ib_data_service import BrokerDataProvider, build_broker_data_provider_from_config
+from .ib_session_manager import close_ib_session_manager
 
 
 _BROKER_PROVIDER_LOCK = Lock()
@@ -25,6 +26,7 @@ def close_shared_broker_data_provider() -> None:
         provider = _BROKER_PROVIDER
         _BROKER_PROVIDER = None
     if provider is None:
+        close_ib_session_manager()
         return
     disconnect = getattr(provider, "disconnect", None)
     if callable(disconnect):
@@ -32,6 +34,7 @@ def close_shared_broker_data_provider() -> None:
             disconnect()
         except Exception:
             pass
+    close_ib_session_manager()
 
 
 def reset_shared_broker_data_provider() -> None:

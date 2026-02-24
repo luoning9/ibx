@@ -13,6 +13,8 @@ paper_port = 4002
 live_port = 4001
 client_id = 99
 timeout_seconds = 5
+# 单个 client 连接空闲保持时长（秒）；超过后自动释放，下一次请求再重连
+session_idle_ttl_seconds = 30
 # 账户代码；留空表示由 IB 返回的默认账户
 account_code = ""
 # 可选: "paper" | "live"

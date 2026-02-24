@@ -31,6 +31,7 @@ def test_load_app_config_from_conf_file(tmp_path: Path) -> None:
         live_port = 5001
         client_id = 123
         timeout_seconds = 9
+        session_idle_ttl_seconds = 31
         trading_mode = "live"
         
         [ib_gateway.client_ids]
@@ -65,6 +66,7 @@ def test_load_app_config_from_conf_file(tmp_path: Path) -> None:
         assert cfg.ib_gateway.client_ids.market_data == 224
         assert cfg.ib_gateway.client_ids.cli == 225
         assert cfg.ib_gateway.timeout_seconds == 9
+        assert cfg.ib_gateway.session_idle_ttl_seconds == 31
         assert cfg.ib_gateway.trading_mode == "live"
         assert cfg.runtime.data_dir == "/tmp/ibx-data"
         assert cfg.runtime.enable_live_trading is True
@@ -241,6 +243,7 @@ def test_client_ids_fallback_to_client_id_when_not_configured(tmp_path: Path) ->
     try:
         cfg = load_app_config()
         assert cfg.ib_gateway.client_id == 321
+        assert cfg.ib_gateway.session_idle_ttl_seconds == 30
         assert cfg.ib_gateway.client_ids.broker_data == 321
         assert cfg.ib_gateway.client_ids.market_data == 321
         assert cfg.ib_gateway.client_ids.cli == 321

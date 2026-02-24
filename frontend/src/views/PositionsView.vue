@@ -55,7 +55,7 @@ onMounted(loadPositions)
     <el-card shadow="never">
       <template #header>
         <div class="card-header-row">
-          <span class="card-title">账户持仓总览</span>
+          <span class="card-title">资金情况</span>
           <el-button size="small" @click="loadPositions">刷新</el-button>
         </div>
       </template>
@@ -68,27 +68,25 @@ onMounted(loadPositions)
         class="mb-12"
       />
       <el-row :gutter="16">
-        <el-col :xs="12" :sm="12" :md="8">
+        <el-col :xs="12" :sm="12" :md="6">
           <div class="kv">
             <span>账户净值</span>
             <strong>{{ formatCurrency(summary?.net_liquidation) }}</strong>
           </div>
         </el-col>
-        <el-col :xs="12" :sm="12" :md="8">
+        <el-col :xs="12" :sm="12" :md="6">
           <div class="kv">
             <span>可用资金</span>
             <strong>{{ formatCurrency(summary?.available_funds) }}</strong>
           </div>
         </el-col>
-        <el-col :xs="12" :sm="12" :md="8">
+        <el-col :xs="12" :sm="12" :md="6">
           <div class="kv">
             <span>未实现盈亏</span>
             <strong>{{ formatSignedCurrency(summary?.unrealized_pnl) }}</strong>
           </div>
         </el-col>
-      </el-row>
-      <el-row :gutter="16">
-        <el-col :xs="12" :sm="12" :md="8">
+        <el-col :xs="12" :sm="12" :md="6">
           <div class="kv">
             <span>已实现盈亏</span>
             <strong>{{ formatSignedCurrency(summary?.realized_pnl) }}</strong>
@@ -106,7 +104,7 @@ onMounted(loadPositions)
         <el-table-column prop="symbol" label="symbol" width="110" />
         <el-table-column label="持仓" width="120">
           <template #default="{ row }">
-            {{ formatNumber(row.position_qty, 2) }} {{ row.position_unit }}
+            {{ formatNumber(row.position_qty, 0) }} {{ row.position_unit }}
           </template>
         </el-table-column>
         <el-table-column label="均价" width="120">

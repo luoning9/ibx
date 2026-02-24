@@ -369,7 +369,7 @@ def test_pause_rejected_when_strategy_locked() -> None:
 
 def test_portfolio_summary_uses_broker_data_provider(monkeypatch) -> None:
     monkeypatch.setattr(
-        "app.store.get_shared_broker_data_provider",
+        "app.store.build_broker_data_provider_from_config",
         lambda: FixtureBrokerDataProvider(),
     )
     resp = client.get("/v1/portfolio-summary")
@@ -385,7 +385,7 @@ def test_portfolio_summary_uses_broker_data_provider(monkeypatch) -> None:
 
 def test_positions_uses_broker_data_provider(monkeypatch) -> None:
     monkeypatch.setattr(
-        "app.store.get_shared_broker_data_provider",
+        "app.store.build_broker_data_provider_from_config",
         lambda: FixtureBrokerDataProvider(),
     )
     resp = client.get("/v1/positions")
