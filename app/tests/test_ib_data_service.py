@@ -215,6 +215,27 @@ def test_get_account_snapshot_filters_account_and_parses_values(monkeypatch) -> 
     assert snapshot.positions[0].symbol == "AAPL"
 
 
+def test_get_account_snapshot_disconnects_when_requested() -> None:
+    fake_ib = _FakeIB()
+    fake_ib.summary_result = [
+        SimpleNamespace(account="U111", tag="NetLiquidation", value="1", currency="USD"),
+    ]
+    fake_ib.portfolio_result = []
+    svc = IBDataService(
+        ib=fake_ib,
+        host="127.0.0.1",
+        port=4002,
+        client_id=99,
+        timeout_seconds=5.0,
+    )
+
+    assert fake_ib.isConnected() is False
+    snapshot = svc.get_account_snapshot(account_code="U111", disconnect_after=True)
+    assert snapshot.account_code == "U111"
+    assert fake_ib.isConnected() is False
+    assert len(fake_ib.connect_calls) == 1
+
+
 def test_connect_initializes_event_loop_when_missing(monkeypatch) -> None:
     fake_ib = _FakeIB()
     svc = IBDataService(
@@ -243,6 +264,21 @@ def test_connect_initializes_event_loop_when_missing(monkeypatch) -> None:
     svc.connect()
     assert recorded["set_called"] is True
     assert len(fake_ib.connect_calls) == 1
+
+
+def test_ensure_ib_sets_request_timeout() -> None:
+    fake_ib = _FakeIB()
+    svc = IBDataService(
+        ib=fake_ib,
+        host="127.0.0.1",
+        port=4002,
+        client_id=99,
+        timeout_seconds=7.5,
+    )
+
+    ib = svc._ensure_ib()
+    assert ib is fake_ib
+    assert float(getattr(fake_ib, "RequestTimeout")) == 7.5
 
 
 def test_connect_fails_when_client_id_conflicted() -> None:

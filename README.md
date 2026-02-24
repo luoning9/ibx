@@ -228,6 +228,13 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 - `IBX_MARKET_DATA_LOG_PATH`：仅覆盖行情日志文件路径
 - `IBX_MARKET_CACHE_DB_PATH`：仅覆盖行情缓存数据库路径
 
+IB 连接会话策略（当前实现）：
+- 按 `host + port + client_id + readonly` 复用会话；
+- 每个会话固定由一个专用工作线程处理（connect/request/disconnect 全部在同一线程）；
+- 同一会话内请求串行执行（避免同一 `client_id` 并发冲突）；
+- 空闲超过 `ib_gateway.session_idle_ttl_seconds`（默认 30 秒）自动断开；
+- 下一次请求会自动重连。
+
 样本数据：
 - `make seed-sample` 会先清空运行时业务数据，再灌入干净的 `SMP-*` 样本（策略、事件、交易、持仓与组合快照）。
 - 如需只刷新 `SMP-*` 而保留其它数据，可执行：`python3 scripts/seed_sample_data.py --keep-non-sample`

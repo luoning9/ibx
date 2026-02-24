@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ from threading import Lock
 from typing import Any, Callable, Protocol
 
 from .config import PROJECT_ROOT, infer_ib_api_port, load_app_config, resolve_ib_client_id
+from .ib_session_manager import get_ib_session_manager
 from .market_config import resolve_market_profile
 
 
@@ -181,6 +183,7 @@ class IBDataService:
         port: int | None = None,
         client_id: int | None = None,
         timeout_seconds: float | None = None,
+        session_idle_ttl_seconds: float | None = None,
         account_code: str | None = None,
         trading_mode: str | None = None,
         readonly: bool = True,
@@ -192,14 +195,24 @@ class IBDataService:
         self.port = int(port if port is not None else infer_ib_api_port(mode))
         self.client_id = int(client_id if client_id is not None else resolve_ib_client_id("broker_data"))
         self.timeout_seconds = float(timeout_seconds if timeout_seconds is not None else cfg.timeout_seconds)
+        self.session_idle_ttl_seconds = float(
+            session_idle_ttl_seconds if session_idle_ttl_seconds is not None else cfg.session_idle_ttl_seconds
+        )
         self.default_account_code = _normalize_account(account_code or cfg.account_code)
         self.readonly = bool(readonly)
         self._ib = ib
         self._contract_builder = contract_builder or _default_contract_builder
+        self._logger = logging.getLogger("ibx.broker_data")
 
     def _ensure_ib(self) -> Any:
         _ensure_thread_event_loop()
         if self._ib is not None:
+            # ib_insync default RequestTimeout=0 (no timeout), which can block forever.
+            # Keep it aligned with app-level timeout to avoid stuck requests.
+            try:
+                setattr(self._ib, "RequestTimeout", float(self.timeout_seconds))
+            except Exception:
+                pass
             return self._ib
         try:
             from ib_insync import IB
@@ -208,9 +221,18 @@ class IBDataService:
                 "Missing dependency: ib_insync. Install with: pip install ib_insync"
             ) from exc
         self._ib = IB()
+        try:
+            setattr(self._ib, "RequestTimeout", float(self.timeout_seconds))
+        except Exception:
+            pass
         return self._ib
 
     def connect(self) -> None:
+        if self._ib is None:
+            def _noop(_: Any) -> None:
+                return None
+            self._run_with_ib(_noop)
+            return
         ib = self._ensure_ib()
         if bool(getattr(ib, "isConnected", lambda: False)()):
             return
@@ -233,12 +255,68 @@ class IBDataService:
             ) from exc
 
     def disconnect(self) -> None:
+        if self._ib is None:
+            session = self._get_managed_session()
+            session.force_close()
+            return
         with _IB_REQUEST_LOCK:
             ib = self._ensure_ib()
             try:
                 ib.disconnect()
             except Exception:
                 pass
+
+    def _get_managed_session(self) -> Any:
+        manager = get_ib_session_manager()
+        return manager.get_session(
+            host=self.host,
+            port=self.port,
+            client_id=self.client_id,
+            timeout_seconds=self.timeout_seconds,
+            readonly=self.readonly,
+            idle_ttl_seconds=self.session_idle_ttl_seconds,
+        )
+
+    def _run_with_ib(
+        self,
+        callback: Callable[[Any], Any],
+        *,
+        disconnect_after: bool = False,
+    ) -> Any:
+        if self._ib is not None:
+            with _IB_REQUEST_LOCK:
+                self.connect()
+                ib = self._ensure_ib()
+                try:
+                    return callback(ib)
+                finally:
+                    if disconnect_after:
+                        try:
+                            ib.disconnect()
+                        except Exception:
+                            pass
+
+        session = self._get_managed_session()
+        try:
+            return session.run(callback)
+        except Exception as exc:
+            self._logger.exception(
+                "IBDataService request failed host=%s port=%s client_id=%s readonly=%s",
+                self.host,
+                self.port,
+                self.client_id,
+                self.readonly,
+            )
+            detail = str(exc).strip()
+            if not detail:
+                detail = exc.__class__.__name__
+            raise IBDataServiceError(
+                "ib request failed"
+                f" host={self.host} port={self.port} client_id={self.client_id}: {detail}"
+            ) from exc
+        finally:
+            if disconnect_after:
+                session.force_close()
 
     def resolve_contract_id(
         self,
@@ -247,16 +325,14 @@ class IBDataService:
         market: str,
         contract_month: str | None = None,
     ) -> int:
-        with _IB_REQUEST_LOCK:
-            normalized_code = str(code).strip().upper()
-            if not normalized_code:
-                raise ValueError("code is required")
-            normalized_month = str(contract_month or "").strip() or None
+        normalized_code = str(code).strip().upper()
+        if not normalized_code:
+            raise ValueError("code is required")
+        normalized_month = str(contract_month or "").strip() or None
 
-            profile = resolve_market_profile(market, None)
-            self.connect()
-            ib = self._ensure_ib()
+        profile = resolve_market_profile(market, None)
 
+        def _resolve(ib: Any) -> int:
             if profile.sec_type == "FUT" and normalized_month is None:
                 probe = self._contract_builder(
                     sec_type=profile.sec_type,
@@ -291,29 +367,48 @@ class IBDataService:
                 )
             return con_id
 
-    def get_account_snapshot(self, *, account_code: str | None = None) -> AccountSnapshot:
-        with _IB_REQUEST_LOCK:
-            target_account = _normalize_account(account_code) or self.default_account_code
-            self.connect()
-            ib = self._ensure_ib()
+        return int(self._run_with_ib(_resolve))
 
+    def get_account_snapshot(
+        self,
+        *,
+        account_code: str | None = None,
+        disconnect_after: bool = False,
+    ) -> AccountSnapshot:
+        target_account = _normalize_account(account_code) or self.default_account_code
+
+        def _snapshot(ib: Any) -> AccountSnapshot:
+            nonlocal target_account
             summary_items = list(ib.accountSummary())
-            portfolio_items = list(ib.portfolio())
 
             if target_account is None:
                 if summary_items:
                     target_account = _normalize_account(getattr(summary_items[0], "account", None))
-                elif portfolio_items:
-                    target_account = _normalize_account(getattr(portfolio_items[0], "account", None))
+                else:
+                    managed_accounts_attr = getattr(ib, "managedAccounts", None)
+                    if callable(managed_accounts_attr):
+                        managed_accounts = managed_accounts_attr()
+                    elif isinstance(managed_accounts_attr, (list, tuple)):
+                        managed_accounts = list(managed_accounts_attr)
+                    else:
+                        managed_accounts = []
+                    if managed_accounts:
+                        target_account = _normalize_account(managed_accounts[0])
+
+            portfolio_items = list(ib.portfolio())
 
             filtered_summary = summary_items
             filtered_portfolio = portfolio_items
             if target_account:
                 filtered_summary = [
-                    item for item in summary_items if _normalize_account(getattr(item, "account", None)) == target_account
+                    item
+                    for item in summary_items
+                    if _normalize_account(getattr(item, "account", None)) == target_account
                 ]
                 filtered_portfolio = [
-                    item for item in portfolio_items if _normalize_account(getattr(item, "account", None)) == target_account
+                    item
+                    for item in portfolio_items
+                    if _normalize_account(getattr(item, "account", None)) == target_account
                 ]
 
             values: dict[str, str] = {}
@@ -363,6 +458,8 @@ class IBDataService:
                 values_float=values_float,
                 positions=positions,
             )
+
+        return self._run_with_ib(_snapshot, disconnect_after=disconnect_after)
 
     def __enter__(self) -> IBDataService:
         self.connect()
