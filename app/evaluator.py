@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
+import socket
 import sqlite3
+import struct
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Any
 
 from .config import (
+    infer_ib_api_port,
+    load_app_config,
     resolve_metric_allowed_rules,
     resolve_metric_allowed_windows,
     resolve_trigger_window_policy,
@@ -16,6 +23,9 @@ from .config import (
 
 
 UTC = timezone.utc
+_GATEWAY_PROBE_CACHE_LOCK = Lock()
+_GATEWAY_PROBE_CACHE: tuple[float, bool] | None = None
+_LOGGER = logging.getLogger("ibx.evaluator")
 
 
 def _to_utc(dt: datetime) -> datetime:
@@ -37,6 +47,7 @@ class ConditionEvaluationState:
     condition_id: str
     state: str
     last_value: float | None = None
+    last_evaluated_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -87,14 +98,153 @@ class ConditionEvaluationResult:
 @dataclass(frozen=True)
 class ConditionEvaluationInput:
     values_by_contract: dict[int, list[float]]
-    state_values: dict[str, Any]
+    state_values: dict[str, Any] | None = None
+
+
+def _normalize_values_by_contract(
+    raw_values: dict[Any, Any] | None,
+) -> dict[int, list[float]]:
+    if not isinstance(raw_values, dict):
+        return {}
+    values_by_contract: dict[int, list[float]] = {}
+    for key, values in raw_values.items():
+        cid = _to_int_or_none(key)
+        if cid is None:
+            continue
+        if isinstance(values, list):
+            numeric_values: list[float] = []
+            valid = True
+            for item in values:
+                numeric = _to_float_or_none(item)
+                if numeric is None:
+                    valid = False
+                    break
+                numeric_values.append(numeric)
+            if valid:
+                values_by_contract[cid] = numeric_values
+            continue
+        scalar = _to_float_or_none(values)
+        if scalar is not None:
+            values_by_contract[cid] = [scalar]
+    return values_by_contract
+
+
+def _gateway_override_from_env() -> bool | None:
+    raw = os.getenv("IBX_GATEWAY_READY")
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _gateway_probe_ttl_seconds() -> float:
+    raw = os.getenv("IBX_GATEWAY_PROBE_TTL_SECONDS")
+    default = 2.0
+    try:
+        ttl = float(raw) if raw is not None else default
+    except ValueError:
+        ttl = default
+    return max(0.0, ttl)
+
+
+def _gateway_probe_timeout_seconds() -> float:
+    cfg_timeout = float(load_app_config().ib_gateway.timeout_seconds)
+    default = min(2.0, max(0.2, cfg_timeout))
+    raw = os.getenv("IBX_GATEWAY_PROBE_TIMEOUT_SECONDS")
+    try:
+        timeout = float(raw) if raw is not None else default
+    except ValueError:
+        timeout = default
+    return min(5.0, max(0.1, timeout))
+
+
+def _resolve_gateway_probe_target() -> tuple[str, int]:
+    cfg = load_app_config().ib_gateway
+    host = str(os.getenv("IB_HOST", cfg.host)).strip() or cfg.host
+    mode = str(os.getenv("TRADING_MODE", cfg.trading_mode)).strip().lower()
+    raw_port = str(os.getenv("IB_API_PORT", "")).strip()
+    if raw_port:
+        try:
+            parsed = int(raw_port)
+            if 1 <= parsed <= 65535:
+                return host, parsed
+        except ValueError:
+            pass
+    return host, int(infer_ib_api_port(mode))
+
+
+def _read_exact(sock: socket.socket, size: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            raise ConnectionError("socket closed by peer")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _read_frame(sock: socket.socket) -> bytes:
+    header = _read_exact(sock, 4)
+    (length,) = struct.unpack(">I", header)
+    if length <= 0:
+        return b""
+    return _read_exact(sock, length)
+
+
+def _probe_gateway_health_once() -> bool:
+    host, port = _resolve_gateway_probe_target()
+    timeout = _gateway_probe_timeout_seconds()
+    min_client_version = 157
+    max_client_version = 178
+    payload = f"v{min_client_version}..{max_client_version}".encode("ascii")
+    framed = struct.pack(">I", len(payload)) + payload
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"API\0" + framed)
+            reply = _read_frame(sock)
+            if not reply:
+                return False
+            parts = reply.split(b"\0")
+            version = parts[0].decode("ascii", errors="ignore").strip() if parts else ""
+            return bool(version)
+    except Exception:
+        return False
 
 
 def _gateway_is_working() -> bool:
-    raw = os.getenv("IBX_GATEWAY_READY")
-    if raw is None:
-        return True
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    global _GATEWAY_PROBE_CACHE
+    override = _gateway_override_from_env()
+    if override is not None:
+        return override
+
+    now = time.monotonic()
+    ttl = _gateway_probe_ttl_seconds()
+    with _GATEWAY_PROBE_CACHE_LOCK:
+        cached = _GATEWAY_PROBE_CACHE
+        if cached is not None and (now - cached[0]) <= ttl:
+            return cached[1]
+
+    status = _probe_gateway_health_once()
+    with _GATEWAY_PROBE_CACHE_LOCK:
+        _GATEWAY_PROBE_CACHE = (now, status)
+    return status
+
+
+def reset_gateway_probe_cache() -> None:
+    global _GATEWAY_PROBE_CACHE
+    with _GATEWAY_PROBE_CACHE_LOCK:
+        _GATEWAY_PROBE_CACHE = None
+
+
+def gateway_is_working() -> bool:
+    return _gateway_is_working()
 
 
 def _to_float_or_none(value: Any) -> float | None:
@@ -229,6 +379,67 @@ def _build_trigger_policy_payload(prepared: PreparedCondition) -> dict[str, Any]
         "required_points": first_contract.required_points if first_contract else None,
         "include_partial_bar": first_contract.include_partial_bar if first_contract else None,
     }
+
+
+def _extract_requirement_keys(metrics: dict[str, Any]) -> set[tuple[str, int]]:
+    keys: set[tuple[str, int]] = set()
+    policies = metrics.get("trigger_policies")
+    if not isinstance(policies, list):
+        return keys
+    for policy in policies:
+        if not isinstance(policy, dict):
+            continue
+        condition_id = str(policy.get("condition_id") or "").strip()
+        if not condition_id:
+            continue
+        contracts = policy.get("contracts")
+        if not isinstance(contracts, list):
+            continue
+        for contract in contracts:
+            if not isinstance(contract, dict):
+                continue
+            contract_id = _to_int_or_none(contract.get("contract_id"))
+            if contract_id is None:
+                continue
+            keys.add((condition_id, contract_id))
+    return keys
+
+
+def _parse_monitoring_end_map(raw: Any) -> dict[str, dict[str, str]]:
+    # strategy_runs.last_monitoring_data_end_at shape: {condition_id: {contract_id: ts_iso}}
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for condition_id, by_contract in data.items():
+        if not isinstance(condition_id, str) or not isinstance(by_contract, dict):
+            continue
+        normalized_contracts: dict[str, str] = {}
+        for contract_id, value in by_contract.items():
+            if not isinstance(contract_id, str):
+                continue
+            value_text = str(value or "").strip()
+            if value_text:
+                normalized_contracts[contract_id] = value_text
+        if normalized_contracts:
+            out[condition_id] = normalized_contracts
+    return out
+
+
+def _set_monitoring_end_value(
+    values: dict[str, dict[str, str]],
+    *,
+    condition_id: str,
+    contract_id: int,
+    ts_iso: str,
+) -> None:
+    by_contract = values.setdefault(condition_id, {})
+    by_contract[str(contract_id)] = ts_iso
 
 
 def _condition_id_hint(condition: dict[str, Any], fallback: str) -> str:
@@ -416,54 +627,77 @@ class ConditionEvaluator:
         first_contract_id = requirement.contracts[0].contract_id
         second_contract_id = requirement.contracts[1].contract_id if len(requirement.contracts) > 1 else None
         assert first_contract_id is not None
-        current_contract_values = {
-            cid: values[-1]
-            for cid, values in by_contract.items()
-        }
-        observed_value = _metric_observed_value(
-            metric=self.prepared.metric,
-            contract_values=current_contract_values,
-            state_values=evaluation_input.state_values,
-            first_contract_id=first_contract_id,
-            second_contract_id=second_contract_id,
-        )
-        if observed_value is None:
+        observed_series: list[float] = []
+        if requirement.require_time_alignment and len(by_contract) > 1:
+            aligned_points = min(len(values) for values in by_contract.values())
+            for idx in range(aligned_points):
+                contract_values = {
+                    cid: values[-aligned_points + idx]
+                    for cid, values in by_contract.items()
+                }
+                observed = _metric_observed_value(
+                    metric=self.prepared.metric,
+                    contract_values=contract_values,
+                    state_values=evaluation_input.state_values,
+                    first_contract_id=first_contract_id,
+                    second_contract_id=second_contract_id,
+                )
+                if observed is not None:
+                    observed_series.append(observed)
+        else:
+            primary_values = by_contract[first_contract_id]
+            aligned_points = len(primary_values)
+            secondary_values: list[float] | None = None
+            if second_contract_id is not None and second_contract_id in by_contract:
+                secondary_values = by_contract[second_contract_id]
+                aligned_points = min(aligned_points, len(secondary_values))
+            for idx in range(aligned_points):
+                contract_values: dict[int, float] = {
+                    first_contract_id: primary_values[-aligned_points + idx]
+                }
+                if secondary_values is not None and second_contract_id is not None:
+                    contract_values[second_contract_id] = secondary_values[-aligned_points + idx]
+                observed = _metric_observed_value(
+                    metric=self.prepared.metric,
+                    contract_values=contract_values,
+                    state_values=evaluation_input.state_values,
+                    first_contract_id=first_contract_id,
+                    second_contract_id=second_contract_id,
+                )
+                if observed is not None:
+                    observed_series.append(observed)
+
+        if not observed_series:
             return ConditionEvaluationResult(
                 state="WAITING",
                 observed_value=None,
                 reason="missing_metric_inputs",
             )
+        observed_value = observed_series[-1]
 
         mode = self.prepared.trigger_mode
         if mode.startswith("CROSS_"):
-            previous_contract_values: dict[int, float] = {}
-            for cid, values in by_contract.items():
-                if len(values) < 2:
-                    return ConditionEvaluationResult(
-                        state="WAITING",
-                        observed_value=None,
-                        reason=f"insufficient_points_for_cross:{cid}",
-                    )
-                previous_contract_values[cid] = values[-2]
-            previous_observed_value = _metric_observed_value(
-                metric=self.prepared.metric,
-                contract_values=previous_contract_values,
-                state_values=evaluation_input.state_values,
-                first_contract_id=first_contract_id,
-                second_contract_id=second_contract_id,
-            )
-            if previous_observed_value is None or self.prepared.threshold is None:
+            if len(observed_series) < 2 or self.prepared.threshold is None:
                 return ConditionEvaluationResult(
                     state="WAITING",
                     observed_value=None,
                     reason="missing_cross_inputs",
                 )
             if mode.startswith("CROSS_UP"):
-                passed = previous_observed_value < self.prepared.threshold and observed_value >= self.prepared.threshold
+                passed = any(
+                    prev < self.prepared.threshold <= curr
+                    for prev, curr in zip(observed_series, observed_series[1:])
+                )
             else:
-                passed = previous_observed_value > self.prepared.threshold and observed_value <= self.prepared.threshold
+                passed = any(
+                    prev > self.prepared.threshold >= curr
+                    for prev, curr in zip(observed_series, observed_series[1:])
+                )
         else:
-            passed = _evaluate_condition(self.prepared.operator, self.prepared.threshold, observed_value)
+            passed = any(
+                _evaluate_condition(self.prepared.operator, self.prepared.threshold, sample)
+                for sample in observed_series
+            )
 
         return ConditionEvaluationResult(
             state="TRUE" if passed else "FALSE",
@@ -476,6 +710,7 @@ def evaluate_strategy(
     strategy_row: sqlite3.Row,
     *,
     now: datetime | None = None,
+    condition_inputs: dict[str, ConditionEvaluationInput] | None = None,
 ) -> StrategyEvaluationResult:
     evaluated_at = _to_utc(now or datetime.now(UTC))
     conditions_raw = json.loads(strategy_row["conditions_json"] or "[]")
@@ -529,7 +764,11 @@ def evaluate_strategy(
 
     if not _gateway_is_working():
         condition_states = [
-            ConditionEvaluationState(condition_id=evaluator.prepared.condition_id, state="NOT_EVALUATED")
+            ConditionEvaluationState(
+                condition_id=evaluator.prepared.condition_id,
+                state="NOT_EVALUATED",
+                last_evaluated_at=evaluated_at,
+            )
             for evaluator in evaluators
         ]
         return StrategyEvaluationResult(
@@ -551,19 +790,13 @@ def evaluate_strategy(
     for evaluator in evaluators:
         condition_id = evaluator.prepared.condition_id
         condition_dict = evaluator.prepared.condition_raw
-        values_by_contract: dict[int, list[float]] = {}
-        condition_values = condition_dict.get("values_by_contract")
-        if isinstance(condition_values, dict):
-            for key, values in condition_values.items():
-                cid = _to_int_or_none(key)
-                if cid is None:
-                    continue
-                if isinstance(values, list):
-                    values_by_contract[cid] = list(values)
-                else:
-                    scalar = _to_float_or_none(values)
-                    if scalar is not None:
-                        values_by_contract[cid] = [scalar]
+        external_input = None if condition_inputs is None else condition_inputs.get(condition_id)
+        values_by_contract = _normalize_values_by_contract(
+            None if external_input is None else external_input.values_by_contract
+        )
+        condition_values = _normalize_values_by_contract(condition_dict.get("values_by_contract"))
+        for cid, values in condition_values.items():
+            values_by_contract.setdefault(cid, values)
         # Skeleton bridge: fallback single observed value into first contract series.
         if evaluator.prepared.requirement.contracts:
             first_contract_id = evaluator.prepared.requirement.contracts[0].contract_id
@@ -572,14 +805,41 @@ def evaluate_strategy(
             )
             if first_contract_id is not None and fallback_value is not None and first_contract_id not in values_by_contract:
                 values_by_contract[first_contract_id] = [fallback_value]
-        state_values = condition_dict.get("state_values")
+        state_values = (
+            None
+            if external_input is None
+            else external_input.state_values
+        )
+        if not isinstance(state_values, dict):
+            state_values = condition_dict.get("state_values")
         if not isinstance(state_values, dict):
             state_values = {}
+        points_by_contract: dict[int, int] = {}
+        for cid, series in values_by_contract.items():
+            points_by_contract[cid] = len(series)
+        required_points_by_contract = {
+            int(contract_req.contract_id): int(contract_req.required_points)
+            for contract_req in evaluator.prepared.requirement.contracts
+            if contract_req.contract_id is not None
+        }
         condition_result = evaluator.evaluate(
             ConditionEvaluationInput(
                 values_by_contract=values_by_contract,
                 state_values=state_values,
             )
+        )
+        _LOGGER.info(
+            "condition evaluate condition_id=%s metric=%s trigger_mode=%s evaluation_window=%s "
+            "state=%s reason=%s observed_value=%s points_by_contract=%s required_points_by_contract=%s",
+            condition_id,
+            evaluator.prepared.metric,
+            evaluator.prepared.trigger_mode,
+            evaluator.prepared.evaluation_window,
+            condition_result.state,
+            condition_result.reason,
+            condition_result.observed_value,
+            points_by_contract,
+            required_points_by_contract,
         )
         if condition_result.state == "WAITING":
             has_waiting = True
@@ -587,6 +847,7 @@ def evaluate_strategy(
                 ConditionEvaluationState(
                     condition_id=condition_id,
                     state=condition_result.state,
+                    last_evaluated_at=evaluated_at,
                 )
             )
             continue
@@ -596,6 +857,7 @@ def evaluate_strategy(
                 condition_id=condition_id,
                 state=condition_result.state,
                 last_value=condition_result.observed_value,
+                last_evaluated_at=evaluated_at,
             )
         )
 
@@ -663,38 +925,169 @@ def persist_evaluation_result(
     conn: sqlite3.Connection,
     *,
     strategy_id: str,
-    evaluated_at: datetime,
+    updated_at: datetime,
+    evaluated_at: datetime | None,
+    initial_last_monitoring_data_end_at: datetime | None,
+    monitoring_end_updates: dict[tuple[str, int], datetime],
+    suggested_next_monitor_at: datetime | None,
     result: StrategyEvaluationResult,
 ) -> None:
-    evaluated_at_utc = _to_utc(evaluated_at)
-    ts_iso = _to_iso_utc(evaluated_at_utc)
-
-    conn.execute(
-        """
-        INSERT INTO strategy_runs (strategy_id, evaluated_at, condition_met, decision_reason, metrics_json)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            strategy_id,
-            ts_iso,
-            1 if result.condition_met else 0,
-            result.decision_reason,
-            _dumps_json(result.metrics),
-        ),
+    updated_at_utc = _to_utc(updated_at)
+    updated_at_iso = _to_iso_utc(updated_at_utc)
+    evaluated_at_utc = _to_utc(evaluated_at) if evaluated_at is not None else None
+    evaluated_at_iso = _to_iso_utc(evaluated_at_utc) if evaluated_at_utc is not None else None
+    initial_monitoring_end_iso = _to_iso_utc(
+        _to_utc(initial_last_monitoring_data_end_at or evaluated_at_utc or updated_at_utc)
     )
+    requirement_keys = _extract_requirement_keys(result.metrics)
+    existing = conn.execute(
+        """
+        SELECT last_monitoring_data_end_at, evaluated_at
+        FROM strategy_runs
+        WHERE strategy_id = ?
+        """,
+        (strategy_id,),
+    ).fetchone()
+
+    monitoring_end_map: dict[str, dict[str, str]] = {}
+    if existing is not None:
+        monitoring_end_map = _parse_monitoring_end_map(existing["last_monitoring_data_end_at"])
+    for condition_id, contract_id in requirement_keys:
+        by_contract = monitoring_end_map.get(condition_id)
+        if by_contract is not None and str(contract_id) in by_contract:
+            continue
+        prev_iso: str | None = None
+        if by_contract is not None:
+            prev_iso = by_contract.get(str(contract_id))
+        _set_monitoring_end_value(
+            monitoring_end_map,
+            condition_id=condition_id,
+            contract_id=contract_id,
+            ts_iso=initial_monitoring_end_iso,
+        )
+        _LOGGER.info(
+            "strategy_runs last_monitoring_data_end_at update strategy_id=%s condition_id=%s contract_id=%s "
+            "prev=%s next=%s reason=%s",
+            strategy_id,
+            condition_id,
+            contract_id,
+            prev_iso,
+            initial_monitoring_end_iso,
+            "initialize",
+        )
+    for (condition_id, contract_id), monitoring_end_at in monitoring_end_updates.items():
+        prev_iso: str | None = None
+        by_contract = monitoring_end_map.get(condition_id)
+        if by_contract is not None:
+            prev_iso = by_contract.get(str(contract_id))
+        next_iso = _to_iso_utc(monitoring_end_at)
+        if prev_iso == next_iso:
+            continue
+        _set_monitoring_end_value(
+            monitoring_end_map,
+            condition_id=condition_id,
+            contract_id=contract_id,
+            ts_iso=next_iso,
+        )
+        _LOGGER.info(
+            "strategy_runs last_monitoring_data_end_at update strategy_id=%s condition_id=%s contract_id=%s "
+            "prev=%s next=%s reason=%s",
+            strategy_id,
+            condition_id,
+            contract_id,
+            prev_iso,
+            next_iso,
+            "market_data",
+        )
+
+    monitoring_end_json = _dumps_json(monitoring_end_map)
+    suggested_next_monitor_iso = (
+        _to_iso_utc(suggested_next_monitor_at)
+        if suggested_next_monitor_at is not None
+        else None
+    )
+    stored_evaluated_at_iso = evaluated_at_iso
+    if stored_evaluated_at_iso is None:
+        if existing is not None and isinstance(existing["evaluated_at"], str) and existing["evaluated_at"].strip():
+            stored_evaluated_at_iso = str(existing["evaluated_at"]).strip()
+        else:
+            stored_evaluated_at_iso = updated_at_iso
+    if existing is not None:
+        conn.execute(
+            """
+            UPDATE strategy_runs
+            SET evaluated_at = ?,
+                last_monitoring_data_end_at = ?,
+                suggested_next_monitor_at = ?,
+                condition_met = ?,
+                decision_reason = ?,
+                last_outcome = ?,
+                run_count = run_count + 1,
+                metrics_json = ?,
+                updated_at = ?
+            WHERE strategy_id = ?
+            """,
+            (
+                stored_evaluated_at_iso,
+                monitoring_end_json,
+                suggested_next_monitor_iso,
+                1 if result.condition_met else 0,
+                result.decision_reason,
+                result.outcome,
+                _dumps_json(result.metrics),
+                updated_at_iso,
+                strategy_id,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id,
+                last_monitoring_data_end_at,
+                suggested_next_monitor_at,
+                first_evaluated_at,
+                evaluated_at,
+                condition_met,
+                decision_reason,
+                last_outcome,
+                run_count,
+                metrics_json,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                strategy_id,
+                monitoring_end_json,
+                suggested_next_monitor_iso,
+                stored_evaluated_at_iso,
+                stored_evaluated_at_iso,
+                1 if result.condition_met else 0,
+                result.decision_reason,
+                result.outcome,
+                _dumps_json(result.metrics),
+                updated_at_iso,
+            ),
+        )
 
     for state in result.condition_states:
+        state_last_evaluated_at_iso = (
+            _to_iso_utc(_to_utc(state.last_evaluated_at))
+            if state.last_evaluated_at is not None
+            else None
+        )
         cursor = conn.execute(
             """
             UPDATE condition_states
-            SET state = ?, last_value = ?, last_evaluated_at = ?, updated_at = ?
+            SET state = ?, last_value = ?, last_evaluated_at = COALESCE(?, last_evaluated_at), updated_at = ?
             WHERE strategy_id = ? AND condition_id = ?
             """,
             (
                 state.state,
                 state.last_value,
-                ts_iso,
-                ts_iso,
+                state_last_evaluated_at_iso,
+                updated_at_iso,
                 strategy_id,
                 state.condition_id,
             ),
@@ -712,7 +1105,7 @@ def persist_evaluation_result(
                 state.condition_id,
                 state.state,
                 state.last_value,
-                ts_iso,
-                ts_iso,
+                state_last_evaluated_at_iso,
+                updated_at_iso,
             ),
         )

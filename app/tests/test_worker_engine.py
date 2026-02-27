@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.config import clear_app_config_cache
 from app.db import get_connection, init_db
+from app.market_data import (
+    HistoricalBar,
+    HistoricalBarsRequest,
+    HistoricalBarsResult,
+    TradingCalendarRequest,
+    TradingCalendarResult,
+    TradingCalendarSession,
+)
 from app.verification import ActivationVerificationResult
 from app.worker import (
     StrategyExecutionEngine,
@@ -69,6 +77,96 @@ def _insert_strategy(
             ),
         )
         conn.commit()
+
+
+def _insert_symbol(
+    strategy_id: str,
+    *,
+    db_path: Path,
+    position: int,
+    code: str,
+    contract_id: int | None,
+) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_symbols (strategy_id, position, code, trade_type, contract_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (strategy_id, position, code, "buy", contract_id, _iso_now()),
+        )
+        conn.commit()
+
+
+def _parse_bar_size_delta(bar_size: str) -> timedelta:
+    parts = bar_size.strip().lower().split()
+    if len(parts) != 2:
+        return timedelta(minutes=1)
+    try:
+        amount = int(parts[0])
+    except ValueError:
+        return timedelta(minutes=1)
+    unit = parts[1]
+    if unit in {"min", "mins", "minute", "minutes"}:
+        return timedelta(minutes=max(1, amount))
+    if unit in {"hour", "hours"}:
+        return timedelta(hours=max(1, amount))
+    if unit in {"day", "days"}:
+        return timedelta(days=max(1, amount))
+    return timedelta(minutes=1)
+
+
+class _FakeMarketDataProvider:
+    def __init__(
+        self,
+        *,
+        closes_by_symbol: dict[str, list[float]],
+        trading_calendar_by_contract: dict[int, list[tuple[datetime, datetime]]] | None = None,
+    ) -> None:
+        self._closes_by_symbol = {k.upper(): list(v) for k, v in closes_by_symbol.items()}
+        self._trading_calendar_by_contract = trading_calendar_by_contract or {}
+        self.requests: list[HistoricalBarsRequest] = []
+        self.calendar_requests: list[TradingCalendarRequest] = []
+
+    def get_historical_bars(self, request: HistoricalBarsRequest) -> HistoricalBarsResult:
+        self.requests.append(request)
+        if isinstance(request.contract, str):
+            symbol = request.contract.strip().upper()
+        else:
+            symbol = str(request.contract.get("code", "")).strip().upper()
+        closes = self._closes_by_symbol.get(symbol, [])
+        delta = _parse_bar_size_delta(request.bar_size)
+        end = request.end_time.astimezone(UTC)
+        bars: list[HistoricalBar] = []
+        for idx, close in enumerate(closes):
+            ts = end - delta * (len(closes) - idx)
+            bars.append(
+                HistoricalBar(
+                    ts=ts,
+                    open=close,
+                    high=close,
+                    low=close,
+                    close=close,
+                    volume=1000.0,
+                )
+            )
+        return HistoricalBarsResult(bars=bars, meta={"source": "TEST"})
+
+    def get_trading_calendar(self, request: TradingCalendarRequest) -> TradingCalendarResult:
+        self.calendar_requests.append(request)
+        raw_sessions = self._trading_calendar_by_contract.get(int(request.contract_id), [])
+        sessions: list[TradingCalendarSession] = []
+        for start, end in raw_sessions:
+            start_utc = start.astimezone(UTC)
+            end_utc = end.astimezone(UTC)
+            sessions.append(
+                TradingCalendarSession(
+                    ref_date=start_utc.strftime("%Y%m%d"),
+                    start_time=start_utc,
+                    end_time=end_utc,
+                )
+            )
+        return TradingCalendarResult(sessions=sessions, meta={"source": "TEST"})
 
 
 def test_strategy_task_queue_deduplicates_inflight() -> None:
@@ -317,6 +415,7 @@ def test_build_execution_engine_ignores_worker_env_overrides(tmp_path) -> None:
         [worker]
         enabled = true
         monitor_interval_seconds = 41
+        max_monitoring_interval_minutes = 66
         threads = 3
         queue_maxsize = 777
         gateway_not_work_event_throttle_seconds = 601
@@ -339,6 +438,7 @@ def test_build_execution_engine_ignores_worker_env_overrides(tmp_path) -> None:
         engine = build_execution_engine_from_env()
         assert engine.enabled is True
         assert engine._monitor_interval_seconds == 41
+        assert engine._max_monitoring_interval_minutes == 66
         assert engine._worker_count == 3
         assert engine._queue._queue.maxsize == 777
         assert engine._gateway_not_work_event_throttle_seconds == 601
@@ -380,7 +480,7 @@ def test_process_once_active_persists_strategy_run(tmp_path) -> None:
                     "condition_id": "c1",
                     "condition_type": "SINGLE_PRODUCT",
                     "metric": "PRICE",
-                    "trigger_mode": "LEVEL_INSTANT",
+                    "trigger_mode": "CROSS_UP_INSTANT",
                     "evaluation_window": "1m",
                     "window_price_basis": "CLOSE",
                     "operator": ">=",
@@ -391,21 +491,70 @@ def test_process_once_active_persists_strategy_run(tmp_path) -> None:
             ]
         ),
     )
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0]})
 
-    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
 
     old_db_path = os.getenv("IBX_DB_PATH")
     os.environ["IBX_DB_PATH"] = str(db_path)
     try:
         engine.process_once("S-WORKER-ACTIVE", reason="unit_test")
         with get_connection() as conn:
+            initial_run = conn.execute(
+                """
+                SELECT last_monitoring_data_end_at, run_count
+                FROM strategy_runs
+                WHERE strategy_id = ?
+                """,
+                ("S-WORKER-ACTIVE",),
+            ).fetchone()
+            assert initial_run is not None
+            strategy_row = conn.execute(
+                "SELECT logical_activated_at FROM strategies WHERE id = ?",
+                ("S-WORKER-ACTIVE",),
+            ).fetchone()
+            assert strategy_row is not None
+            monitoring_end_map = json.loads(initial_run["last_monitoring_data_end_at"])
+            assert monitoring_end_map["c1"]["1"] == strategy_row["logical_activated_at"]
+            assert initial_run["run_count"] == 1
+
+        engine.process_once("S-WORKER-ACTIVE", reason="unit_test")
+        with get_connection() as conn:
             run_row = conn.execute(
-                "SELECT condition_met, decision_reason FROM strategy_runs WHERE strategy_id = ?",
+                """
+                SELECT
+                    last_monitoring_data_end_at,
+                    condition_met,
+                    decision_reason,
+                    last_outcome,
+                    run_count,
+                    metrics_json
+                FROM strategy_runs
+                WHERE strategy_id = ?
+                """,
                 ("S-WORKER-ACTIVE",),
             ).fetchone()
             assert run_row is not None
+            monitoring_end_map = json.loads(run_row["last_monitoring_data_end_at"])
+            assert monitoring_end_map["c1"]["1"] == strategy_row["logical_activated_at"]
             assert run_row["condition_met"] == 0
             assert run_row["decision_reason"] == "waiting_for_market_data"
+            assert run_row["last_outcome"] == "waiting_for_market_data"
+            assert run_row["run_count"] == 2
+            metrics = json.loads(run_row["metrics_json"])
+            assert "market_data_preparation" in metrics
+
+            run_count_row = conn.execute(
+                "SELECT COUNT(1) AS c FROM strategy_runs WHERE strategy_id = ?",
+                ("S-WORKER-ACTIVE",),
+            ).fetchone()
+            assert run_count_row is not None
+            assert run_count_row["c"] == 1
 
             state_row = conn.execute(
                 """
@@ -423,6 +572,787 @@ def test_process_once_active_persists_strategy_run(tmp_path) -> None:
             os.environ.pop("IBX_DB_PATH", None)
         else:
             os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_active_uses_market_data_provider_and_triggers(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_market_data.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [100.5, 101.2]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-MD", reason="unit_test")
+        with get_connection() as conn:
+            run_row = conn.execute(
+                """
+                SELECT condition_met, decision_reason, metrics_json, last_monitoring_data_end_at
+                FROM strategy_runs
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("S-WORKER-MD",),
+            ).fetchone()
+            assert run_row is not None
+            assert run_row["condition_met"] == 1
+            assert run_row["decision_reason"] == "conditions_met"
+            metrics = json.loads(run_row["metrics_json"])
+            summary = metrics.get("market_data_preparation")
+            assert isinstance(summary, dict)
+            assert summary.get("conditions_total") == 1
+            assert summary.get("conditions_with_input") == 1
+            conditions = summary.get("conditions")
+            assert isinstance(conditions, list)
+            assert len(conditions) == 1
+            first = conditions[0]
+            assert first.get("condition_id") == "c1"
+            assert first.get("status") == "evaluated"
+            contracts = first.get("contracts")
+            assert isinstance(contracts, list)
+            assert len(contracts) == 1
+            assert contracts[0].get("status") == "ready"
+            assert contracts[0].get("symbol") == "AAPL"
+            assert contracts[0].get("series_points") == 2
+            assert len(provider.requests) > 0
+            req_end = provider.requests[-1].end_time.astimezone(UTC)
+            expected_last_bar = req_end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            monitoring_end_map = json.loads(run_row["last_monitoring_data_end_at"])
+            assert monitoring_end_map["c1"]["1"] == expected_last_bar
+
+            state_row = conn.execute(
+                """
+                SELECT state, last_value
+                FROM condition_states
+                WHERE strategy_id = ? AND condition_id = ?
+                """,
+                ("S-WORKER-MD", "c1"),
+            ).fetchone()
+            assert state_row is not None
+            assert state_row["state"] == "TRUE"
+            assert state_row["last_value"] is not None
+
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-MD",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "TRIGGERED"
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_market_data_requirement_uses_per_key_last_monitoring_end_as_start_time(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_market_data_start_from_last_end.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-LAST-END",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-LAST-END",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+    last_end_iso = (datetime.now(UTC) - timedelta(minutes=10)).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-MD-LAST-END",
+                json.dumps({"c1": {"1": last_end_iso}}),
+                _iso_now(),
+                _iso_now(),
+                0,
+                "waiting_for_market_data",
+                "waiting_for_market_data",
+                1,
+                "{}",
+                _iso_now(),
+            ),
+        )
+        conn.commit()
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0, 102.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once("S-WORKER-MD-LAST-END", reason="unit_test")
+        assert len(provider.requests) > 0
+        request = provider.requests[0]
+        assert request.start_time.replace(microsecond=0).isoformat().replace("+00:00", "Z") == last_end_iso
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
+
+
+def test_waiting_for_market_data_does_not_advance_last_monitoring_end(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_waiting_keep_last_end.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-WAITING-LAST-END",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "CROSS_UP_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-WAITING-LAST-END",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    last_end_iso = (datetime.now(UTC) - timedelta(minutes=15)).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-MD-WAITING-LAST-END",
+                json.dumps({"c1": {"1": last_end_iso}}),
+                _iso_now(),
+                _iso_now(),
+                0,
+                "waiting_for_market_data",
+                "waiting_for_market_data",
+                1,
+                "{}",
+                _iso_now(),
+            ),
+        )
+        conn.commit()
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-MD-WAITING-LAST-END", reason="unit_test")
+        with get_connection() as conn:
+            run_row = conn.execute(
+                """
+                SELECT last_monitoring_data_end_at, last_outcome
+                FROM strategy_runs
+                WHERE strategy_id = ?
+                """,
+                ("S-WORKER-MD-WAITING-LAST-END",),
+            ).fetchone()
+            assert run_row is not None
+            assert run_row["last_outcome"] == "waiting_for_market_data"
+            monitoring_end_map = json.loads(run_row["last_monitoring_data_end_at"])
+            assert monitoring_end_map["c1"]["1"] == last_end_iso
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_active_skips_monitoring_when_before_suggested_next_and_within_max_interval(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_skip_by_suggested_next.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-SKIP-SUGGESTED",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-SKIP-SUGGESTED",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    evaluated_at = now - timedelta(minutes=10)
+    suggested_next = now + timedelta(minutes=30)
+    last_end_iso = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, suggested_next_monitor_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-SKIP-SUGGESTED",
+                json.dumps({"c1": {"1": last_end_iso}}),
+                suggested_next.isoformat().replace("+00:00", "Z"),
+                evaluated_at.isoformat().replace("+00:00", "Z"),
+                evaluated_at.isoformat().replace("+00:00", "Z"),
+                0,
+                "no_new_data",
+                "no_new_data",
+                1,
+                "{}",
+                evaluated_at.isoformat().replace("+00:00", "Z"),
+            ),
+        )
+        conn.commit()
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        max_monitoring_interval_minutes=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-SKIP-SUGGESTED", reason="unit_test")
+        assert len(provider.requests) == 0
+        with get_connection() as conn:
+            run_row = conn.execute(
+                """
+                SELECT run_count, evaluated_at, suggested_next_monitor_at
+                FROM strategy_runs
+                WHERE strategy_id = ?
+                """,
+                ("S-WORKER-SKIP-SUGGESTED",),
+            ).fetchone()
+            assert run_row is not None
+            assert int(run_row["run_count"]) == 1
+            assert run_row["evaluated_at"] == evaluated_at.isoformat().replace("+00:00", "Z")
+            assert run_row["suggested_next_monitor_at"] == suggested_next.isoformat().replace("+00:00", "Z")
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_active_does_not_skip_when_max_monitoring_interval_exceeded(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_no_skip_after_max_interval.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-NO-SKIP-SUGGESTED",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-NO-SKIP-SUGGESTED",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    evaluated_at = now - timedelta(minutes=120)
+    suggested_next = now + timedelta(minutes=30)
+    last_end_iso = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, suggested_next_monitor_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-NO-SKIP-SUGGESTED",
+                json.dumps({"c1": {"1": last_end_iso}}),
+                suggested_next.isoformat().replace("+00:00", "Z"),
+                evaluated_at.isoformat().replace("+00:00", "Z"),
+                evaluated_at.isoformat().replace("+00:00", "Z"),
+                0,
+                "no_new_data",
+                "no_new_data",
+                1,
+                "{}",
+                evaluated_at.isoformat().replace("+00:00", "Z"),
+            ),
+        )
+        conn.commit()
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": []})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        max_monitoring_interval_minutes=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-NO-SKIP-SUGGESTED", reason="unit_test")
+        assert len(provider.requests) > 0
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_no_new_data_skips_evaluate_and_keeps_last_monitoring_end(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_no_new_data.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-NO-NEW",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-NO-NEW",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    last_end_iso = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    previous_eval_iso = (datetime.now(UTC) - timedelta(minutes=30)).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-MD-NO-NEW",
+                json.dumps({"c1": {"1": last_end_iso}}),
+                previous_eval_iso,
+                previous_eval_iso,
+                0,
+                "waiting_for_market_data",
+                "waiting_for_market_data",
+                1,
+                "{}",
+                previous_eval_iso,
+            ),
+        )
+        conn.commit()
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": []})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-MD-NO-NEW", reason="unit_test")
+        with get_connection() as conn:
+            run_row = conn.execute(
+                """
+                SELECT last_monitoring_data_end_at, decision_reason, last_outcome, suggested_next_monitor_at, evaluated_at, updated_at
+                FROM strategy_runs
+                WHERE strategy_id = ?
+                """,
+                ("S-WORKER-MD-NO-NEW",),
+            ).fetchone()
+            assert run_row is not None
+            assert run_row["decision_reason"] == "no_new_data"
+            assert run_row["last_outcome"] == "no_new_data"
+            assert run_row["suggested_next_monitor_at"] is None
+            assert run_row["evaluated_at"] == previous_eval_iso
+            assert str(run_row["updated_at"]) >= previous_eval_iso
+            monitoring_end_map = json.loads(run_row["last_monitoring_data_end_at"])
+            assert monitoring_end_map["c1"]["1"] == last_end_iso
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_no_new_data_outside_session_sets_suggested_next_monitor_at(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_no_new_data_suggested_next.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-NO-NEW-SUGGEST",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-NO-NEW-SUGGEST",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    last_end_iso = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-MD-NO-NEW-SUGGEST",
+                json.dumps({"c1": {"1": last_end_iso}}),
+                _iso_now(),
+                _iso_now(),
+                0,
+                "waiting_for_market_data",
+                "waiting_for_market_data",
+                1,
+                "{}",
+                _iso_now(),
+            ),
+        )
+        conn.commit()
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    next_session_start = now + timedelta(minutes=30)
+    provider = _FakeMarketDataProvider(
+        closes_by_symbol={"AAPL": []},
+        trading_calendar_by_contract={
+            1: [
+                (
+                    next_session_start,
+                    next_session_start + timedelta(hours=6),
+                )
+            ]
+        },
+    )
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-MD-NO-NEW-SUGGEST", reason="unit_test")
+        with get_connection() as conn:
+            run_row = conn.execute(
+                """
+                SELECT decision_reason, last_outcome, suggested_next_monitor_at
+                FROM strategy_runs
+                WHERE strategy_id = ?
+                """,
+                ("S-WORKER-MD-NO-NEW-SUGGEST",),
+            ).fetchone()
+            assert run_row is not None
+            assert run_row["decision_reason"] == "no_new_data"
+            assert run_row["last_outcome"] == "no_new_data"
+            assert run_row["suggested_next_monitor_at"] == next_session_start.isoformat().replace("+00:00", "Z")
+            event_row = conn.execute(
+                """
+                SELECT event_type, detail
+                FROM strategy_events
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("S-WORKER-MD-NO-NEW-SUGGEST",),
+            ).fetchone()
+            assert event_row is not None
+            assert event_row["event_type"] == "MONITOR_SCHEDULED"
+            assert "suggested_next_monitor_at" in str(event_row["detail"])
+            assert next_session_start.isoformat().replace("+00:00", "Z") in str(event_row["detail"])
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_or_short_circuit_keeps_skipped_condition_last_evaluated_at(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_or_short_circuit_keep_last_eval.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-OR-SHORT",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                },
+                {
+                    "condition_id": "c2",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "MSFT",
+                    "contract_id": 2,
+                },
+            ]
+        ),
+    )
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE strategies SET condition_logic = 'OR' WHERE id = ?",
+            ("S-WORKER-OR-SHORT",),
+        )
+        previous_eval_iso = (datetime.now(UTC) - timedelta(minutes=90)).replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
+        conn.execute(
+            """
+            INSERT INTO condition_states (
+                strategy_id, condition_id, state, last_value, last_evaluated_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-OR-SHORT",
+                "c2",
+                "FALSE",
+                88.0,
+                previous_eval_iso,
+                previous_eval_iso,
+            ),
+        )
+        conn.commit()
+
+    _insert_symbol(
+        "S-WORKER-OR-SHORT",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+    _insert_symbol(
+        "S-WORKER-OR-SHORT",
+        db_path=db_path,
+        position=2,
+        code="MSFT",
+        contract_id=2,
+    )
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0], "MSFT": [90.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once("S-WORKER-OR-SHORT", reason="unit_test")
+        with get_connection() as conn:
+            state_row = conn.execute(
+                """
+                SELECT state, last_evaluated_at
+                FROM condition_states
+                WHERE strategy_id = ? AND condition_id = ?
+                """,
+                ("S-WORKER-OR-SHORT", "c2"),
+            ).fetchone()
+            assert state_row is not None
+            assert state_row["state"] == "NOT_EVALUATED"
+            assert state_row["last_evaluated_at"] == previous_eval_iso
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
 
 
 def test_process_once_triggered_creates_trade_instruction(tmp_path) -> None:
@@ -478,6 +1408,28 @@ def test_process_once_verifying_moves_to_active(tmp_path, monkeypatch) -> None:
         db_path=db_path,
         status="VERIFYING",
     )
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-VERIFY",
+                json.dumps({"c1": {"1": _iso_now()}}),
+                _iso_now(),
+                _iso_now(),
+                0,
+                "waiting_for_market_data",
+                "waiting_for_market_data",
+                1,
+                "{}",
+                _iso_now(),
+            ),
+        )
+        conn.commit()
     monkeypatch.setattr(
         "app.worker.run_activation_verification",
         lambda conn, *, strategy_id, strategy_row: ActivationVerificationResult(
@@ -516,6 +1468,13 @@ def test_process_once_verifying_moves_to_active(tmp_path, monkeypatch) -> None:
             ).fetchone()
             assert event_row is not None
             assert event_row["event_type"] == "ACTIVATED"
+
+            run_row = conn.execute(
+                "SELECT COUNT(1) AS c FROM strategy_runs WHERE strategy_id = ?",
+                ("S-WORKER-VERIFY",),
+            ).fetchone()
+            assert run_row is not None
+            assert int(run_row["c"]) == 0
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
@@ -576,6 +1535,215 @@ def test_process_once_verifying_moves_to_verify_failed_when_verification_rejecte
             os.environ["IBX_DB_PATH"] = old_db_path
 
 
+def test_process_once_active_moves_to_verify_failed_when_activation_time_missing(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_active_missing_activation_time.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-ACTIVE-MISSING-ACTIVATION",
+        db_path=db_path,
+        status="ACTIVE",
+    )
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE strategies
+            SET activated_at = NULL, logical_activated_at = NULL
+            WHERE id = ?
+            """,
+            ("S-WORKER-ACTIVE-MISSING-ACTIVATION",),
+        )
+        conn.commit()
+
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-ACTIVE-MISSING-ACTIVATION", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-ACTIVE-MISSING-ACTIVATION",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "VERIFY_FAILED"
+
+            event_row = conn.execute(
+                """
+                SELECT event_type, detail
+                FROM strategy_events
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("S-WORKER-ACTIVE-MISSING-ACTIVATION",),
+            ).fetchone()
+            assert event_row is not None
+            assert event_row["event_type"] == "VERIFY_FAILED"
+            assert "missing_activation_time" in str(event_row["detail"])
+
+            run_row = conn.execute(
+                "SELECT COUNT(1) AS c FROM strategy_runs WHERE strategy_id = ?",
+                ("S-WORKER-ACTIVE-MISSING-ACTIVATION",),
+            ).fetchone()
+            assert run_row is not None
+            assert int(run_row["c"]) == 0
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_active_missing_activation_time_has_priority_over_skip_gate(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_active_missing_activation_priority.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-ACTIVE-MISSING-ACTIVATION-PRIORITY",
+        db_path=db_path,
+        status="ACTIVE",
+    )
+    now = datetime.now(UTC).replace(microsecond=0)
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE strategies
+            SET activated_at = NULL, logical_activated_at = NULL
+            WHERE id = ?
+            """,
+            ("S-WORKER-ACTIVE-MISSING-ACTIVATION-PRIORITY",),
+        )
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, suggested_next_monitor_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-ACTIVE-MISSING-ACTIVATION-PRIORITY",
+                json.dumps({"c1": {"1": _iso_now()}}),
+                (now + timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+                now.isoformat().replace("+00:00", "Z"),
+                now.isoformat().replace("+00:00", "Z"),
+                0,
+                "no_new_data",
+                "no_new_data",
+                1,
+                "{}",
+                now.isoformat().replace("+00:00", "Z"),
+            ),
+        )
+        conn.commit()
+
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-ACTIVE-MISSING-ACTIVATION-PRIORITY", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-ACTIVE-MISSING-ACTIVATION-PRIORITY",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "VERIFY_FAILED"
+
+            event_row = conn.execute(
+                """
+                SELECT event_type, detail
+                FROM strategy_events
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("S-WORKER-ACTIVE-MISSING-ACTIVATION-PRIORITY",),
+            ).fetchone()
+            assert event_row is not None
+            assert event_row["event_type"] == "VERIFY_FAILED"
+            assert "missing_activation_time" in str(event_row["detail"])
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_active_raises_when_market_data_provider_missing(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_active_missing_market_data_provider.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-ACTIVE-MISSING-PROVIDER",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-ACTIVE-MISSING-PROVIDER",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        try:
+            engine.process_once("S-WORKER-ACTIVE-MISSING-PROVIDER", reason="unit_test")
+            assert False, "expected RuntimeError"
+        except RuntimeError as exc:
+            assert "missing market data provider" in str(exc).lower()
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-ACTIVE-MISSING-PROVIDER",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "ACTIVE"
+
+            event_row = conn.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM strategy_events
+                WHERE strategy_id = ?
+                """,
+                ("S-WORKER-ACTIVE-MISSING-PROVIDER",),
+            ).fetchone()
+            assert event_row is not None
+            assert int(event_row["c"]) == 0
+
+            run_row = conn.execute(
+                "SELECT COUNT(1) AS c FROM strategy_runs WHERE strategy_id = ?",
+                ("S-WORKER-ACTIVE-MISSING-PROVIDER",),
+            ).fetchone()
+            assert run_row is not None
+            assert int(run_row["c"]) == 0
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
 def test_process_once_active_without_conditions_moves_to_verify_failed(tmp_path) -> None:
     db_path = tmp_path / "ibx_worker_active_no_conditions.sqlite3"
     init_db(db_path=db_path)
@@ -586,7 +1754,13 @@ def test_process_once_active_without_conditions_moves_to_verify_failed(tmp_path)
         conditions_json="[]",
     )
 
-    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
 
     old_db_path = os.getenv("IBX_DB_PATH")
     os.environ["IBX_DB_PATH"] = str(db_path)
@@ -602,7 +1776,7 @@ def test_process_once_active_without_conditions_moves_to_verify_failed(tmp_path)
 
             event_row = conn.execute(
                 """
-                SELECT event_type
+                SELECT event_type, detail
                 FROM strategy_events
                 WHERE strategy_id = ?
                 ORDER BY id DESC
@@ -612,6 +1786,7 @@ def test_process_once_active_without_conditions_moves_to_verify_failed(tmp_path)
             ).fetchone()
             assert event_row is not None
             assert event_row["event_type"] == "VERIFY_FAILED"
+            assert "missing_data_requirements" in str(event_row["detail"])
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
@@ -639,7 +1814,13 @@ def test_process_once_active_invalid_condition_moves_to_verify_failed(tmp_path) 
         ),
     )
 
-    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
 
     old_db_path = os.getenv("IBX_DB_PATH")
     os.environ["IBX_DB_PATH"] = str(db_path)
@@ -698,11 +1879,13 @@ def test_gateway_not_work_event_is_throttled_by_runtime_state(tmp_path) -> None:
         ),
     )
 
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0]})
     engine = StrategyExecutionEngine(
         enabled=False,
         monitor_interval_seconds=60,
         worker_count=1,
         gateway_not_work_event_throttle_seconds=300,
+        market_data_provider=provider,
     )
 
     old_db_path = os.getenv("IBX_DB_PATH")
@@ -759,7 +1942,7 @@ def test_waiting_for_market_data_event_is_throttled_by_runtime_state(tmp_path) -
                     "condition_id": "c1",
                     "condition_type": "SINGLE_PRODUCT",
                     "metric": "PRICE",
-                    "trigger_mode": "LEVEL_INSTANT",
+                    "trigger_mode": "CROSS_UP_INSTANT",
                     "evaluation_window": "1m",
                     "window_price_basis": "CLOSE",
                     "operator": ">=",
@@ -771,17 +1954,19 @@ def test_waiting_for_market_data_event_is_throttled_by_runtime_state(tmp_path) -
         ),
     )
 
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0]})
     engine = StrategyExecutionEngine(
         enabled=False,
         monitor_interval_seconds=60,
         worker_count=1,
         waiting_for_market_data_event_throttle_seconds=300,
+        market_data_provider=provider,
     )
 
     old_db_path = os.getenv("IBX_DB_PATH")
     old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
     os.environ["IBX_DB_PATH"] = str(db_path)
-    os.environ.pop("IBX_GATEWAY_READY", None)
+    os.environ["IBX_GATEWAY_READY"] = "1"
     try:
         engine.process_once("S-WORKER-WAIT-THROTTLE", reason="unit_test")
         engine.process_once("S-WORKER-WAIT-THROTTLE", reason="unit_test")
