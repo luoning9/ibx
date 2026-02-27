@@ -1264,45 +1264,6 @@ class StrategyExecutionEngine:
             has_condition_evaluated,
         )
 
-    def _extract_contract_ids_from_market_data_preparation(
-        self,
-        market_data_preparation: dict[str, Any] | None,
-    ) -> list[int]:
-        if not isinstance(market_data_preparation, dict):
-            return []
-        raw_conditions = market_data_preparation.get("conditions")
-        if not isinstance(raw_conditions, list):
-            return []
-        seen: set[int] = set()
-        out: list[int] = []
-        for condition in raw_conditions:
-            if not isinstance(condition, dict):
-                continue
-            raw_contracts = condition.get("contracts")
-            if not isinstance(raw_contracts, list):
-                continue
-            for contract in raw_contracts:
-                if not isinstance(contract, dict):
-                    continue
-                contract_id = _to_int_or_none(contract.get("contract_id"))
-                if contract_id is None or contract_id in seen:
-                    continue
-                seen.add(contract_id)
-                out.append(contract_id)
-        return out
-
-    def _suggest_next_monitor_at_for_no_new_data(
-        self,
-        *,
-        now: datetime,
-        market_data_preparation: dict[str, Any] | None,
-    ) -> datetime | None:
-        contract_ids = self._extract_contract_ids_from_market_data_preparation(market_data_preparation)
-        return self._suggest_next_monitor_at_for_contract_ids(
-            now=now,
-            contract_ids=contract_ids,
-        )
-
     def _suggest_next_monitor_at_for_contract_ids(
         self,
         *,
