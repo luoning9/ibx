@@ -13,7 +13,7 @@ export type StrategyStatus =
 
 export type StrategyTradeType = 'buy' | 'sell' | 'switch' | 'open' | 'close' | 'spread'
 export type SymbolTradeType = 'buy' | 'sell' | 'open' | 'close' | 'ref'
-export type StrategyMarket = 'US_STOCK' | 'COMEX_FUTURES'
+export type StrategyMarket = string
 
 export type StrategySymbolItem = {
   code: string
@@ -67,6 +67,19 @@ export type NextStrategyProjection = {
   status: StrategyStatus | 'NOT_SET' | 'UNKNOWN'
 }
 
+export type StrategyRunSummary = {
+  // Mirrors backend StrategyRunSummaryOut.
+  first_evaluated_at: string
+  evaluated_at: string
+  suggested_next_monitor_at: string | null
+  condition_met: boolean
+  decision_reason: string
+  last_outcome: string
+  run_count: number
+  last_monitoring_data_end_at: Record<string, Record<string, string>>
+  updated_at: string
+}
+
 export type StrategyDetail = {
   id: string
   description: string
@@ -93,6 +106,7 @@ export type StrategyDetail = {
   trade_action_runtime: TradeActionRuntime
   next_strategy: NextStrategyProjection | null
   upstream_strategy: NextStrategyProjection | null
+  strategy_run: StrategyRunSummary | null
   anchor_price: number | null
   events: EventItem[]
   created_at: string
@@ -169,6 +183,7 @@ export type StrategyBasicPatchPayload = {
   trade_type?: StrategyTradeType
   symbols?: StrategySymbolItem[]
   upstream_only_activation?: boolean
+  logical_activated_at?: string | null
   expire_mode?: 'relative' | 'absolute'
   expire_in_seconds?: number | null
   expire_at?: string | null
@@ -197,4 +212,78 @@ export type ConditionRulesResponse = {
     allowed_windows: Record<string, string[]>
     allowed_rules: Record<string, ConditionRulePair[]>
   }
+}
+
+export type SystemGatewayStatus = {
+  trading_mode: 'paper' | 'live'
+  host: string
+  api_port: number
+  paper_port: number
+  live_port: number
+  account_code: string | null
+}
+
+export type SystemProviderStatus = {
+  configured: string
+  runtime_class: string | null
+  runtime_mode: string | null
+  details: Record<string, unknown>
+}
+
+export type SystemWorkerStatus = {
+  enabled: boolean
+  running: boolean
+  monitor_interval_seconds: number
+  configured_threads: number
+  live_threads: number
+  scanner_alive: boolean
+  queue_length: number
+  queue_maxsize: number
+  inflight_tasks: number
+}
+
+export type SystemStatus = {
+  gateway: SystemGatewayStatus
+  worker: SystemWorkerStatus
+  providers: Record<string, SystemProviderStatus>
+}
+
+export type MarketProfile = {
+  market: string
+  sec_type: string
+  exchange: string
+  currency: string
+  allowed_trade_types: string[]
+}
+
+export type MarketDataProbePayload = {
+  code: string
+  market: string
+  contract_month?: string | null
+  start_time: string
+  end_time: string
+  bar_size: string
+  what_to_show: string
+  use_rth: boolean
+  include_partial_bar: boolean
+  max_bars?: number | null
+  page_size?: number | null
+}
+
+export type MarketDataBar = {
+  ts: string
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number | null
+  wap: number | null
+  count: number | null
+}
+
+export type MarketDataProbeResponse = {
+  provider_class: string
+  request: Record<string, unknown>
+  bars: MarketDataBar[]
+  meta: Record<string, unknown>
 }

@@ -1,17 +1,33 @@
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, Thread
-from typing import Callable
+from typing import Any, Callable
 
 from .chain import execute_triggered_strategy, sync_order_submitted_strategy_status
 from .config import load_app_config
-from .db import get_connection
-from .evaluator import evaluate_strategy, persist_evaluation_result
+from .db import get_connection, init_db
+from .evaluator import (
+    ConditionEvaluationInput,
+    ConditionEvaluationState,
+    ConditionEvaluator,
+    StrategyEvaluationResult,
+    gateway_is_working,
+    persist_evaluation_result,
+)
+from .market_data import (
+    HistoricalBar,
+    HistoricalBarsRequest,
+    MarketDataProvider,
+    TradingCalendarRequest,
+    build_market_data_provider_from_config,
+)
+from .market_data_ib import IBSessionHistoricalFetcher
 from .verification import run_activation_verification
 
 
@@ -50,6 +66,95 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
     if not value:
         return None
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _normalize_symbol(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _compact_bar_size_to_ib(value: str) -> tuple[str, timedelta] | None:
+    text = str(value or "").strip().lower()
+    if len(text) < 2:
+        return None
+    unit = text[-1]
+    try:
+        amount = int(text[:-1])
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    if unit == "m":
+        return f"{amount} min", timedelta(minutes=amount)
+    if unit == "h":
+        return f"{amount} hour", timedelta(hours=amount)
+    if unit == "d":
+        return f"{amount} day", timedelta(days=amount)
+    return None
+
+
+def _bar_price_value(bar: HistoricalBar, basis: str) -> float:
+    normalized = basis.strip().upper()
+    if normalized == "HIGH":
+        return float(bar.high)
+    if normalized == "LOW":
+        return float(bar.low)
+    if normalized == "AVG":
+        if bar.wap is not None:
+            return float(bar.wap)
+        return float((bar.open + bar.high + bar.low + bar.close) / 4.0)
+    return float(bar.close)
+
+
+def _bar_value_for_metric(metric: str, *, basis: str, bar: HistoricalBar) -> float | None:
+    metric_key = metric.strip().upper()
+    if metric_key in {"PRICE", "DRAWDOWN_PCT", "RALLY_PCT", "SPREAD"}:
+        return _bar_price_value(bar, basis)
+    if metric_key == "VOLUME_RATIO":
+        if bar.volume is None:
+            return None
+        return float(bar.volume)
+    if metric_key == "AMOUNT_RATIO":
+        if bar.volume is None:
+            return None
+        return float(bar.volume) * _bar_price_value(bar, basis)
+    return _bar_price_value(bar, basis)
+
+
+def _latest_non_partial_bar_end_time(
+    bars: list[HistoricalBar],
+    *,
+    bar_delta: timedelta,
+    now: datetime,
+) -> datetime | None:
+    if not bars:
+        return None
+    now_utc = _to_utc(now)
+    latest: datetime | None = None
+    for bar in bars:
+        end_ts = _to_utc(bar.ts) + bar_delta
+        if end_ts > now_utc:
+            continue
+        if latest is None or end_ts > latest:
+            latest = end_ts
+    return latest
+
+
+def _build_worker_market_data_provider() -> MarketDataProvider:
+    cfg = load_app_config()
+    if cfg.providers.market_data == "fixture":
+        return build_market_data_provider_from_config()
+    fetcher = IBSessionHistoricalFetcher()
+    return build_market_data_provider_from_config(fetcher=fetcher)
 
 
 @dataclass(frozen=True)
@@ -98,6 +203,16 @@ class StrategyTaskQueue:
         with self._lock:
             self._inflight.discard(strategy_id)
 
+    def qsize(self) -> int:
+        return int(self._queue.qsize())
+
+    def maxsize(self) -> int:
+        return int(self._queue.maxsize)
+
+    def inflight_count(self) -> int:
+        with self._lock:
+            return len(self._inflight)
+
 
 StrategyHandler = Callable[[sqlite3.Connection, sqlite3.Row, datetime], None]
 
@@ -108,15 +223,18 @@ class StrategyExecutionEngine:
         *,
         enabled: bool = False,
         monitor_interval_seconds: int = 60,
+        max_monitoring_interval_minutes: int = 60,
         worker_count: int = 2,
         queue_maxsize: int = 4096,
         gateway_not_work_event_throttle_seconds: int = 300,
         waiting_for_market_data_event_throttle_seconds: int = 120,
         strategy_lock_ttl_seconds: int = DEFAULT_STRATEGY_LOCK_TTL_SECONDS,
+        market_data_provider: MarketDataProvider | None = None,
     ) -> None:
         self._logger = logging.getLogger("ibx.worker")
         self._enabled = enabled
         self._monitor_interval_seconds = monitor_interval_seconds
+        self._max_monitoring_interval_minutes = max(1, int(max_monitoring_interval_minutes))
         self._worker_count = worker_count
         self._queue = StrategyTaskQueue(maxsize=queue_maxsize)
         self._gateway_not_work_event_throttle_seconds = gateway_not_work_event_throttle_seconds
@@ -124,6 +242,7 @@ class StrategyExecutionEngine:
             waiting_for_market_data_event_throttle_seconds
         )
         self._strategy_lock_ttl_seconds = max(1, int(strategy_lock_ttl_seconds))
+        self._market_data_provider = market_data_provider
         self._stop_event = Event()
         self._start_lock = Lock()
         self._running = False
@@ -140,6 +259,23 @@ class StrategyExecutionEngine:
     def running(self) -> bool:
         return self._running
 
+    def runtime_status(self) -> dict[str, int | bool]:
+        scanner = self._scanner_thread
+        worker_threads = list(self._worker_threads)
+        live_worker_threads = sum(1 for thread in worker_threads if thread.is_alive())
+        return {
+            "enabled": bool(self._enabled),
+            "running": bool(self._running),
+            "monitor_interval_seconds": int(self._monitor_interval_seconds),
+            "max_monitoring_interval_minutes": int(self._max_monitoring_interval_minutes),
+            "configured_threads": int(self._worker_count),
+            "live_threads": int(live_worker_threads),
+            "scanner_alive": bool(scanner is not None and scanner.is_alive()),
+            "queue_length": self._queue.qsize(),
+            "queue_maxsize": self._queue.maxsize(),
+            "inflight_tasks": self._queue.inflight_count(),
+        }
+
     def register_handler(self, statuses: list[str] | tuple[str, ...], handler: StrategyHandler) -> None:
         for status in statuses:
             self._handlers[status] = handler
@@ -154,6 +290,7 @@ class StrategyExecutionEngine:
         with self._start_lock:
             if self._running:
                 return
+            init_db()
             cleared_locks = self._clear_legacy_locks()
             if cleared_locks > 0:
                 self._logger.info("cleared legacy strategy locks count=%s", cleared_locks)
@@ -536,28 +673,782 @@ class StrategyExecutionEngine:
             return True
         return (now - last_emitted_at).total_seconds() >= float(throttle_seconds)
 
+    def _load_contract_payloads(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_id: str,
+        market: str,
+    ) -> tuple[dict[int, dict[str, str]], dict[str, dict[str, str]]]:
+        rows = conn.execute(
+            """
+            SELECT code, contract_id
+            FROM strategy_symbols
+            WHERE strategy_id = ?
+            ORDER BY position ASC, id ASC
+            """,
+            (strategy_id,),
+        ).fetchall()
+        by_contract_id: dict[int, dict[str, str]] = {}
+        by_symbol: dict[str, dict[str, str]] = {}
+        for row in rows:
+            symbol = _normalize_symbol(row["code"])
+            if not symbol:
+                continue
+            payload = {"market": market, "code": symbol}
+            by_symbol.setdefault(symbol, payload)
+            contract_id = _to_int_or_none(row["contract_id"])
+            if contract_id is not None:
+                by_contract_id.setdefault(contract_id, payload)
+        return by_contract_id, by_symbol
+
+    def _resolve_contract_payload(
+        self,
+        *,
+        contract_id: int | None,
+        product_hint: Any,
+        market: str,
+        by_contract_id: dict[int, dict[str, str]],
+        by_symbol: dict[str, dict[str, str]],
+    ) -> dict[str, str] | None:
+        if contract_id is not None:
+            payload = by_contract_id.get(contract_id)
+            if payload is not None:
+                return payload
+        symbol = _normalize_symbol(product_hint)
+        if symbol:
+            return by_symbol.get(symbol, {"market": market, "code": symbol})
+        return None
+
+    def _build_condition_inputs_from_market_data(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_row: sqlite3.Row,
+        initial_last_monitoring_data_end_at: datetime,
+        now: datetime,
+    ) -> tuple[
+        StrategyEvaluationResult,
+        dict[str, Any] | None,
+        dict[tuple[str, int], datetime],
+        bool,
+        datetime | None,
+        bool,
+    ]:
+        provider = self._market_data_provider
+        strategy_id = str(strategy_row["id"])
+        default_metrics = {
+            "evaluation_engine": "skeleton_v1",
+            "evaluated_at": _to_iso_utc(now),
+        }
+
+        try:
+            conditions_raw = json.loads(strategy_row["conditions_json"] or "[]")
+        except json.JSONDecodeError:
+            result = StrategyEvaluationResult(
+                outcome="condition_config_invalid",
+                condition_met=False,
+                decision_reason="condition_config_invalid",
+                metrics={
+                    **default_metrics,
+                    "conditions": 0,
+                    "trigger_policies": [],
+                    "error": "invalid_conditions_json",
+                },
+                condition_states=[],
+            )
+            return result, {"conditions_total": 0, "conditions_with_input": 0, "conditions": []}, {}, True, None, False
+        if not isinstance(conditions_raw, list):
+            result = StrategyEvaluationResult(
+                outcome="condition_config_invalid",
+                condition_met=False,
+                decision_reason="condition_config_invalid",
+                metrics={
+                    **default_metrics,
+                    "conditions": 0,
+                    "trigger_policies": [],
+                    "error": "invalid_conditions_payload",
+                },
+                condition_states=[],
+            )
+            return result, {"conditions_total": 0, "conditions_with_input": 0, "conditions": []}, {}, True, None, False
+        if not conditions_raw:
+            result = StrategyEvaluationResult(
+                outcome="no_conditions_configured",
+                condition_met=False,
+                decision_reason="no_conditions_configured",
+                metrics={
+                    **default_metrics,
+                    "conditions": 0,
+                    "trigger_policies": [],
+                },
+                condition_states=[],
+            )
+            return result, {"conditions_total": 0, "conditions_with_input": 0, "conditions": []}, {}, False, None, False
+
+        if not gateway_is_working():
+            condition_states = []
+            for idx, condition in enumerate(conditions_raw, start=1):
+                condition_dict = condition if isinstance(condition, dict) else {}
+                condition_id = str(condition_dict.get("condition_id") or f"c{idx}")
+                condition_states.append(
+                    ConditionEvaluationState(
+                        condition_id=condition_id,
+                        state="NOT_EVALUATED",
+                        last_evaluated_at=now,
+                    )
+                )
+            result = StrategyEvaluationResult(
+                outcome="gateway_not_work",
+                condition_met=False,
+                decision_reason="gateway_not_work",
+                metrics={
+                    **default_metrics,
+                    "conditions": len(condition_states),
+                    "trigger_policies": [],
+                },
+                condition_states=condition_states,
+            )
+            return (
+                result,
+                {"conditions_total": len(conditions_raw), "conditions_with_input": 0, "conditions": []},
+                {},
+                True,
+                None,
+                False,
+            )
+
+        last_monitoring_data_end_map = self._load_last_monitoring_data_end_map(
+            conn,
+            strategy_id=strategy_id,
+        )
+        market = str(strategy_row["market"] or "").strip().upper()
+        by_contract_id, by_symbol = self._load_contract_payloads(
+            conn,
+            strategy_id=strategy_id,
+            market=market,
+        )
+
+        fetch_cache: dict[tuple[str, str, bool, str], list[HistoricalBar]] = {}
+        summary_conditions: list[dict[str, Any]] = []
+        monitoring_end_updates: dict[tuple[str, int], datetime] = {}
+        has_data_requirements = False
+        has_condition_evaluated = False
+        conditions_with_input = 0
+        condition_states: list[ConditionEvaluationState] = []
+        condition_outcomes: list[str] = []
+        condition_no_new_data_suggestions: list[datetime | None] = []
+        trigger_policies: list[dict[str, Any]] = []
+        condition_logic = str(strategy_row["condition_logic"] or "AND").strip().upper()
+        if condition_logic not in {"AND", "OR"}:
+            condition_logic = "AND"
+        or_short_circuit_from_index: int | None = None
+
+        for idx, item in enumerate(conditions_raw, start=1):
+            condition = item if isinstance(item, dict) else {}
+            condition_summary: dict[str, Any] = {
+                "condition_id": str(condition.get("condition_id") or f"c{idx}"),
+                "status": "waiting",
+                "contracts": [],
+                "input_ready": False,
+            }
+            summary_conditions.append(condition_summary)
+            evaluator = ConditionEvaluator(condition)
+            try:
+                evaluator.prepare()
+            except ValueError as exc:
+                condition_id = str(condition.get("condition_id") or f"c{idx}")
+                result = StrategyEvaluationResult(
+                    outcome="condition_config_invalid",
+                    condition_met=False,
+                    decision_reason="condition_config_invalid",
+                    metrics={
+                        **default_metrics,
+                        "conditions": len(conditions_raw),
+                        "trigger_policies": trigger_policies,
+                        "invalid_condition_id": condition_id,
+                        "error": str(exc),
+                    },
+                    condition_states=[
+                        ConditionEvaluationState(
+                            condition_id=condition_id,
+                            state="NOT_EVALUATED",
+                            last_evaluated_at=now,
+                        )
+                    ],
+                )
+                condition_summary["status"] = "prepare_error"
+                condition_summary["reason"] = str(exc)
+                return (
+                    result,
+                    {
+                        "conditions_total": len(conditions_raw),
+                        "conditions_with_input": conditions_with_input,
+                        "conditions": summary_conditions,
+                    },
+                    {},
+                    True,
+                    None,
+                    False,
+                )
+            prepared = evaluator.prepared
+            if prepared is None:
+                condition_id = str(condition.get("condition_id") or f"c{idx}")
+                result = StrategyEvaluationResult(
+                    outcome="condition_config_invalid",
+                    condition_met=False,
+                    decision_reason="condition_config_invalid",
+                    metrics={
+                        **default_metrics,
+                        "conditions": len(conditions_raw),
+                        "trigger_policies": trigger_policies,
+                        "invalid_condition_id": condition_id,
+                        "error": "prepared_condition_missing",
+                    },
+                    condition_states=[
+                        ConditionEvaluationState(
+                            condition_id=condition_id,
+                            state="NOT_EVALUATED",
+                            last_evaluated_at=now,
+                        )
+                    ],
+                )
+                condition_summary["status"] = "prepare_error"
+                condition_summary["reason"] = "prepared_condition_missing"
+                return (
+                    result,
+                    {
+                        "conditions_total": len(conditions_raw),
+                        "conditions_with_input": conditions_with_input,
+                        "conditions": summary_conditions,
+                    },
+                    {},
+                    True,
+                    None,
+                    False,
+                )
+
+            if prepared.requirement.contracts:
+                has_data_requirements = True
+            trigger_policies.append(
+                {
+                    "condition_id": prepared.condition_id,
+                    "trigger_mode": prepared.trigger_mode,
+                    "evaluation_window": prepared.evaluation_window,
+                    "missing_data_policy": prepared.requirement.missing_data_policy,
+                    "require_time_alignment": prepared.requirement.require_time_alignment,
+                    "contracts": [
+                        {
+                            "contract_id": contract_req.contract_id,
+                            "base_bar": contract_req.base_bar,
+                            "required_points": int(contract_req.required_points),
+                            "include_partial_bar": bool(contract_req.include_partial_bar),
+                            "use_rth": True,
+                        }
+                        for contract_req in prepared.requirement.contracts
+                    ],
+                }
+            )
+
+            metric = prepared.metric
+            basis = str(condition.get("window_price_basis", "CLOSE")).strip().upper() or "CLOSE"
+            values_by_contract: dict[int, list[float]] = {}
+            contracts_obj = condition_summary["contracts"]
+            if not isinstance(contracts_obj, list):
+                contracts_obj = []
+                condition_summary["contracts"] = contracts_obj
+            contracts_summary: list[dict[str, Any]] = contracts_obj
+            condition_summary["condition_id"] = prepared.condition_id
+            condition_summary["metric"] = metric
+            condition_summary["trigger_mode"] = prepared.trigger_mode
+            condition_summary["evaluation_window"] = prepared.evaluation_window
+            condition_summary["status"] = "prepared"
+
+            condition_monitoring_end_updates: dict[tuple[str, int], datetime] = {}
+            condition_has_new_data = False
+            condition_contract_ids: list[int] = []
+            for contract_index, contract_req in enumerate(prepared.requirement.contracts):
+                contract_id = contract_req.contract_id
+                contract_summary: dict[str, Any] = {
+                    "contract_id": contract_id,
+                    "status": "waiting",
+                    "required_points": int(contract_req.required_points),
+                    "include_partial_bar": bool(contract_req.include_partial_bar),
+                    "base_bar": contract_req.base_bar,
+                    "use_rth": True,
+                }
+                contracts_summary.append(contract_summary)
+                if contract_id is None:
+                    contract_summary["status"] = "missing_contract_id"
+                    continue
+                condition_contract_ids.append(contract_id)
+                bar_cfg = _compact_bar_size_to_ib(contract_req.base_bar)
+                if bar_cfg is None:
+                    contract_summary["status"] = "invalid_base_bar"
+                    continue
+                ib_bar_size, bar_delta = bar_cfg
+                contract_summary["bar_size"] = ib_bar_size
+                product_hint = condition.get("product") if contract_index == 0 else condition.get("product_b")
+                payload = self._resolve_contract_payload(
+                    contract_id=contract_id,
+                    product_hint=product_hint,
+                    market=market,
+                    by_contract_id=by_contract_id,
+                    by_symbol=by_symbol,
+                )
+                if payload is None:
+                    contract_summary["status"] = "unresolved_contract"
+                    continue
+                contract_summary["symbol"] = payload["code"]
+
+                lookback_points = max(3, int(contract_req.required_points) + 2)
+                contract_summary["lookback_points"] = lookback_points
+                required_start_time = now - (bar_delta * lookback_points)
+                requirement_last_end_at = self._resolve_requirement_last_monitoring_data_end_at(
+                    last_monitoring_data_end_map=last_monitoring_data_end_map,
+                    condition_id=prepared.condition_id,
+                    contract_id=contract_id,
+                    default_last_monitoring_data_end_at=initial_last_monitoring_data_end_at,
+                )
+                contract_summary["last_monitoring_data_end_at"] = _to_iso_utc(requirement_last_end_at)
+                start_time = requirement_last_end_at if required_start_time > requirement_last_end_at else required_start_time
+                cache_key = (
+                    f"{payload['market']}|{payload['code']}",
+                    ib_bar_size,
+                    bool(contract_req.include_partial_bar),
+                    _to_iso_utc(start_time),
+                )
+                bars = fetch_cache.get(cache_key)
+                contract_summary["from_cache"] = bars is not None
+                if bars is None:
+                    if provider is None:
+                        raise RuntimeError("missing market data provider")
+                    request = HistoricalBarsRequest(
+                        contract=payload,
+                        start_time=start_time,
+                        end_time=now,
+                        bar_size=ib_bar_size,
+                        what_to_show="TRADES",
+                        use_rth=True,
+                        include_partial_bar=bool(contract_req.include_partial_bar),
+                    )
+                    try:
+                        fetch_result = provider.get_historical_bars(request)
+                        bars = list(fetch_result.bars)
+                    except Exception as exc:  # noqa: BLE001
+                        self._logger.debug(
+                            "market data fetch failed strategy_id=%s condition_id=%s contract_id=%s payload=%s error=%s",
+                            strategy_id,
+                            prepared.condition_id or f"c{idx}",
+                            contract_id,
+                            payload,
+                            exc,
+                        )
+                        contract_summary["status"] = "fetch_failed"
+                        contract_summary["error"] = type(exc).__name__
+                        bars = []
+                    fetch_cache[cache_key] = bars
+
+                contract_summary["bars"] = len(bars)
+                latest_non_partial_bar = _latest_non_partial_bar_end_time(
+                    bars,
+                    bar_delta=bar_delta,
+                    now=now,
+                )
+                if latest_non_partial_bar is not None:
+                    contract_summary["last_non_partial_bar_at"] = _to_iso_utc(latest_non_partial_bar)
+                    if latest_non_partial_bar > requirement_last_end_at:
+                        condition_has_new_data = True
+                        contract_summary["has_new_data"] = True
+                        key = (prepared.condition_id, contract_id)
+                        current = condition_monitoring_end_updates.get(key)
+                        if current is None or latest_non_partial_bar > current:
+                            condition_monitoring_end_updates[key] = latest_non_partial_bar
+                    else:
+                        contract_summary["has_new_data"] = False
+                else:
+                    contract_summary["has_new_data"] = False
+
+                series: list[float] = []
+                for bar in bars:
+                    value = _bar_value_for_metric(metric, basis=basis, bar=bar)
+                    if value is not None:
+                        series.append(value)
+                if not series:
+                    if contract_summary["status"] == "waiting":
+                        contract_summary["status"] = "empty_series"
+                    continue
+                values_by_contract[contract_id] = series
+                contract_summary["series_points"] = len(values_by_contract[contract_id])
+                if contract_summary["status"] == "waiting":
+                    contract_summary["status"] = "ready"
+
+            # No fresh non-partial bar for this condition: skip evaluate and mark as condition-level no_new_data.
+            if not condition_has_new_data:
+                condition_summary["status"] = "no_new_data"
+                condition_summary["condition_result"] = "NO_NEW_DATA"
+                next_monitor_at = self._suggest_next_monitor_at_for_contract_ids(
+                    now=now,
+                    contract_ids=condition_contract_ids,
+                )
+                condition_no_new_data_suggestions.append(next_monitor_at)
+                if next_monitor_at is not None:
+                    condition_summary["suggested_next_monitor_at"] = _to_iso_utc(next_monitor_at)
+                condition_states.append(
+                    ConditionEvaluationState(
+                        condition_id=prepared.condition_id,
+                        state="NOT_EVALUATED",
+                        last_evaluated_at=now,
+                    )
+                )
+                condition_outcomes.append("NO_NEW_DATA")
+                continue
+
+            condition_summary["input_ready"] = True
+            conditions_with_input += 1
+            has_condition_evaluated = True
+            points_by_contract: dict[int, int] = {
+                cid: len(series) for cid, series in values_by_contract.items()
+            }
+            required_points_by_contract = {
+                int(contract_req.contract_id): int(contract_req.required_points)
+                for contract_req in prepared.requirement.contracts
+                if contract_req.contract_id is not None
+            }
+            condition_result = evaluator.evaluate(
+                ConditionEvaluationInput(
+                    values_by_contract=values_by_contract,
+                    state_values=None,
+                )
+            )
+            self._logger.info(
+                "condition evaluate condition_id=%s metric=%s trigger_mode=%s evaluation_window=%s "
+                "state=%s reason=%s observed_value=%s points_by_contract=%s required_points_by_contract=%s",
+                prepared.condition_id,
+                prepared.metric,
+                prepared.trigger_mode,
+                prepared.evaluation_window,
+                condition_result.state,
+                condition_result.reason,
+                condition_result.observed_value,
+                points_by_contract,
+                required_points_by_contract,
+            )
+            condition_summary["condition_result"] = condition_result.state
+            condition_summary["status"] = "evaluated"
+            condition_summary["reason"] = condition_result.reason
+
+            if condition_result.state == "WAITING":
+                # WAITING means input still insufficient; keep last_monitoring_data_end_at unchanged for retry.
+                condition_outcomes.append("WAITING")
+                condition_states.append(
+                    ConditionEvaluationState(
+                        condition_id=prepared.condition_id,
+                        state="WAITING",
+                        last_evaluated_at=now,
+                    )
+                )
+                continue
+
+            if condition_result.state == "TRUE":
+                condition_outcomes.append("TRUE")
+            else:
+                condition_outcomes.append("FALSE")
+            condition_states.append(
+                ConditionEvaluationState(
+                    condition_id=prepared.condition_id,
+                    state=condition_result.state,
+                    last_value=condition_result.observed_value,
+                    last_evaluated_at=now,
+                )
+            )
+            # Only TRUE/FALSE outcomes advance last_monitoring_data_end_at.
+            for key, update_ts in condition_monitoring_end_updates.items():
+                current = monitoring_end_updates.get(key)
+                if current is None or update_ts > current:
+                    monitoring_end_updates[key] = update_ts
+            if condition_logic == "OR" and condition_result.state == "TRUE":
+                # OR strategy is already met, remaining conditions can be skipped.
+                condition_summary["short_circuit"] = "or_true_met"
+                or_short_circuit_from_index = idx
+                break
+
+        if or_short_circuit_from_index is not None:
+            for rest_idx, rest_item in enumerate(
+                conditions_raw[or_short_circuit_from_index:],
+                start=or_short_circuit_from_index + 1,
+            ):
+                rest_condition = rest_item if isinstance(rest_item, dict) else {}
+                rest_condition_id = str(rest_condition.get("condition_id") or f"c{rest_idx}")
+                summary_conditions.append(
+                    {
+                        "condition_id": rest_condition_id,
+                        "status": "skipped_or_short_circuit",
+                        "contracts": [],
+                        "input_ready": False,
+                    }
+                )
+                condition_states.append(
+                    ConditionEvaluationState(
+                        condition_id=rest_condition_id,
+                        state="NOT_EVALUATED",
+                    )
+                )
+
+        has_waiting = any(item == "WAITING" for item in condition_outcomes)
+        any_true = any(item == "TRUE" for item in condition_outcomes)
+        any_false = any(item == "FALSE" for item in condition_outcomes)
+        all_true = bool(condition_outcomes) and all(item == "TRUE" for item in condition_outcomes)
+        all_false = bool(condition_outcomes) and all(item == "FALSE" for item in condition_outcomes)
+
+        strategy_outcome = "no_new_data"
+        condition_met = False
+        decision_reason = "no_new_data"
+        if condition_logic == "AND":
+            if any_false:
+                strategy_outcome = "evaluated"
+                decision_reason = "conditions_not_met"
+            elif all_true:
+                strategy_outcome = "evaluated"
+                condition_met = True
+                decision_reason = "conditions_met"
+            elif has_waiting:
+                strategy_outcome = "waiting_for_market_data"
+                decision_reason = "waiting_for_market_data"
+        else:
+            if any_true:
+                strategy_outcome = "evaluated"
+                condition_met = True
+                decision_reason = "conditions_met"
+            elif all_false:
+                strategy_outcome = "evaluated"
+                decision_reason = "conditions_not_met"
+            elif has_waiting:
+                strategy_outcome = "waiting_for_market_data"
+                decision_reason = "waiting_for_market_data"
+
+        suggested_next_monitor_at: datetime | None = None
+        if strategy_outcome == "no_new_data":
+            candidates = [item for item in condition_no_new_data_suggestions if item is not None]
+            if candidates:
+                suggested_next_monitor_at = min(candidates)
+
+        metrics: dict[str, Any] = {
+            **default_metrics,
+            "condition_logic": condition_logic,
+            "conditions": len(condition_states),
+            "trigger_policies": trigger_policies,
+        }
+        if strategy_outcome == "no_new_data":
+            metrics["suggested_next_monitor_at"] = (
+                _to_iso_utc(suggested_next_monitor_at) if suggested_next_monitor_at is not None else None
+            )
+
+        result = StrategyEvaluationResult(
+            outcome=strategy_outcome,
+            condition_met=condition_met,
+            decision_reason=decision_reason,
+            metrics=metrics,
+            condition_states=condition_states,
+        )
+        return (
+            result,
+            {
+                "conditions_total": len(conditions_raw),
+                "conditions_with_input": conditions_with_input,
+                "conditions": summary_conditions,
+            },
+            monitoring_end_updates,
+            has_data_requirements,
+            suggested_next_monitor_at,
+            has_condition_evaluated,
+        )
+
+    def _extract_contract_ids_from_market_data_preparation(
+        self,
+        market_data_preparation: dict[str, Any] | None,
+    ) -> list[int]:
+        if not isinstance(market_data_preparation, dict):
+            return []
+        raw_conditions = market_data_preparation.get("conditions")
+        if not isinstance(raw_conditions, list):
+            return []
+        seen: set[int] = set()
+        out: list[int] = []
+        for condition in raw_conditions:
+            if not isinstance(condition, dict):
+                continue
+            raw_contracts = condition.get("contracts")
+            if not isinstance(raw_contracts, list):
+                continue
+            for contract in raw_contracts:
+                if not isinstance(contract, dict):
+                    continue
+                contract_id = _to_int_or_none(contract.get("contract_id"))
+                if contract_id is None or contract_id in seen:
+                    continue
+                seen.add(contract_id)
+                out.append(contract_id)
+        return out
+
+    def _suggest_next_monitor_at_for_no_new_data(
+        self,
+        *,
+        now: datetime,
+        market_data_preparation: dict[str, Any] | None,
+    ) -> datetime | None:
+        contract_ids = self._extract_contract_ids_from_market_data_preparation(market_data_preparation)
+        return self._suggest_next_monitor_at_for_contract_ids(
+            now=now,
+            contract_ids=contract_ids,
+        )
+
+    def _suggest_next_monitor_at_for_contract_ids(
+        self,
+        *,
+        now: datetime,
+        contract_ids: list[int],
+    ) -> datetime | None:
+        provider = self._market_data_provider
+        if provider is None:
+            return None
+        if not contract_ids:
+            return None
+
+        now_utc = _to_utc(now)
+        in_any_session = False
+        next_start: datetime | None = None
+        for contract_id in contract_ids:
+            try:
+                calendar = provider.get_trading_calendar(
+                    TradingCalendarRequest(
+                        contract_id=contract_id,
+                        as_of_time=now_utc,
+                        use_rth=True,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._logger.debug(
+                    "trading calendar fetch failed contract_id=%s error=%s",
+                    contract_id,
+                    exc,
+                )
+                continue
+            for session in calendar.sessions:
+                session_start = _to_utc(session.start_time)
+                session_end = _to_utc(session.end_time)
+                if session_start <= now_utc < session_end:
+                    in_any_session = True
+                if session_start > now_utc:
+                    if next_start is None or session_start < next_start:
+                        next_start = session_start
+        if in_any_session:
+            return None
+        return next_start
+
+    def _resolve_initial_last_monitoring_data_end_at(
+        self,
+        *,
+        strategy_row: sqlite3.Row,
+    ) -> datetime | None:
+        return (
+            _parse_iso_utc(strategy_row["logical_activated_at"])
+            or _parse_iso_utc(strategy_row["activated_at"])
+        )
+
+    def _load_strategy_run_timing(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_id: str,
+    ) -> tuple[datetime | None, datetime | None]:
+        row = conn.execute(
+            """
+            SELECT suggested_next_monitor_at, updated_at
+            FROM strategy_runs
+            WHERE strategy_id = ?
+            """,
+            (strategy_id,),
+        ).fetchone()
+        if row is None:
+            return None, None
+        return _parse_iso_utc(row["suggested_next_monitor_at"]), _parse_iso_utc(row["updated_at"])
+
+    def _should_skip_active_monitoring_cycle(
+        self,
+        *,
+        now: datetime,
+        suggested_next_monitor_at: datetime | None,
+        updated_at: datetime | None,
+    ) -> bool:
+        if suggested_next_monitor_at is None or updated_at is None:
+            return False
+        now_utc = _to_utc(now)
+        if now_utc >= suggested_next_monitor_at:
+            return False
+        forced_monitor_at = _to_utc(updated_at) + timedelta(minutes=self._max_monitoring_interval_minutes)
+        return now_utc < forced_monitor_at
+
+    def _load_last_monitoring_data_end_map(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_id: str,
+    ) -> dict[str, dict[str, datetime]]:
+        row = conn.execute(
+            """
+            SELECT last_monitoring_data_end_at
+            FROM strategy_runs
+            WHERE strategy_id = ?
+            """,
+            (strategy_id,),
+        ).fetchone()
+        if row is None:
+            return {}
+        raw = row["last_monitoring_data_end_at"]
+        if not isinstance(raw, str) or not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, dict[str, datetime]] = {}
+        for condition_id, by_contract in data.items():
+            if not isinstance(condition_id, str) or not isinstance(by_contract, dict):
+                continue
+            normalized_contracts: dict[str, datetime] = {}
+            for contract_id, raw_ts in by_contract.items():
+                if not isinstance(contract_id, str):
+                    continue
+                parsed = _parse_iso_utc(str(raw_ts))
+                if parsed is None:
+                    continue
+                normalized_contracts[contract_id] = parsed
+            if normalized_contracts:
+                out[condition_id] = normalized_contracts
+        return out
+
+    def _resolve_requirement_last_monitoring_data_end_at(
+        self,
+        *,
+        last_monitoring_data_end_map: dict[str, dict[str, datetime]],
+        condition_id: str,
+        contract_id: int,
+        default_last_monitoring_data_end_at: datetime,
+    ) -> datetime:
+        by_contract = last_monitoring_data_end_map.get(condition_id)
+        if by_contract is None:
+            return default_last_monitoring_data_end_at
+        return by_contract.get(str(contract_id), default_last_monitoring_data_end_at)
+
     def _handle_active(self, conn: sqlite3.Connection, strategy_row: sqlite3.Row, now: datetime) -> None:
         strategy_id = strategy_row["id"]
-        result = evaluate_strategy(strategy_row, now=now)
-        persist_evaluation_result(
-            conn,
-            strategy_id=strategy_id,
-            evaluated_at=now,
-            result=result,
+        initial_last_monitoring_data_end_at = self._resolve_initial_last_monitoring_data_end_at(
+            strategy_row=strategy_row,
         )
-        previous_outcome = self._get_runtime_state(
-            conn,
-            strategy_id=strategy_id,
-            state_key=RUNTIME_KEY_LAST_EVALUATION_OUTCOME,
-        )
-        self._set_runtime_state(
-            conn,
-            strategy_id=strategy_id,
-            state_key=RUNTIME_KEY_LAST_EVALUATION_OUTCOME,
-            state_value=result.outcome,
-            now=now,
-        )
-        if result.outcome == "no_conditions_configured":
+        if initial_last_monitoring_data_end_at is None:
             cursor = conn.execute(
                 """
                 UPDATE strategies
@@ -571,10 +1462,116 @@ class StrategyExecutionEngine:
                     conn,
                     strategy_id=strategy_id,
                     event_type="VERIFY_FAILED",
-                    detail="ACTIVE 阶段评估失败：no_conditions_configured",
+                    detail="ACTIVE 阶段评估失败：missing_activation_time",
                     ts=now,
                 )
             return
+        if self._market_data_provider is None:
+            raise RuntimeError("ACTIVE stage missing market data provider")
+        (
+            previous_suggested_next_monitor_at,
+            previous_updated_at,
+        ) = self._load_strategy_run_timing(
+            conn,
+            strategy_id=strategy_id,
+        )
+        if self._should_skip_active_monitoring_cycle(
+            now=now,
+            suggested_next_monitor_at=previous_suggested_next_monitor_at,
+            updated_at=previous_updated_at,
+        ):
+            self._logger.info(
+                "skip active monitoring strategy_id=%s now=%s suggested_next_monitor_at=%s updated_at=%s max_interval_minutes=%s",
+                strategy_id,
+                _to_iso_utc(now),
+                _to_iso_utc(previous_suggested_next_monitor_at) if previous_suggested_next_monitor_at else None,
+                _to_iso_utc(previous_updated_at) if previous_updated_at else None,
+                self._max_monitoring_interval_minutes,
+            )
+            return
+
+        (
+            result,
+            market_data_preparation,
+            monitoring_end_updates,
+            has_data_requirements,
+            suggested_next_monitor_at,
+            has_condition_evaluated,
+        ) = self._build_condition_inputs_from_market_data(
+            conn,
+            strategy_row=strategy_row,
+            initial_last_monitoring_data_end_at=initial_last_monitoring_data_end_at,
+            now=now,
+        )
+        if not has_data_requirements:
+            cursor = conn.execute(
+                """
+                UPDATE strategies
+                SET status = 'VERIFY_FAILED', updated_at = ?, version = version + 1
+                WHERE id = ? AND status = 'ACTIVE' AND is_deleted = 0
+                """,
+                (_to_iso_utc(now), strategy_id),
+            )
+            if cursor.rowcount > 0:
+                self._append_event(
+                    conn,
+                    strategy_id=strategy_id,
+                    event_type="VERIFY_FAILED",
+                    detail="ACTIVE 阶段评估失败：missing_data_requirements",
+                    ts=now,
+                )
+            return
+        evaluated_at_for_store: datetime | None = _utcnow() if has_condition_evaluated else None
+        self._logger.info(
+            "strategy evaluate strategy_id=%s outcome=%s condition_met=%s decision_reason=%s conditions=%s",
+            strategy_id,
+            result.outcome,
+            result.condition_met,
+            result.decision_reason,
+            len(result.condition_states),
+        )
+        if market_data_preparation is not None:
+            result.metrics["market_data_preparation"] = market_data_preparation
+        persist_evaluation_result(
+            conn,
+            strategy_id=strategy_id,
+            updated_at=now,
+            evaluated_at=evaluated_at_for_store,
+            initial_last_monitoring_data_end_at=initial_last_monitoring_data_end_at,
+            monitoring_end_updates=monitoring_end_updates,
+            suggested_next_monitor_at=suggested_next_monitor_at,
+            result=result,
+        )
+        if result.outcome == "no_new_data" and suggested_next_monitor_at is not None:
+            prev_iso = (
+                _to_iso_utc(previous_suggested_next_monitor_at)
+                if previous_suggested_next_monitor_at is not None
+                else None
+            )
+            next_iso = _to_iso_utc(suggested_next_monitor_at)
+            if prev_iso != next_iso:
+                self._append_event(
+                    conn,
+                    strategy_id=strategy_id,
+                    event_type="MONITOR_SCHEDULED",
+                    detail=(
+                        "no_new_data 且当前非交易时段，"
+                        f"suggested_next_monitor_at: {prev_iso or 'NULL'} -> {next_iso}"
+                    ),
+                    ts=now,
+                )
+        previous_outcome = self._get_runtime_state(
+            conn,
+            strategy_id=strategy_id,
+            state_key=RUNTIME_KEY_LAST_EVALUATION_OUTCOME,
+        )
+        self._set_runtime_state(
+            conn,
+            strategy_id=strategy_id,
+            state_key=RUNTIME_KEY_LAST_EVALUATION_OUTCOME,
+            state_value=result.outcome,
+            now=now,
+        )
         if result.outcome == "condition_config_invalid":
             cursor = conn.execute(
                 """
@@ -671,6 +1668,10 @@ class StrategyExecutionEngine:
     def _handle_verifying(self, conn: sqlite3.Connection, strategy_row: sqlite3.Row, now: datetime) -> None:
         strategy_id = strategy_row["id"]
         now_iso = _to_iso_utc(now)
+        conn.execute(
+            "DELETE FROM strategy_runs WHERE strategy_id = ?",
+            (strategy_id,),
+        )
         verification_result = run_activation_verification(
             conn,
             strategy_id=strategy_id,
@@ -756,15 +1757,18 @@ class StrategyExecutionEngine:
 
 def build_execution_engine_from_config() -> StrategyExecutionEngine:
     worker_cfg = load_app_config().worker
+    market_data_provider = _build_worker_market_data_provider()
     return StrategyExecutionEngine(
         enabled=worker_cfg.enabled,
         monitor_interval_seconds=worker_cfg.monitor_interval_seconds,
+        max_monitoring_interval_minutes=worker_cfg.max_monitoring_interval_minutes,
         worker_count=worker_cfg.threads,
         queue_maxsize=worker_cfg.queue_maxsize,
         gateway_not_work_event_throttle_seconds=worker_cfg.gateway_not_work_event_throttle_seconds,
         waiting_for_market_data_event_throttle_seconds=(
             worker_cfg.waiting_for_market_data_event_throttle_seconds
         ),
+        market_data_provider=market_data_provider,
     )
 
 

@@ -229,6 +229,19 @@ class TradeActionRuntime(BaseModel):
     last_error: str | None = None
 
 
+class StrategyRunSummaryOut(BaseModel):
+    # Snapshot of the single strategy_runs row used by the detail page.
+    first_evaluated_at: datetime
+    evaluated_at: datetime
+    suggested_next_monitor_at: datetime | None = None
+    condition_met: bool
+    decision_reason: str
+    last_outcome: str
+    run_count: int
+    last_monitoring_data_end_at: dict[str, dict[str, str]] = Field(default_factory=dict)
+    updated_at: datetime
+
+
 class NextStrategyProjection(BaseModel):
     id: str
     description: str | None = None
@@ -274,6 +287,7 @@ class StrategyDetailOut(BaseModel):
     trade_action_runtime: TradeActionRuntime
     next_strategy: NextStrategyProjection | None = None
     upstream_strategy: NextStrategyProjection | None = None
+    strategy_run: StrategyRunSummaryOut | None = None
 
     anchor_price: float | None = None
     events: list[EventLogItem] = Field(default_factory=list)
@@ -311,6 +325,7 @@ class StrategyBasicPatchIn(BaseModel):
     trade_type: StrategyTradeType | None = None
     symbols: list[StrategySymbolItem] | None = None
     upstream_only_activation: bool | None = None
+    logical_activated_at: datetime | None = None
     expire_mode: Literal["relative", "absolute"] | None = None
     expire_in_seconds: int | None = None
     expire_at: datetime | None = None
@@ -371,3 +386,103 @@ class TradeLogOut(BaseModel):
     stage: str
     result: str
     detail: str
+
+
+class MarketDataProbeIn(BaseModel):
+    code: str
+    market: str = "US_STOCK"
+    contract_month: str | None = None
+    start_time: datetime
+    end_time: datetime
+    bar_size: str = "1 min"
+    what_to_show: str = "TRADES"
+    use_rth: bool = True
+    include_partial_bar: bool = True
+    max_bars: int | None = 200
+    page_size: int | None = 500
+
+    @field_validator("code", "market", "bar_size", "what_to_show", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("field cannot be empty")
+        return text
+
+    @field_validator("contract_month", mode="before")
+    @classmethod
+    def normalize_contract_month(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @model_validator(mode="after")
+    def validate_time_and_limits(self) -> "MarketDataProbeIn":
+        if self.start_time >= self.end_time:
+            raise ValueError("start_time must be earlier than end_time")
+        if self.max_bars is not None and self.max_bars <= 0:
+            raise ValueError("max_bars must be positive")
+        if self.page_size is not None and self.page_size <= 0:
+            raise ValueError("page_size must be positive")
+        return self
+
+
+class MarketDataBarOut(BaseModel):
+    ts: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float | None = None
+    wap: float | None = None
+    count: int | None = None
+
+
+class MarketDataProbeOut(BaseModel):
+    provider_class: str
+    request: dict[str, Any] = Field(default_factory=dict)
+    bars: list[MarketDataBarOut] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class MarketProfileOut(BaseModel):
+    market: str
+    sec_type: str
+    exchange: str
+    currency: str
+    allowed_trade_types: list[str] = Field(default_factory=list)
+
+
+class SystemGatewayStatusOut(BaseModel):
+    trading_mode: Literal["paper", "live"]
+    host: str
+    api_port: int
+    paper_port: int
+    live_port: int
+    account_code: str | None = None
+
+
+class SystemProviderStatusOut(BaseModel):
+    configured: str
+    runtime_class: str | None = None
+    runtime_mode: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class SystemWorkerStatusOut(BaseModel):
+    enabled: bool
+    running: bool
+    monitor_interval_seconds: int
+    configured_threads: int
+    live_threads: int
+    scanner_alive: bool
+    queue_length: int
+    queue_maxsize: int
+    inflight_tasks: int
+
+
+class SystemStatusOut(BaseModel):
+    gateway: SystemGatewayStatusOut
+    worker: SystemWorkerStatusOut
+    providers: dict[str, SystemProviderStatusOut]

@@ -12,15 +12,13 @@ from fastapi import HTTPException
 
 from .db import get_connection, init_db
 from .broker_provider_registry import (
-    close_shared_broker_data_provider,
+    get_broker_data_provider,
+    close_broker_data_runtime,
 )
 from .ib_data_service import (
     AccountSnapshot,
     IBDataServiceError,
-    IBDataService,
-    build_broker_data_provider_from_config,
 )
-from .ib_session_manager import close_ib_session_manager
 from .market_config import resolve_market_profile
 from .models import (
     ActiveTradeInstructionOut,
@@ -38,6 +36,7 @@ from .models import (
     StrategyConditionsPutIn,
     StrategyCreateIn,
     StrategyDetailOut,
+    StrategyRunSummaryOut,
     StrategyStatus,
     StrategySummaryOut,
     StrategySymbolItem,
@@ -230,10 +229,8 @@ class SQLiteStore:
         return get_connection()
 
     def _load_broker_snapshot(self) -> AccountSnapshot:
-        provider = build_broker_data_provider_from_config()
+        provider = get_broker_data_provider()
         try:
-            if isinstance(provider, IBDataService):
-                return provider.get_account_snapshot()
             return provider.get_account_snapshot()
         except (IBDataServiceError, ValueError, RuntimeError, TimeoutError) as exc:
             _LOGGER.exception("Failed to load broker snapshot from provider=%s", provider.__class__.__name__)
@@ -247,14 +244,6 @@ class SQLiteStore:
             if not detail:
                 detail = exc.__class__.__name__
             raise HTTPException(status_code=502, detail=f"broker_data unavailable: {detail}") from exc
-        finally:
-            if not isinstance(provider, IBDataService):
-                disconnect = getattr(provider, "disconnect", None)
-                if callable(disconnect):
-                    try:
-                        disconnect()
-                    except Exception:
-                        pass
 
     def _get_strategy_row(
         self,
@@ -517,6 +506,55 @@ class SQLiteStore:
             for r in rows
         ]
 
+    def _load_strategy_run_summary(
+        self,
+        conn: sqlite3.Connection,
+        strategy_id: str,
+    ) -> StrategyRunSummaryOut | None:
+        # strategy_runs is optional at rest; it appears after runtime evaluation creates it.
+        row = conn.execute(
+            """
+            SELECT
+                first_evaluated_at,
+                evaluated_at,
+                suggested_next_monitor_at,
+                condition_met,
+                decision_reason,
+                last_outcome,
+                run_count,
+                last_monitoring_data_end_at,
+                updated_at
+            FROM strategy_runs
+            WHERE strategy_id = ?
+            """,
+            (strategy_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        raw_monitoring_end = row["last_monitoring_data_end_at"]
+        monitoring_end_map: dict[str, dict[str, str]] = {}
+        if isinstance(raw_monitoring_end, str) and raw_monitoring_end.strip():
+            try:
+                # Keep detail API resilient even if historical rows contain malformed JSON.
+                payload = json.loads(raw_monitoring_end)
+                if isinstance(payload, dict):
+                    monitoring_end_map = payload
+            except json.JSONDecodeError:
+                monitoring_end_map = {}
+
+        return StrategyRunSummaryOut(
+            first_evaluated_at=parse_iso(row["first_evaluated_at"]) or utcnow(),
+            evaluated_at=parse_iso(row["evaluated_at"]) or utcnow(),
+            suggested_next_monitor_at=parse_iso(row["suggested_next_monitor_at"]),
+            condition_met=bool(row["condition_met"]),
+            decision_reason=row["decision_reason"],
+            last_outcome=row["last_outcome"],
+            run_count=int(row["run_count"]),
+            last_monitoring_data_end_at=monitoring_end_map,
+            updated_at=parse_iso(row["updated_at"]) or utcnow(),
+        )
+
     def _effective_expire_at(self, row: sqlite3.Row) -> datetime | None:
         explicit = parse_iso(row["expire_at"])
         if explicit is not None:
@@ -589,6 +627,7 @@ class SQLiteStore:
                 conn,
                 upstream_strategy_id=row["upstream_strategy_id"],
             ),
+            strategy_run=self._load_strategy_run_summary(conn, strategy_id),
             anchor_price=row["anchor_price"],
             events=self._load_events(conn, strategy_id),
             created_at=parse_iso(row["created_at"]) or utcnow(),
@@ -891,6 +930,13 @@ class SQLiteStore:
             expire_in_seconds = (
                 payload.expire_in_seconds if "expire_in_seconds" in fields_set else row["expire_in_seconds"]
             )
+            logical_activated_at = (
+                to_iso(payload.logical_activated_at)
+                if "logical_activated_at" in fields_set and payload.logical_activated_at is not None
+                else None
+                if "logical_activated_at" in fields_set
+                else row["logical_activated_at"]
+            )
             expire_at = row["expire_at"]
             if expire_mode == "relative":
                 expire_at = None
@@ -903,6 +949,7 @@ class SQLiteStore:
                 UPDATE strategies
                 SET description = ?, market = ?, sec_type = ?, exchange = ?, currency = ?, trade_type = ?,
                     upstream_only_activation = ?,
+                    logical_activated_at = ?,
                     expire_mode = ?, expire_in_seconds = ?, expire_at = ?, updated_at = ?,
                     version = version + 1
                 WHERE id = ?
@@ -915,6 +962,7 @@ class SQLiteStore:
                     market_profile.currency,
                     next_trade_type,
                     upstream_only_activation,
+                    logical_activated_at,
                     expire_mode,
                     expire_in_seconds,
                     expire_at,
@@ -1355,8 +1403,7 @@ class SQLiteStore:
 
     def shutdown(self) -> None:
         with self._lock:
-            close_shared_broker_data_provider()
-            close_ib_session_manager()
+            close_broker_data_runtime()
 
 
 store = SQLiteStore()
