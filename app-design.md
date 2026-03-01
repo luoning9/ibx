@@ -46,7 +46,7 @@ flowchart LR
     E --> F[Risk Engine]
     F --> G[Verification Engine]
     G --> H[Execution Engine]
-    H --> I[IB Adapter ib_insync]
+    H --> I[IB Adapter ib_async]
     I --> J[IB Gateway]
     J --> K[IBKR]
     I --> L[Order/Fill Events]
@@ -215,6 +215,11 @@ flowchart LR
 - `FUT_ROLL` 作为执行层内部工作流处理“先平后开”，不单独拆分模块（R4.8）。
 - 订阅并回写订单/成交状态（R4.4）。
 
+IB 会话循环约束（实现说明）：
+- 服务端 IB 会话线程不调用 `ib_async.util.patchAsyncio()`。
+- 原因：该补丁面向 Notebook 嵌套事件循环场景；在 `uvloop` 下不兼容且会产生持续告警日志。
+- 当前方案：每个 IB 会话线程显式创建并绑定独立 event loop，按队列串行执行请求。
+
 ---
 
 ## 5. 数据模型（最小实现）
@@ -302,13 +307,14 @@ flowchart LR
 ### 5.4 `orders`
 - `id`, `strategy_id`, `ib_order_id`, `status`, `qty`, `avg_fill_price`, `filled_qty`, `error_message`, `created_at`, `updated_at`
 
-### 5.5 `verification_events`
-- `id`, `strategy_id`, `rule_id`, `rule_version`, `passed`, `reason`, `order_snapshot_json`, `created_at`
+### 5.5 `strategy_runs`
+- `id`, `strategy_id`（唯一）
+- `last_monitoring_data_end_at`（JSON：`condition_id -> contract_id -> base_bar -> ts`；各 key 初值为 `logical_activated_at`）
+- `first_evaluated_at`, `evaluated_at`（最近一次评估时间）
+- `condition_met`, `decision_reason`, `last_outcome`, `metrics_json`
+- `check_count`, `updated_at`
 
-### 5.6 `strategy_runs`
-- `id`, `strategy_id`, `evaluated_at`, `condition_met`, `decision_reason`, `metrics_json`
-
-### 5.7 `condition_states`（读模型，可选）
+### 5.6 `condition_states`（读模型，可选）
 - `id`, `strategy_id`, `condition_id`, `state`, `last_value`, `last_evaluated_at`, `updated_at`
 - `state`：`TRUE` / `FALSE` / `WAITING` / `NOT_EVALUATED`
 - 用于详情页“条件是否满足”与“条件组状态”快速读取（R4.13）

@@ -1022,7 +1022,7 @@ def persist_evaluation_result(
                 condition_met = ?,
                 decision_reason = ?,
                 last_outcome = ?,
-                run_count = run_count + 1,
+                check_count = check_count + 1,
                 metrics_json = ?,
                 updated_at = ?
             WHERE strategy_id = ?
@@ -1051,7 +1051,7 @@ def persist_evaluation_result(
                 condition_met,
                 decision_reason,
                 last_outcome,
-                run_count,
+                check_count,
                 metrics_json,
                 updated_at
             )
