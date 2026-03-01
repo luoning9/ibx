@@ -237,7 +237,7 @@ class StrategyRunSummaryOut(BaseModel):
     condition_met: bool
     decision_reason: str
     last_outcome: str
-    run_count: int
+    check_count: int
     last_monitoring_data_end_at: dict[str, dict[str, str]] = Field(default_factory=dict)
     updated_at: datetime
 
@@ -331,6 +331,10 @@ class StrategyBasicPatchIn(BaseModel):
     expire_at: datetime | None = None
 
 
+class StrategyDescriptionOut(BaseModel):
+    description: str
+
+
 class StrategyConditionsPutIn(BaseModel):
     condition_logic: Literal["AND", "OR"] = "AND"
     conditions: list[ConditionItem] = Field(default_factory=list)
@@ -346,6 +350,44 @@ class ControlResponse(BaseModel):
     strategy_id: str
     status: StrategyStatus
     message: str
+    updated_at: datetime
+
+
+TradeRecoveryAction = Literal["reconcile", "retry_dispatch", "mark_failed"]
+
+
+class TradeRecoveryIn(BaseModel):
+    action: TradeRecoveryAction = "reconcile"
+    order_id: int | None = None
+    perm_id: int | None = None
+    order_ref: str | None = None
+    reason: str | None = None
+
+    @field_validator("order_id", "perm_id")
+    @classmethod
+    def validate_positive_ids(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("must be a positive integer")
+        return value
+
+    @field_validator("order_ref", "reason", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+
+class TradeRecoveryOut(BaseModel):
+    trade_id: str
+    strategy_id: str
+    trade_status: str
+    strategy_status: StrategyStatus
+    message: str
+    order_id: int | None = None
+    perm_id: int | None = None
+    ib_order_id: str | None = None
     updated_at: datetime
 
 
@@ -374,9 +416,68 @@ class ActiveTradeInstructionOut(BaseModel):
     updated_at: datetime
     strategy_id: str
     trade_id: str
+    perm_id: int | None = None
+    order_count: int = 0
+    filled_order_count: int = 0
     instruction_summary: str
     status: str
     expire_at: datetime | None = None
+
+
+class TradeOrderLegOut(BaseModel):
+    leg_index: int
+    con_id: int | None = None
+    symbol: str | None = None
+    contract_month: str | None = None
+    side: str
+    ratio: float = 1.0
+    exchange: str | None = None
+
+
+class TradeOrderOut(BaseModel):
+    id: str
+    trade_id: str
+    strategy_id: str
+    leg_role: str
+    sequence_no: int
+    ib_order_id: str | None = None
+    status: str
+    qty: float
+    avg_fill_price: float | None = None
+    filled_qty: float
+    error_message: str | None = None
+    order_payload: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
+    legs: list[TradeOrderLegOut] = Field(default_factory=list)
+
+
+class OtherOpenOrderOut(BaseModel):
+    updated_at: datetime | None = None
+    perm_id: int
+    order_id: int | None = None
+    can_cancel: bool = False
+    client_id: int | None = None
+    trade_service_client_id: int | None = None
+    symbol: str
+    sec_type: str
+    side: str
+    order_type: str
+    quantity: float
+    status: str
+    filled_qty: float
+    remaining_qty: float
+    avg_fill_price: float | None = None
+    account_code: str | None = None
+
+
+class OpenOrderCancelOut(BaseModel):
+    perm_id: int
+    order_id: int | None = None
+    status: str
+    terminal: bool
+    message: str
+    updated_at: datetime
 
 
 class TradeLogOut(BaseModel):

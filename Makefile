@@ -1,4 +1,4 @@
-.PHONY: check check-paper check-live check-both portfolio api api-dev test-api init-db seed-sample
+.PHONY: check check-paper check-live check-both check-market-data check-trade portfolio api api-dev test-api init-db seed-sample
 
 PAPER_PORT := 4002
 LIVE_PORT := 4001
@@ -25,6 +25,20 @@ check-both:
 	$(MAKE) check-paper
 	$(MAKE) check-live
 
+# 检查 market data：真实通过 IB 拉取固定标的历史K线（AAPL 1 day）
+check-market-data:
+	$(PYTHON) scripts/get_latest_bar.py \
+		--code "AAPL" \
+		--market "US_STOCK" \
+		--bar-size "1 day" \
+		--lookback-bars 7 \
+		--page-size 500 \
+		--no-cache
+
+# 检查 trade：通过 IBOrderService 查询当前活动订单（默认使用 cli client id）
+check-trade:
+	$(PYTHON) scripts/check_trade.py
+
 # 查看当前资产组合
 portfolio:
 	$(PYTHON) scripts/list_portfolio.py
@@ -47,4 +61,6 @@ init-db:
 
 # 灌入干净样本数据（先清空业务数据，再写入 SMP-*）
 seed-sample:
+	rm -f data/ibx.sqlite3 data/ibx.sqlite3-shm data/ibx.sqlite3-wal
+	rm -f data/logs/*.log
 	$(PYTHON) scripts/seed_sample_data.py

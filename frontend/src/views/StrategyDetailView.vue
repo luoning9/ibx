@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { ArrowDown, ArrowUp, CaretRight, CloseBold, Link, RefreshRight, VideoPause } from '@element-plus/icons-vue'
+import { CaretRight, CloseBold, Link, RefreshRight, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { LocationQueryRaw } from 'vue-router'
 
 import {
   activateStrategy,
   cancelStrategy,
+  fetchGeneratedStrategyDescription,
   fetchStrategyDetail,
+  patchStrategyBasic,
   pauseStrategy,
   resumeStrategy,
 } from '../api/services'
@@ -22,7 +24,10 @@ const router = useRouter()
 const detail = ref<StrategyDetail | null>(null)
 const loading = ref(false)
 const error = ref('')
-const logCollapsed = ref(false)
+const generatedDescription = ref('')
+const descriptionEditing = ref(false)
+const descriptionDraft = ref('')
+const descriptionEditWrapRef = ref<HTMLElement | null>(null)
 
 const strategyId = computed(() => String(route.params.id || ''))
 type ConditionViewItem = {
@@ -38,16 +43,88 @@ type FollowupField = {
   value: string
 }
 
+async function applyGeneratedDescriptionIfEmpty(data: StrategyDetail) {
+  generatedDescription.value = ''
+  if (String(data.description || '').trim()) {
+    return data
+  }
+  try {
+    const generated = await fetchGeneratedStrategyDescription(data.id)
+    const generatedText = String(generated.description || '').trim()
+    generatedDescription.value = generatedText
+    if (generatedText) {
+      return {
+        ...data,
+        description: generatedText,
+      }
+    }
+  } catch {
+    generatedDescription.value = ''
+  }
+  return data
+}
+
 async function loadDetail() {
   if (!strategyId.value) return
   loading.value = true
   error.value = ''
   try {
-    detail.value = await fetchStrategyDetail(strategyId.value)
+    const data = await fetchStrategyDetail(strategyId.value)
+    detail.value = await applyGeneratedDescriptionIfEmpty(data)
   } catch (err) {
     error.value = `加载策略详情失败：${String(err)}`
   } finally {
     loading.value = false
+  }
+}
+
+const displayDescription = computed(() => {
+  const explicit = String(detail.value?.description || '').trim()
+  if (explicit) return explicit
+  const generated = String(generatedDescription.value || '').trim()
+  return generated || '-'
+})
+
+function startDescriptionEdit() {
+  const current = detail.value
+  if (!current) return
+  if (!current.editable) {
+    ElMessage.warning(current.editable_reason || '当前状态不可编辑描述')
+    return
+  }
+  descriptionDraft.value = String(current.description || '').trim()
+  descriptionEditing.value = true
+}
+
+function cancelDescriptionEdit() {
+  descriptionEditing.value = false
+  descriptionDraft.value = ''
+}
+
+function handleDocumentMouseDown(event: MouseEvent) {
+  if (!descriptionEditing.value) return
+  const wrap = descriptionEditWrapRef.value
+  if (!wrap) return
+  const target = event.target
+  if (target instanceof Node && wrap.contains(target)) return
+  cancelDescriptionEdit()
+}
+
+async function submitDescriptionEdit() {
+  const current = detail.value
+  if (!current) return
+  const nextDescription = String(descriptionDraft.value || '').trim()
+  if (nextDescription === String(current.description || '').trim()) {
+    descriptionEditing.value = false
+    return
+  }
+  try {
+    const updated = await patchStrategyBasic(current.id, { description: nextDescription })
+    detail.value = await applyGeneratedDescriptionIfEmpty(updated)
+    descriptionEditing.value = false
+    ElMessage.success('描述已更新')
+  } catch (err) {
+    error.value = toActionError('更新描述', err)
   }
 }
 
@@ -358,8 +435,9 @@ function goEditActions() {
   router.push(`/strategies/${strategyId.value}/edit/actions`)
 }
 
-function toggleLogCollapsed() {
-  logCollapsed.value = !logCollapsed.value
+function openRunningLogs() {
+  if (!strategyId.value) return
+  router.push({ path: '/events', query: { strategy_id: strategyId.value } })
 }
 
 function scrollToSection(section: 'conditions' | 'actions') {
@@ -393,7 +471,13 @@ watch(
 )
 
 watch(strategyId, loadDetail)
-onMounted(loadDetail)
+onMounted(() => {
+  void loadDetail()
+  document.addEventListener('mousedown', handleDocumentMouseDown, true)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('mousedown', handleDocumentMouseDown, true)
+})
 </script>
 
 <template>
@@ -424,10 +508,30 @@ onMounted(loadDetail)
                 </el-button>
               </div>
             </div>
-            <span class="detail-description">{{ detail?.description || '-' }}</span>
+            <div ref="descriptionEditWrapRef" class="detail-description-wrap">
+              <el-input
+                v-if="descriptionEditing"
+                v-model="descriptionDraft"
+                size="small"
+                class="detail-description-input"
+                autofocus
+                maxlength="300"
+                @keydown.enter.prevent="submitDescriptionEdit"
+                @keydown.esc.prevent="cancelDescriptionEdit"
+              />
+              <span
+                v-else
+                class="detail-description"
+                title="双击编辑，回车提交"
+                @dblclick="startDescriptionEdit"
+              >
+                {{ displayDescription }}
+              </span>
+            </div>
           </div>
           <el-space>
             <el-button size="small" @click="loadDetail">刷新</el-button>
+            <el-button size="small" @click="openRunningLogs">运行日志</el-button>
             <el-button size="small" @click="router.push('/strategies')">返回列表</el-button>
           </el-space>
         </div>
@@ -463,6 +567,9 @@ onMounted(loadDetail)
               </el-descriptions-item>
               <el-descriptions-item label="activated_at">
                 {{ formatIsoDateTime(detail.activated_at) }}
+                <template v-if="detail.logical_activated_at">
+                  （logical: {{ formatIsoDateTime(detail.logical_activated_at) }}）
+                </template>
               </el-descriptions-item>
               <el-descriptions-item label="expire_at">
                 {{ formatIsoDateTime(detail.expire_at) }}
@@ -532,37 +639,50 @@ onMounted(loadDetail)
       </el-skeleton>
     </el-card>
 
-    <el-card shadow="never" class="log-card-muted">
+    <!-- Runtime snapshot from strategy_runs, shown right after base strategy info. -->
+    <el-card shadow="never">
       <template #header>
         <div class="card-header-row">
-          <span class="card-title">运行日志</span>
-          <el-space>
-            <span class="card-tools">最近 {{ detail?.events?.length || 0 }} 条</span>
-            <el-button
-              class="log-toggle-btn"
-              size="small"
-              circle
-              :icon="logCollapsed ? ArrowDown : ArrowUp"
-              :title="logCollapsed ? '展开日志' : '收起日志'"
-              :aria-label="logCollapsed ? '展开日志' : '收起日志'"
-              @click="toggleLogCollapsed"
-            />
-          </el-space>
+          <span class="card-title">strategy_runs</span>
+          <span class="card-tools">运行时记录</span>
         </div>
       </template>
-      <el-table
-        v-if="detail && !logCollapsed"
-        :data="detail.events"
-        size="small"
-        :max-height="260"
-        v-loading="loading"
-      >
-        <el-table-column label="时间" width="180">
-          <template #default="{ row }">{{ formatIsoDateTime(row.timestamp) }}</template>
-        </el-table-column>
-        <el-table-column prop="event_type" label="事件类型" width="160" />
-        <el-table-column prop="detail" label="详情" min-width="360" />
-      </el-table>
+      <template v-if="detail?.strategy_run">
+        <el-descriptions :column="2" size="small" border>
+          <el-descriptions-item label="first_evaluated_at">
+            {{ formatIsoDateTime(detail.strategy_run.first_evaluated_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="evaluated_at">
+            {{ formatIsoDateTime(detail.strategy_run.evaluated_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="suggested_next_monitor_at">
+            {{ formatIsoDateTime(detail.strategy_run.suggested_next_monitor_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="updated_at">
+            {{ formatIsoDateTime(detail.strategy_run.updated_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="check_count">
+            {{ detail.strategy_run.check_count }}
+          </el-descriptions-item>
+          <el-descriptions-item label="condition_met">
+            {{ detail.strategy_run.condition_met ? 'true' : 'false' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="last_outcome">
+            {{ detail.strategy_run.last_outcome }}
+          </el-descriptions-item>
+          <el-descriptions-item label="decision_reason">
+            {{ detail.strategy_run.decision_reason }}
+          </el-descriptions-item>
+        </el-descriptions>
+        <!-- Keep nested monitoring-end map visible for debugging condition data windows. -->
+        <details class="strategy-run-raw-details">
+          <summary>查看 last_monitoring_data_end_at</summary>
+          <pre class="json-box raw-json-box">{{ pretty(detail.strategy_run.last_monitoring_data_end_at) }}</pre>
+        </details>
+      </template>
+      <div v-else class="strategy-run-empty">
+        暂无 strategy_runs 记录（运行后自动生成）
+      </div>
     </el-card>
 
     <el-card id="conditions-section" shadow="never">
@@ -805,6 +925,7 @@ onMounted(loadDetail)
 }
 
 .detail-header-main {
+  flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -845,6 +966,8 @@ onMounted(loadDetail)
 }
 
 .detail-description {
+  display: block;
+  width: 100%;
   margin-top: 4px;
   color: #9fb0c3;
   font-size: 13px;
@@ -852,6 +975,17 @@ onMounted(loadDetail)
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: text;
+}
+
+.detail-description-wrap {
+  width: 100%;
+  margin-top: 4px;
+  min-height: 24px;
+}
+
+.detail-description-input {
+  width: 100%;
 }
 
 .json-box {
@@ -1056,6 +1190,23 @@ onMounted(loadDetail)
   margin-top: 8px;
 }
 
+.strategy-run-empty {
+  text-align: center;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  padding: 8px 0;
+}
+
+.strategy-run-raw-details {
+  margin-top: 10px;
+}
+
+.strategy-run-raw-details summary {
+  cursor: pointer;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
 .conditions-empty {
   text-align: center;
   color: var(--el-text-color-secondary);
@@ -1192,45 +1343,6 @@ onMounted(loadDetail)
   cursor: pointer;
   color: var(--el-text-color-secondary);
   font-size: 12px;
-}
-
-.log-card-muted {
-  border-color: var(--el-border-color-darker);
-}
-
-.log-card-muted :deep(.el-card__body) {
-  background: var(--el-fill-color-darker);
-}
-
-.log-card-muted :deep(.el-table),
-.log-card-muted :deep(.el-table__inner-wrapper),
-.log-card-muted :deep(.el-table tr),
-.log-card-muted :deep(.el-table td.el-table__cell) {
-  background: transparent;
-  color: var(--el-text-color-regular);
-}
-
-.log-card-muted :deep(.el-table th.el-table__cell) {
-  background: var(--el-fill-color-dark);
-  color: var(--el-text-color-primary);
-}
-
-.log-card-muted :deep(.el-table th.el-table__cell),
-.log-card-muted :deep(.el-table td.el-table__cell) {
-  border-bottom-color: var(--el-border-color-darker);
-}
-
-.log-card-muted :deep(.el-table .cell) {
-  color: inherit;
-}
-
-.log-toggle-btn {
-  color: var(--el-text-color-regular);
-}
-
-.log-toggle-btn.el-button.is-circle {
-  width: 28px;
-  height: 28px;
 }
 
 @media (max-width: 900px) {

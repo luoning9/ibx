@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.config import clear_app_config_cache
 from app.db import get_connection, init_db
@@ -167,6 +168,60 @@ class _FakeMarketDataProvider:
                 )
             )
         return TradingCalendarResult(sessions=sessions, meta={"source": "TEST"})
+
+
+class _FakeOrderService:
+    def __init__(
+        self,
+        *,
+        normalized_status: str = "ORDER_SUBMITTED",
+        order_id: int = 2812,
+        perm_id: int = 91001,
+        filled_qty: float = 0.0,
+        remaining_qty: float = 1.0,
+        avg_fill_price: float | None = None,
+        poll_snapshot: object | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.normalized_status = normalized_status
+        self.order_id = order_id
+        self.perm_id = perm_id
+        self.filled_qty = filled_qty
+        self.remaining_qty = remaining_qty
+        self.avg_fill_price = avg_fill_price
+        self.poll_snapshot = poll_snapshot
+        self.error = error
+        self.calls: list[dict[str, object]] = []
+        self.poll_calls: list[dict[str, object]] = []
+
+    def submit_trade_action(self, *, trade_action: dict[str, object], order_ref: str | None = None):  # type: ignore[no-untyped-def]
+        self.calls.append({"trade_action": dict(trade_action), "order_ref": order_ref})
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(
+            order_id=self.order_id,
+            perm_id=self.perm_id,
+            status="SUBMITTED",
+            normalized_status=self.normalized_status,
+            terminal=self.normalized_status in {"FILLED", "CANCELLED", "FAILED"},
+            filled_qty=self.filled_qty,
+            remaining_qty=self.remaining_qty,
+            avg_fill_price=self.avg_fill_price,
+            symbol=str(trade_action.get("symbol", "")),
+            side=str(trade_action.get("side", "")),
+            order_type=str(trade_action.get("order_type", "")),
+            quantity=float(trade_action.get("quantity", 0.0) or 0.0),
+            account_code=None,
+            submitted_at=datetime.now(UTC),
+        )
+
+    def poll_order_status(self, *, order_id=None, perm_id=None):  # type: ignore[no-untyped-def]
+        self.poll_calls.append({"order_id": order_id, "perm_id": perm_id})
+        return self.poll_snapshot
+
+    def poll_order_status_by_order_ref(self, *, order_ref):  # type: ignore[no-untyped-def]
+        self.poll_calls.append({"order_ref": order_ref})
+        return self.poll_snapshot
 
 
 def test_strategy_task_queue_deduplicates_inflight() -> None:
@@ -507,7 +562,7 @@ def test_process_once_active_persists_strategy_run(tmp_path) -> None:
         with get_connection() as conn:
             initial_run = conn.execute(
                 """
-                SELECT last_monitoring_data_end_at, run_count
+                SELECT last_monitoring_data_end_at, check_count
                 FROM strategy_runs
                 WHERE strategy_id = ?
                 """,
@@ -521,7 +576,7 @@ def test_process_once_active_persists_strategy_run(tmp_path) -> None:
             assert strategy_row is not None
             monitoring_end_map = json.loads(initial_run["last_monitoring_data_end_at"])
             assert monitoring_end_map["c1"]["1"] == strategy_row["logical_activated_at"]
-            assert initial_run["run_count"] == 1
+            assert initial_run["check_count"] == 1
 
         engine.process_once("S-WORKER-ACTIVE", reason="unit_test")
         with get_connection() as conn:
@@ -532,7 +587,7 @@ def test_process_once_active_persists_strategy_run(tmp_path) -> None:
                     condition_met,
                     decision_reason,
                     last_outcome,
-                    run_count,
+                    check_count,
                     metrics_json
                 FROM strategy_runs
                 WHERE strategy_id = ?
@@ -545,16 +600,16 @@ def test_process_once_active_persists_strategy_run(tmp_path) -> None:
             assert run_row["condition_met"] == 0
             assert run_row["decision_reason"] == "waiting_for_market_data"
             assert run_row["last_outcome"] == "waiting_for_market_data"
-            assert run_row["run_count"] == 2
+            assert run_row["check_count"] == 2
             metrics = json.loads(run_row["metrics_json"])
             assert "market_data_preparation" in metrics
 
-            run_count_row = conn.execute(
+            check_count_row = conn.execute(
                 "SELECT COUNT(1) AS c FROM strategy_runs WHERE strategy_id = ?",
                 ("S-WORKER-ACTIVE",),
             ).fetchone()
-            assert run_count_row is not None
-            assert run_count_row["c"] == 1
+            assert check_count_row is not None
+            assert check_count_row["c"] == 1
 
             state_row = conn.execute(
                 """
@@ -719,7 +774,7 @@ def test_market_data_requirement_uses_per_key_last_monitoring_end_as_start_time(
             """
             INSERT INTO strategy_runs (
                 strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
-                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -804,7 +859,7 @@ def test_waiting_for_market_data_does_not_advance_last_monitoring_end(tmp_path) 
             """
             INSERT INTO strategy_runs (
                 strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
-                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -895,7 +950,7 @@ def test_active_skips_monitoring_when_before_suggested_next_and_within_max_inter
             """
             INSERT INTO strategy_runs (
                 strategy_id, last_monitoring_data_end_at, suggested_next_monitor_at, first_evaluated_at, evaluated_at,
-                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -931,14 +986,14 @@ def test_active_skips_monitoring_when_before_suggested_next_and_within_max_inter
         with get_connection() as conn:
             run_row = conn.execute(
                 """
-                SELECT run_count, evaluated_at, suggested_next_monitor_at
+                SELECT check_count, evaluated_at, suggested_next_monitor_at
                 FROM strategy_runs
                 WHERE strategy_id = ?
                 """,
                 ("S-WORKER-SKIP-SUGGESTED",),
             ).fetchone()
             assert run_row is not None
-            assert int(run_row["run_count"]) == 1
+            assert int(run_row["check_count"]) == 1
             assert run_row["evaluated_at"] == evaluated_at.isoformat().replace("+00:00", "Z")
             assert run_row["suggested_next_monitor_at"] == suggested_next.isoformat().replace("+00:00", "Z")
     finally:
@@ -989,7 +1044,7 @@ def test_active_does_not_skip_when_max_monitoring_interval_exceeded(tmp_path) ->
             """
             INSERT INTO strategy_runs (
                 strategy_id, last_monitoring_data_end_at, suggested_next_monitor_at, first_evaluated_at, evaluated_at,
-                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -1072,7 +1127,7 @@ def test_no_new_data_skips_evaluate_and_keeps_last_monitoring_end(tmp_path) -> N
             """
             INSERT INTO strategy_runs (
                 strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
-                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -1166,7 +1221,7 @@ def test_no_new_data_outside_session_sets_suggested_next_monitor_at(tmp_path) ->
             """
             INSERT INTO strategy_runs (
                 strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
-                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -1373,7 +1428,13 @@ def test_process_once_triggered_creates_trade_instruction(tmp_path) -> None:
         ),
     )
 
-    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+    order_service = _FakeOrderService()
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        order_service=order_service,
+    )
 
     old_db_path = os.getenv("IBX_DB_PATH")
     os.environ["IBX_DB_PATH"] = str(db_path)
@@ -1393,6 +1454,513 @@ def test_process_once_triggered_creates_trade_instruction(tmp_path) -> None:
             ).fetchone()
             assert instruction_row is not None
             assert instruction_row["status"] == "ORDER_SUBMITTED"
+            order_row = conn.execute(
+                "SELECT status, ib_order_id FROM orders WHERE strategy_id = ?",
+                ("S-WORKER-TRIG",),
+            ).fetchone()
+            assert order_row is not None
+            assert order_row["status"] == "ORDER_SUBMITTED"
+            assert order_row["ib_order_id"] == "91001"
+            assert len(order_service.calls) == 1
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_triggered_skips_when_existing_order_dispatching(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_triggered_existing_dispatching.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-TRIG-DISPATCHING",
+        db_path=db_path,
+        status="TRIGGERED",
+        trade_action_json=json.dumps(
+            {
+                "action_type": "STOCK_TRADE",
+                "symbol": "AAPL",
+                "side": "BUY",
+                "order_type": "MKT",
+                "quantity": 1,
+            }
+        ),
+    )
+    now_iso = _iso_now()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_instructions (
+                trade_id, strategy_id, instruction_summary, status, expire_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-EXISTING01",
+                "S-WORKER-TRIG-DISPATCHING",
+                "STOCK_TRADE BUY AAPL MKT qty=1",
+                "ORDER_DISPATCHING",
+                None,
+                now_iso,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO orders (
+                id, strategy_id, ib_order_id, status, qty, avg_fill_price, filled_qty, error_message,
+                order_payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-EXISTING01",
+                "S-WORKER-TRIG-DISPATCHING",
+                None,
+                "ORDER_DISPATCHING",
+                1.0,
+                None,
+                0.0,
+                None,
+                json.dumps({"dispatch": {"order_ref": "T-EXISTING01"}}),
+                now_iso,
+                now_iso,
+            ),
+        )
+        conn.commit()
+
+    order_service = _FakeOrderService()
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        order_service=order_service,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-TRIG-DISPATCHING", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-TRIG-DISPATCHING",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "TRIGGERED"
+
+            instruction_rows = conn.execute(
+                """
+                SELECT trade_id, status
+                FROM trade_instructions
+                WHERE strategy_id = ?
+                ORDER BY updated_at DESC
+                """,
+                ("S-WORKER-TRIG-DISPATCHING",),
+            ).fetchall()
+            assert len(instruction_rows) == 1
+            assert instruction_rows[0]["trade_id"] == "T-EXISTING01"
+            assert instruction_rows[0]["status"] == "ORDER_DISPATCHING"
+            assert len(order_service.calls) == 0
+            assert len(order_service.poll_calls) >= 1
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_triggered_reconciles_existing_order_dispatching(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_triggered_existing_dispatching_reconcile.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-TRIG-DISPATCHING-RECONCILE",
+        db_path=db_path,
+        status="TRIGGERED",
+        trade_action_json=json.dumps(
+            {
+                "action_type": "STOCK_TRADE",
+                "symbol": "AAPL",
+                "side": "BUY",
+                "order_type": "MKT",
+                "quantity": 1,
+            }
+        ),
+    )
+    now_iso = _iso_now()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_instructions (
+                trade_id, strategy_id, instruction_summary, status, expire_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-EXISTING02",
+                "S-WORKER-TRIG-DISPATCHING-RECONCILE",
+                "STOCK_TRADE BUY AAPL MKT qty=1",
+                "ORDER_DISPATCHING",
+                None,
+                now_iso,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO orders (
+                id, strategy_id, ib_order_id, status, qty, avg_fill_price, filled_qty, error_message,
+                order_payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-EXISTING02",
+                "S-WORKER-TRIG-DISPATCHING-RECONCILE",
+                None,
+                "ORDER_DISPATCHING",
+                1.0,
+                None,
+                0.0,
+                None,
+                json.dumps({"dispatch": {"order_ref": "T-EXISTING02"}}),
+                now_iso,
+                now_iso,
+            ),
+        )
+        conn.commit()
+
+    order_service = _FakeOrderService(
+        poll_snapshot=SimpleNamespace(
+            order_id=32001,
+            perm_id=920001,
+            normalized_status="ORDER_SUBMITTED",
+            avg_fill_price=None,
+            filled_qty=0.0,
+            error_message=None,
+        )
+    )
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        order_service=order_service,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-TRIG-DISPATCHING-RECONCILE", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-TRIG-DISPATCHING-RECONCILE",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "ORDER_SUBMITTED"
+
+            instruction_row = conn.execute(
+                "SELECT status FROM trade_instructions WHERE trade_id = ?",
+                ("T-EXISTING02",),
+            ).fetchone()
+            assert instruction_row is not None
+            assert instruction_row["status"] == "ORDER_SUBMITTED"
+            order_row = conn.execute(
+                "SELECT status, ib_order_id FROM orders WHERE id = ?",
+                ("T-EXISTING02",),
+            ).fetchone()
+            assert order_row is not None
+            assert order_row["status"] == "ORDER_SUBMITTED"
+            assert order_row["ib_order_id"] == "920001"
+            assert len(order_service.calls) == 0
+            assert len(order_service.poll_calls) >= 1
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_triggered_dispatching_timeout_moves_to_failed(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_triggered_dispatching_timeout.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-TRIG-DISPATCHING-TIMEOUT",
+        db_path=db_path,
+        status="TRIGGERED",
+        trade_action_json=json.dumps(
+            {
+                "action_type": "STOCK_TRADE",
+                "symbol": "AAPL",
+                "side": "BUY",
+                "order_type": "MKT",
+                "quantity": 1,
+            }
+        ),
+    )
+    old_iso = (datetime.now(UTC) - timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_instructions (
+                trade_id, strategy_id, instruction_summary, status, expire_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-EXISTING03",
+                "S-WORKER-TRIG-DISPATCHING-TIMEOUT",
+                "STOCK_TRADE BUY AAPL MKT qty=1",
+                "ORDER_DISPATCHING",
+                None,
+                old_iso,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO orders (
+                id, strategy_id, ib_order_id, status, qty, avg_fill_price, filled_qty, error_message,
+                order_payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-EXISTING03",
+                "S-WORKER-TRIG-DISPATCHING-TIMEOUT",
+                None,
+                "ORDER_DISPATCHING",
+                1.0,
+                None,
+                0.0,
+                None,
+                json.dumps({"dispatch": {"order_ref": "T-EXISTING03"}}),
+                old_iso,
+                old_iso,
+            ),
+        )
+        conn.commit()
+
+    order_service = _FakeOrderService(poll_snapshot=None)
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        order_service=order_service,
+        dispatching_reconcile_timeout_seconds=1.0,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-TRIG-DISPATCHING-TIMEOUT", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-TRIG-DISPATCHING-TIMEOUT",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "FAILED"
+
+            instruction_row = conn.execute(
+                "SELECT status FROM trade_instructions WHERE trade_id = ?",
+                ("T-EXISTING03",),
+            ).fetchone()
+            assert instruction_row is not None
+            assert instruction_row["status"] == "FAILED"
+            order_row = conn.execute(
+                "SELECT status, error_message FROM orders WHERE id = ?",
+                ("T-EXISTING03",),
+            ).fetchone()
+            assert order_row is not None
+            assert order_row["status"] == "FAILED"
+            assert "timeout" in str(order_row["error_message"]).lower()
+            assert len(order_service.calls) == 0
+            assert len(order_service.poll_calls) >= 1
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_order_submitted_polls_and_moves_to_filled(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_order_submitted_filled.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy("S-WORKER-ORDER-SUB-FILLED", db_path=db_path, status="ORDER_SUBMITTED")
+    now_iso = _iso_now()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_instructions (
+                trade_id, strategy_id, instruction_summary, status, expire_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-SUBMITTED01",
+                "S-WORKER-ORDER-SUB-FILLED",
+                "STOCK_TRADE BUY AAPL MKT qty=1",
+                "ORDER_SUBMITTED",
+                None,
+                now_iso,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO orders (
+                id, strategy_id, ib_order_id, status, qty, avg_fill_price, filled_qty, error_message,
+                order_payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-SUBMITTED01",
+                "S-WORKER-ORDER-SUB-FILLED",
+                "91001",
+                "ORDER_SUBMITTED",
+                1.0,
+                None,
+                0.0,
+                None,
+                json.dumps({"dispatch": {"order_ref": "T-SUBMITTED01"}}),
+                now_iso,
+                now_iso,
+            ),
+        )
+        conn.commit()
+
+    order_service = _FakeOrderService(
+        poll_snapshot=SimpleNamespace(
+            order_id=32011,
+            perm_id=91001,
+            normalized_status="FILLED",
+            avg_fill_price=188.5,
+            filled_qty=1.0,
+            error_message=None,
+        )
+    )
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        order_service=order_service,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-ORDER-SUB-FILLED", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-ORDER-SUB-FILLED",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "FILLED"
+
+            instruction_row = conn.execute(
+                "SELECT status FROM trade_instructions WHERE trade_id = ?",
+                ("T-SUBMITTED01",),
+            ).fetchone()
+            assert instruction_row is not None
+            assert instruction_row["status"] == "FILLED"
+
+            order_row = conn.execute(
+                "SELECT status, ib_order_id, avg_fill_price, filled_qty FROM orders WHERE id = ?",
+                ("T-SUBMITTED01",),
+            ).fetchone()
+            assert order_row is not None
+            assert order_row["status"] == "FILLED"
+            assert order_row["ib_order_id"] == "91001"
+            assert float(order_row["avg_fill_price"]) == 188.5
+            assert float(order_row["filled_qty"]) == 1.0
+            assert len(order_service.calls) == 0
+            assert len(order_service.poll_calls) >= 1
+            assert order_service.poll_calls[0]["perm_id"] == 91001
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_order_submitted_polls_by_order_ref_for_partial_fill(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_order_submitted_partial.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy("S-WORKER-ORDER-SUB-PARTIAL", db_path=db_path, status="ORDER_SUBMITTED")
+    now_iso = _iso_now()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_instructions (
+                trade_id, strategy_id, instruction_summary, status, expire_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-SUBMITTED02",
+                "S-WORKER-ORDER-SUB-PARTIAL",
+                "STOCK_TRADE BUY AAPL MKT qty=1",
+                "ORDER_SUBMITTED",
+                None,
+                now_iso,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO orders (
+                id, strategy_id, ib_order_id, status, qty, avg_fill_price, filled_qty, error_message,
+                order_payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "T-SUBMITTED02",
+                "S-WORKER-ORDER-SUB-PARTIAL",
+                None,
+                "ORDER_SUBMITTED",
+                1.0,
+                None,
+                0.0,
+                None,
+                json.dumps({"dispatch": {"order_ref": "T-SUBMITTED02"}}),
+                now_iso,
+                now_iso,
+            ),
+        )
+        conn.commit()
+
+    order_service = _FakeOrderService(
+        poll_snapshot=SimpleNamespace(
+            order_id=32012,
+            perm_id=93002,
+            normalized_status="PARTIAL_FILL",
+            avg_fill_price=187.2,
+            filled_qty=0.4,
+            error_message=None,
+        )
+    )
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        order_service=order_service,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-ORDER-SUB-PARTIAL", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-ORDER-SUB-PARTIAL",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "ORDER_SUBMITTED"
+
+            instruction_row = conn.execute(
+                "SELECT status FROM trade_instructions WHERE trade_id = ?",
+                ("T-SUBMITTED02",),
+            ).fetchone()
+            assert instruction_row is not None
+            assert instruction_row["status"] == "PARTIAL_FILL"
+
+            order_row = conn.execute(
+                "SELECT status, ib_order_id, avg_fill_price, filled_qty FROM orders WHERE id = ?",
+                ("T-SUBMITTED02",),
+            ).fetchone()
+            assert order_row is not None
+            assert order_row["status"] == "PARTIAL_FILL"
+            assert order_row["ib_order_id"] == "93002"
+            assert float(order_row["avg_fill_price"]) == 187.2
+            assert float(order_row["filled_qty"]) == 0.4
+            assert len(order_service.calls) == 0
+            assert len(order_service.poll_calls) >= 1
+            assert any(call.get("order_ref") == "T-SUBMITTED02" for call in order_service.poll_calls)
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
@@ -1413,7 +1981,7 @@ def test_process_once_verifying_moves_to_active(tmp_path, monkeypatch) -> None:
             """
             INSERT INTO strategy_runs (
                 strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
-                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -1432,7 +2000,7 @@ def test_process_once_verifying_moves_to_active(tmp_path, monkeypatch) -> None:
         conn.commit()
     monkeypatch.setattr(
         "app.worker.run_activation_verification",
-        lambda conn, *, strategy_id, strategy_row: ActivationVerificationResult(
+        lambda conn, *, strategy_id, strategy_row, trade_service=None: ActivationVerificationResult(
             passed=True,
             reason="verification_passed",
             resolved_symbol_contracts=1,
@@ -1482,6 +2050,58 @@ def test_process_once_verifying_moves_to_active(tmp_path, monkeypatch) -> None:
             os.environ["IBX_DB_PATH"] = old_db_path
 
 
+def test_process_once_verifying_logs_trade_validation_context(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "ibx_worker_verifying_context.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-VERIFY-CONTEXT",
+        db_path=db_path,
+        status="VERIFYING",
+    )
+    monkeypatch.setattr(
+        "app.worker.run_activation_verification",
+        lambda conn, *, strategy_id, strategy_row, trade_service=None: ActivationVerificationResult(
+            passed=True,
+            reason="verification_passed",
+            resolved_symbol_contracts=1,
+            updated_condition_contracts=0,
+            trade_validation_context={
+                "market": "US_STOCK",
+                "symbol": "AAPL",
+                "side": "BUY",
+                "order_type": "MKT",
+                "quantity": 1.0,
+            },
+        ),
+    )
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-VERIFY-CONTEXT", reason="unit_test")
+        with get_connection() as conn:
+            context_event = conn.execute(
+                """
+                SELECT event_type, detail
+                FROM strategy_events
+                WHERE strategy_id = ? AND event_type = 'VERIFY_TRADE_ACTION_CONTEXT'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("S-WORKER-VERIFY-CONTEXT",),
+            ).fetchone()
+            assert context_event is not None
+            payload = json.loads(str(context_event["detail"] or "{}"))
+            assert payload["market"] == "US_STOCK"
+            assert payload["symbol"] == "AAPL"
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
 def test_process_once_verifying_moves_to_verify_failed_when_verification_rejected(
     tmp_path,
     monkeypatch,
@@ -1495,7 +2115,7 @@ def test_process_once_verifying_moves_to_verify_failed_when_verification_rejecte
     )
     monkeypatch.setattr(
         "app.worker.run_activation_verification",
-        lambda conn, *, strategy_id, strategy_row: ActivationVerificationResult(
+        lambda conn, *, strategy_id, strategy_row, trade_service=None: ActivationVerificationResult(
             passed=False,
             reason="verification rejected",
         ),
@@ -1617,7 +2237,7 @@ def test_process_once_active_missing_activation_time_has_priority_over_skip_gate
             """
             INSERT INTO strategy_runs (
                 strategy_id, last_monitoring_data_end_at, suggested_next_monitor_at, first_evaluated_at, evaluated_at,
-                condition_met, decision_reason, last_outcome, run_count, metrics_json, updated_at
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (

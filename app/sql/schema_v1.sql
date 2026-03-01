@@ -98,11 +98,19 @@ CREATE TABLE IF NOT EXISTS condition_states (
 
 CREATE TABLE IF NOT EXISTS strategy_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  strategy_id TEXT NOT NULL REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  -- One strategy keeps exactly one runtime summary row.
+  strategy_id TEXT NOT NULL UNIQUE REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  last_monitoring_data_end_at TEXT NOT NULL CHECK (json_valid(last_monitoring_data_end_at)),
+  -- Scheduler hint for the next recommended monitoring cycle; NULL means "run normally".
+  suggested_next_monitor_at TEXT,
+  first_evaluated_at TEXT NOT NULL,
   evaluated_at TEXT NOT NULL,
   condition_met INTEGER NOT NULL CHECK (condition_met IN (0, 1)),
   decision_reason TEXT NOT NULL,
-  metrics_json TEXT NOT NULL CHECK (json_valid(metrics_json))
+  last_outcome TEXT NOT NULL,
+  check_count INTEGER NOT NULL DEFAULT 1 CHECK (check_count >= 1),
+  metrics_json TEXT NOT NULL CHECK (json_valid(metrics_json)),
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS strategy_runtime_states (
@@ -116,7 +124,11 @@ CREATE TABLE IF NOT EXISTS strategy_runtime_states (
 
 CREATE TABLE IF NOT EXISTS orders (
   id TEXT PRIMARY KEY,
+  trade_id TEXT REFERENCES trade_instructions(trade_id) ON UPDATE CASCADE ON DELETE CASCADE,
   strategy_id TEXT NOT NULL REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  leg_role TEXT NOT NULL DEFAULT "SINGLE"
+    CHECK (leg_role IN ("SINGLE", "ROLL_CLOSE", "ROLL_OPEN", "COMBO_BAG")),
+  sequence_no INTEGER NOT NULL DEFAULT 1 CHECK (sequence_no >= 1),
   ib_order_id TEXT,
   status TEXT NOT NULL,
   qty REAL NOT NULL CHECK (qty > 0),
@@ -128,16 +140,18 @@ CREATE TABLE IF NOT EXISTS orders (
   updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS verification_events (
+CREATE TABLE IF NOT EXISTS order_legs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  strategy_id TEXT NOT NULL REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
-  trade_id TEXT,
-  rule_id TEXT NOT NULL,
-  rule_version TEXT NOT NULL,
-  passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
-  reason TEXT NOT NULL,
-  order_snapshot_json TEXT NOT NULL CHECK (json_valid(order_snapshot_json)),
-  created_at TEXT NOT NULL
+  order_id TEXT NOT NULL REFERENCES orders(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  leg_index INTEGER NOT NULL CHECK (leg_index >= 1),
+  con_id INTEGER,
+  symbol TEXT,
+  contract_month TEXT,
+  side TEXT NOT NULL,
+  ratio REAL NOT NULL DEFAULT 1 CHECK (ratio > 0),
+  exchange TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (order_id, leg_index)
 );
 
 CREATE TABLE IF NOT EXISTS trade_logs (
@@ -195,15 +209,15 @@ CREATE INDEX IF NOT EXISTS idx_strategy_events_strategy_ts
   ON strategy_events (strategy_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_condition_states_strategy
   ON condition_states (strategy_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_strategy_runs_strategy_eval
-  ON strategy_runs (strategy_id, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_strategy_runs_evaluated_at
+  ON strategy_runs (evaluated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_strategy_runtime_states_strategy_updated
   ON strategy_runtime_states (strategy_id, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_orders_strategy_status_updated
   ON orders (strategy_id, status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_verification_events_strategy_ts
-  ON verification_events (strategy_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_order_legs_order_index
+  ON order_legs (order_id, leg_index ASC);
 CREATE INDEX IF NOT EXISTS idx_trade_logs_ts
   ON trade_logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_trade_instructions_status_updated

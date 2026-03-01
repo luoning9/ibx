@@ -75,7 +75,7 @@ export type StrategyRunSummary = {
   condition_met: boolean
   decision_reason: string
   last_outcome: string
-  run_count: number
+  check_count: number
   last_monitoring_data_end_at: Record<string, Record<string, string>>
   updated_at: string
 }
@@ -145,9 +145,68 @@ export type ActiveTradeInstruction = {
   updated_at: string
   strategy_id: string
   trade_id: string
+  perm_id: number | null
+  order_count: number
+  filled_order_count: number
   instruction_summary: string
   status: string
   expire_at: string | null
+}
+
+export type TradeOrderLeg = {
+  leg_index: number
+  con_id: number | null
+  symbol: string | null
+  contract_month: string | null
+  side: string
+  ratio: number
+  exchange: string | null
+}
+
+export type TradeOrder = {
+  id: string
+  trade_id: string
+  strategy_id: string
+  leg_role: string
+  sequence_no: number
+  ib_order_id: string | null
+  status: string
+  qty: number
+  avg_fill_price: number | null
+  filled_qty: number
+  error_message: string | null
+  order_payload: Record<string, unknown> | null
+  created_at: string
+  updated_at: string
+  legs: TradeOrderLeg[]
+}
+
+export type OtherOpenOrder = {
+  updated_at: string | null
+  perm_id: number
+  order_id: number | null
+  can_cancel: boolean
+  client_id: number | null
+  trade_service_client_id: number | null
+  symbol: string
+  sec_type: string
+  side: string
+  order_type: string
+  quantity: number
+  status: string
+  filled_qty: number
+  remaining_qty: number
+  avg_fill_price: number | null
+  account_code: string | null
+}
+
+export type OpenOrderCancelResult = {
+  perm_id: number
+  order_id: number | null
+  status: string
+  terminal: boolean
+  message: string
+  updated_at: string
 }
 
 export type TradeLogItem = {
@@ -187,6 +246,10 @@ export type StrategyBasicPatchPayload = {
   expire_mode?: 'relative' | 'absolute'
   expire_in_seconds?: number | null
   expire_at?: string | null
+}
+
+export type StrategyDescriptionResult = {
+  description: string
 }
 
 export type ConditionRulePair = {
