@@ -5,41 +5,95 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.config import infer_ib_api_port, load_app_config, resolve_ib_client_id
-from app.market_config import resolve_market_profile
+from app.config import SUPPORTED_IB_ROLES, load_app_config, resolve_ib_client_id
+from app.ib_compat import INSTALL_HINT, is_missing_ib_dependency_error
+from app.ib_session_manager import close_ib_session_manager
 from app.market_data import (
-    HistoricalBar,
+    DirectIBMarketDataProvider,
     HistoricalBarsRequest,
     build_market_data_provider_from_config,
 )
+from app.ib_market_data import IBSessionHistoricalFetcher
 from app.runtime_paths import resolve_market_cache_db_path
-
-try:
-    from ib_insync import IB, Future, Stock
-except ModuleNotFoundError:
-    IB = None  # type: ignore[assignment]
-    Future = None  # type: ignore[assignment]
-    Stock = None  # type: ignore[assignment]
 
 
 UTC = timezone.utc
+CLIENT_ID_CONFLICT_ERROR_CODE = 5
 
 
-def infer_default_port() -> int:
-    cfg = load_app_config().ib_gateway
-    mode = os.getenv("TRADING_MODE", cfg.trading_mode).strip().lower()
-    return infer_ib_api_port(mode)
+class ClientIdConflictError(RuntimeError):
+    """Raised when IB rejects the connection because client id is already in use."""
+
+
+def _looks_like_client_id_conflict(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    if "error 326" in lowered:
+        return True
+    if "client id is already in use" in lowered:
+        return True
+    if "clientid" in lowered and "already in use" in lowered:
+        return True
+    if "client id" in lowered and "already in use" in lowered:
+        return True
+    return False
+
+
+def _is_client_id_conflict_exception(exc: Exception) -> bool:
+    pending: list[BaseException | None] = [exc]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None:
+            continue
+        obj_id = id(current)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+        if _looks_like_client_id_conflict(str(current)):
+            return True
+        pending.append(getattr(current, "__cause__", None))
+        pending.append(getattr(current, "__context__", None))
+    return False
+
+
+def _extract_client_id_conflict_message_from_meta(meta: dict[str, Any]) -> str | None:
+    error_codes = meta.get("ib_error_codes")
+    if isinstance(error_codes, list):
+        for item in error_codes:
+            try:
+                if int(item) == 326:
+                    return "ib_error_codes contains 326 (client id already in use)"
+            except Exception:
+                continue
+
+    ib_errors = meta.get("ib_errors")
+    if isinstance(ib_errors, list):
+        for item in ib_errors:
+            if not isinstance(item, dict):
+                continue
+            code_raw = item.get("code")
+            try:
+                if int(code_raw) == 326:
+                    message = str(item.get("message") or "").strip()
+                    return message or "ib_errors contains code=326 (client id already in use)"
+            except Exception:
+                pass
+            message = str(item.get("message") or "").strip()
+            if _looks_like_client_id_conflict(message):
+                return message
+    return None
 
 
 def _to_utc(dt: datetime) -> datetime:
@@ -69,27 +123,8 @@ def _parse_bar_size_delta(bar_size: str) -> timedelta | None:
     return None
 
 
-def _duration_str(start_time: datetime, end_time: datetime, *, bar_delta: timedelta | None) -> str:
-    seconds = max(1, math.ceil((_to_utc(end_time) - _to_utc(start_time)).total_seconds()))
-
-    # IB historical duration constraints differ by bar size.
-    # Hour/day bars are safer with day-based duration to avoid error 321.
-    if bar_delta is not None and bar_delta >= timedelta(hours=1):
-        days = max(1, math.ceil(seconds / 86400))
-        return f"{days} D"
-
-    if seconds <= 86400:
-        return f"{seconds} S"
-    days = max(1, math.ceil(seconds / 86400))
-    return f"{days} D"
-
-
 def _iso_utc(dt: datetime) -> str:
     return _to_utc(dt).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _ib_utc(dt: datetime) -> str:
-    return _to_utc(dt).strftime("%Y%m%d %H:%M:%S UTC")
 
 
 def _aligned_query_end(now: datetime, bar_delta: timedelta | None) -> datetime:
@@ -128,180 +163,7 @@ def _lookback_candidates(bar_delta: timedelta | None, lookback_bars: int) -> lis
     return out
 
 
-def _coerce_ib_bar_ts(raw: Any) -> datetime:
-    if isinstance(raw, datetime):
-        return _to_utc(raw)
-    if isinstance(raw, date):
-        return datetime(raw.year, raw.month, raw.day, tzinfo=UTC)
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            raise RuntimeError("empty bar date string")
-        if len(text) == 8 and text.isdigit():
-            parsed = datetime.strptime(text, "%Y%m%d")
-            return parsed.replace(tzinfo=UTC)
-        normalized = " ".join(text.split())
-        try:
-            parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
-            return _to_utc(parsed)
-        except ValueError:
-            pass
-        try:
-            parsed = datetime.strptime(normalized, "%Y%m%d %H:%M:%S")
-            return parsed.replace(tzinfo=UTC)
-        except ValueError:
-            pass
-        raise RuntimeError(f"unsupported bar date string format: {text!r}")
-    raise RuntimeError(f"unexpected bar date type: {type(raw)!r}")
-
-
-class IBHistoricalFetcher:
-    def __init__(self, ib: IB) -> None:
-        self._ib = ib
-        self._contract_cache: dict[str, Any] = {}
-
-    def fetch(
-        self,
-        *,
-        contract: Mapping[str, Any] | str,
-        start_time: datetime,
-        end_time: datetime,
-        bar_size: str,
-        what_to_show: str,
-        use_rth: bool,
-    ) -> list[HistoricalBar]:
-        ib_contract = self._resolve_contract(contract)
-        bar_delta = _parse_bar_size_delta(bar_size)
-        bars = self._ib.reqHistoricalData(
-            ib_contract,
-            endDateTime=_ib_utc(end_time),
-            durationStr=_duration_str(start_time, end_time, bar_delta=bar_delta),
-            barSizeSetting=bar_size,
-            whatToShow=what_to_show,
-            useRTH=use_rth,
-            formatDate=2,
-            keepUpToDate=False,
-        )
-        out: list[HistoricalBar] = []
-        for item in bars:
-            out.append(
-                HistoricalBar(
-                    ts=_coerce_ib_bar_ts(item.date),
-                    open=float(item.open),
-                    high=float(item.high),
-                    low=float(item.low),
-                    close=float(item.close),
-                    volume=None if item.volume is None else float(item.volume),
-                    wap=None if item.average is None else float(item.average),
-                    count=None if item.barCount is None else int(item.barCount),
-                )
-            )
-        return out
-
-    def _resolve_contract(self, contract: Mapping[str, Any] | str) -> Any:
-        if Stock is None or Future is None:
-            raise RuntimeError("ib_insync is required for IB-backed market data fetcher")
-        if isinstance(contract, str):
-            payload = {"market": "US_STOCK", "code": contract}
-        else:
-            payload = dict(contract)
-
-        code = str(payload.get("code", "")).strip().upper()
-        if not code:
-            raise ValueError("contract.code is required")
-        market = str(payload.get("market", "US_STOCK")).strip().upper() or "US_STOCK"
-        contract_month = str(payload.get("contract_month", "")).strip()
-
-        cache_key = f"{market}|{code}|{contract_month}"
-        cached = self._contract_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        profile = resolve_market_profile(market, None)
-        if profile.sec_type == "STK":
-            candidate = Stock(symbol=code, exchange=profile.exchange, currency=profile.currency)
-            qualified = self._ib.qualifyContracts(candidate)
-            if not qualified:
-                raise RuntimeError(f"failed to qualify stock contract: market={market}, code={code}")
-            resolved = qualified[0]
-            self._contract_cache[cache_key] = resolved
-            return resolved
-
-        if profile.sec_type == "FUT":
-            if contract_month:
-                candidate = Future(
-                    symbol=code,
-                    lastTradeDateOrContractMonth=contract_month,
-                    exchange=profile.exchange,
-                    currency=profile.currency,
-                )
-                qualified = self._ib.qualifyContracts(candidate)
-                if not qualified:
-                    raise RuntimeError(
-                        f"failed to qualify future contract: market={market}, code={code}, month={contract_month}"
-                    )
-                resolved = qualified[0]
-                self._contract_cache[cache_key] = resolved
-                return resolved
-
-            probe = Future(symbol=code, exchange=profile.exchange, currency=profile.currency)
-            details = self._ib.reqContractDetails(probe)
-            if details:
-                resolved = self._pick_front_contract(details)
-                self._contract_cache[cache_key] = resolved
-                return resolved
-
-            fallback = Future(localSymbol=code, exchange=profile.exchange, currency=profile.currency)
-            qualified = self._ib.qualifyContracts(fallback)
-            if not qualified:
-                raise RuntimeError(
-                    f"failed to resolve future contract: market={market}, code={code}; "
-                    "try --contract-month for explicit contract"
-                )
-            resolved = qualified[0]
-            self._contract_cache[cache_key] = resolved
-            return resolved
-
-        raise RuntimeError(f"unsupported sec_type for market={market}: {profile.sec_type}")
-
-    def _pick_front_contract(self, details: list[Any]) -> Any:
-        today = datetime.now(UTC).strftime("%Y%m%d")
-        entries: list[tuple[str, str, Any]] = []
-        for detail in details:
-            c = detail.contract
-            month = str(getattr(c, "lastTradeDateOrContractMonth", "")).strip()
-            if month:
-                entries.append((month, self._to_cmp_day(month), c))
-        if not entries:
-            return details[0].contract
-
-        ordered = sorted(entries, key=lambda item: item[1])
-        for _, cmp_day, contract in ordered:
-            if cmp_day >= today:
-                qualified = self._ib.qualifyContracts(contract)
-                if qualified:
-                    return qualified[0]
-        qualified = self._ib.qualifyContracts(ordered[-1][2])
-        if qualified:
-            return qualified[0]
-        raise RuntimeError("failed to qualify resolved future contract")
-
-    def _to_cmp_day(self, value: str) -> str:
-        raw = value.strip()
-        if len(raw) >= 8 and raw[:8].isdigit():
-            return raw[:8]
-        if len(raw) == 6 and raw.isdigit():
-            return raw + "99"
-        digits = "".join(ch for ch in raw if ch.isdigit())
-        if len(digits) >= 8:
-            return digits[:8]
-        if len(digits) == 6:
-            return digits + "99"
-        return "00000000"
-
-
 def parse_args() -> argparse.Namespace:
-    cfg = load_app_config().ib_gateway
     parser = argparse.ArgumentParser(description="Get latest completed historical bar by code")
     parser.add_argument("--code", required=True, help="Product code, e.g. AAPL or GC")
     parser.add_argument("--bar-size", required=True, help="IB bar size, e.g. '1 min', '5 mins', '1 hour'")
@@ -317,27 +179,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--what-to-show", default="TRADES", help="IB whatToShow (default: TRADES)")
     parser.add_argument(
-        "--host",
-        default=os.getenv("IB_HOST", cfg.host),
-        help="IB host",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.getenv("IB_API_PORT", str(infer_default_port()))),
-        help="IB API port",
-    )
-    parser.add_argument(
-        "--client-id",
-        type=int,
-        default=int(os.getenv("IB_CLIENT_ID", str(resolve_ib_client_id("cli")))),
-        help="IB client id",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=float(os.getenv("IB_TIMEOUT", str(cfg.timeout_seconds))),
-        help="Connect timeout seconds",
+        "--use-role",
+        default=str(os.getenv("IB_USE_ROLE", "cli")).strip().lower(),
+        help=f"IB role connection to use ({', '.join(SUPPORTED_IB_ROLES)})",
     )
     parser.add_argument(
         "--lookback-bars",
@@ -366,12 +210,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print JSON output",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass local market cache and fetch directly from IB",
+    )
     return parser.parse_args()
+
+
+def _is_missing_ib_dependency(exc: Exception) -> bool:
+    return is_missing_ib_dependency_error(exc)
 
 
 def main() -> int:
     args = parse_args()
     cfg = load_app_config()
+    use_role = str(args.use_role or "").strip().lower()
+    if use_role not in SUPPORTED_IB_ROLES:
+        use_role = "cli"
     bar_delta = _parse_bar_size_delta(args.bar_size)
     now = _aligned_query_end(datetime.now(UTC), bar_delta)
 
@@ -379,45 +235,27 @@ def main() -> int:
     if args.contract_month:
         request_contract["contract_month"] = args.contract_month
 
-    ib: IB | None = None
-
     try:
         if cfg.providers.market_data == "fixture":
-            cache = build_market_data_provider_from_config(
-                now_fn=lambda: now,
-            )
+            cache = build_market_data_provider_from_config(now_fn=lambda: now)
         else:
-            if IB is None:
-                print(
-                    "[ERROR] Missing dependency: ib_insync. Install with: pip install ib_insync",
-                    file=sys.stderr,
-                )
-                return 3
-            ib = IB()
-            try:
-                ib.connect(
-                    host=args.host,
-                    port=args.port,
-                    clientId=args.client_id,
-                    timeout=args.timeout,
-                    readonly=True,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[ERROR] Failed to connect IB API: {exc}", file=sys.stderr)
-                return 1
-            fetcher = IBHistoricalFetcher(ib)
-            cache = (
-                build_market_data_provider_from_config(
+            fetcher = IBSessionHistoricalFetcher(use_role=use_role)
+            if args.no_cache:
+                cache = DirectIBMarketDataProvider(
                     fetcher=fetcher,
                     now_fn=lambda: now,
                 )
-                if not args.cache_db.strip()
-                else build_market_data_provider_from_config(
-                    fetcher=fetcher,
-                    db_path=Path(args.cache_db.strip()),
-                    now_fn=lambda: now,
+            else:
+                cache = (
+                    build_market_data_provider_from_config(fetcher=fetcher, now_fn=lambda: now)
+                    if not args.cache_db.strip()
+                    else build_market_data_provider_from_config(
+                        fetcher=fetcher,
+                        db_path=Path(args.cache_db.strip()),
+                        now_fn=lambda: now,
+                    )
                 )
-            )
+
         result = None
         for lookback in _lookback_candidates(bar_delta, args.lookback_bars):
             start = now - lookback
@@ -435,15 +273,24 @@ def main() -> int:
                 )
             )
             result = current
+            conflict_message = _extract_client_id_conflict_message_from_meta(current.meta)
+            if conflict_message is not None:
+                raise ClientIdConflictError(conflict_message)
             if current.bars:
                 break
         assert result is not None
     except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, ClientIdConflictError) or _is_client_id_conflict_exception(exc):
+            detail = str(exc).strip() or f"role={use_role} client_id={resolve_ib_client_id(use_role)} already in use"
+            print(f"[ERROR] IB client id conflict: {detail}", file=sys.stderr)
+            return CLIENT_ID_CONFLICT_ERROR_CODE
+        if _is_missing_ib_dependency(exc):
+            print(f"[ERROR] {INSTALL_HINT}", file=sys.stderr)
+            return 3
         print(f"[ERROR] Query latest bar failed: {exc}", file=sys.stderr)
         return 2
     finally:
-        if ib is not None and ib.isConnected():
-            ib.disconnect()
+        close_ib_session_manager()
 
     if not result.bars:
         print(

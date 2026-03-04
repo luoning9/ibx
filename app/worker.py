@@ -10,7 +10,6 @@ from threading import Event, Lock, Thread
 from typing import Any, Callable
 from uuid import uuid4
 
-from .chain import sync_order_submitted_strategy_status
 from .config import load_app_config
 from .db import get_connection, init_db
 from .evaluator import (
@@ -21,7 +20,7 @@ from .evaluator import (
     gateway_is_working,
     persist_evaluation_result,
 )
-from .ib_trade_service import IBOrderService
+from .ib_trade_service import IBTradeService
 from .market_data import (
     HistoricalBar,
     HistoricalBarsRequest,
@@ -29,7 +28,7 @@ from .market_data import (
     TradingCalendarRequest,
     build_market_data_provider_from_config,
 )
-from .market_data_ib import IBSessionHistoricalFetcher
+from .ib_market_data import IBSessionHistoricalFetcher
 from .verification import run_activation_verification
 
 
@@ -87,6 +86,13 @@ def _to_int_or_none(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _to_float(value: Any, *, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_symbol(value: Any) -> str:
     return str(value or "").strip().upper()
 
@@ -140,7 +146,7 @@ def _activate_downstream_strategy(
 
     row = conn.execute(
         """
-        SELECT id, status, expire_mode, expire_in_seconds
+        SELECT id, status, expire_mode, expire_in_seconds, expire_at
         FROM v_strategies_active
         WHERE id = ?
         """,
@@ -153,17 +159,18 @@ def _activate_downstream_strategy(
     if str(row["status"]) not in DOWNSTREAM_ACTIVATABLE_STATUSES:
         return False
 
-    activated_at_iso = _to_iso_utc(now)
-    expire_at_iso: str | None = None
-    if row["expire_mode"] == "relative" and row["expire_in_seconds"]:
-        expire_at_iso = _to_iso_utc(now + timedelta(seconds=int(row["expire_in_seconds"])))
+    triggered_at_iso = _to_iso_utc(triggered_at)
+    expire_at_iso: str | None = str(row["expire_at"] or "").strip() or None
+    if row["expire_mode"] == "relative":
+        # Relative expiry is derived again after activation verification passes.
+        expire_at_iso = None
 
     cursor = conn.execute(
         """
         UPDATE strategies
-        SET status = 'ACTIVE',
+        SET status = 'VERIFYING',
             upstream_only_activation = 1,
-            activated_at = ?,
+            activated_at = NULL,
             logical_activated_at = ?,
             expire_at = ?,
             updated_at = ?,
@@ -173,10 +180,9 @@ def _activate_downstream_strategy(
           AND is_deleted = 0
         """,
         (
-            activated_at_iso,
-            _to_iso_utc(triggered_at),
+            triggered_at_iso,
             expire_at_iso,
-            activated_at_iso,
+            _to_iso_utc(now),
             downstream_id,
         ),
     )
@@ -186,8 +192,8 @@ def _activate_downstream_strategy(
     append_event(
         conn,
         strategy_id=downstream_id,
-        event_type="ACTIVATED",
-        detail=f"由上游策略 {upstream_strategy_id} 激活",
+        event_type="VERIFYING",
+        detail=f"由上游策略 {upstream_strategy_id} 触发激活校验",
         ts=now,
     )
     append_event(
@@ -275,8 +281,8 @@ def _build_worker_market_data_provider() -> MarketDataProvider:
     return build_market_data_provider_from_config(fetcher=fetcher)
 
 
-def _build_worker_order_service() -> IBOrderService:
-    return IBOrderService()
+def _build_worker_order_service() -> IBTradeService:
+    return IBTradeService()
 
 
 @dataclass(frozen=True)
@@ -286,6 +292,25 @@ class StrategyTask:
     expected_status: str
     expected_version: int
     enqueued_at: datetime
+
+
+@dataclass(frozen=True)
+class DispatchingTradeState:
+    trade_id: str
+    updated_at: datetime | None
+    ib_order_id: int | None
+
+
+@dataclass(frozen=True)
+class OrderSubmittedTradeState:
+    trade_id: str
+    instruction_status: str
+    order_status: str
+    ib_order_id: int | None
+    ib_order_id_raw: str | None
+    avg_fill_price: float | None
+    filled_qty: float
+    error_message: str | None
 
 
 class StrategyTaskQueue:
@@ -352,7 +377,8 @@ class StrategyExecutionEngine:
         waiting_for_market_data_event_throttle_seconds: int = 120,
         strategy_lock_ttl_seconds: int = DEFAULT_STRATEGY_LOCK_TTL_SECONDS,
         market_data_provider: MarketDataProvider | None = None,
-        order_service: IBOrderService | None = None,
+        order_service: IBTradeService | None = None,
+        dispatching_reconcile_timeout_seconds: float | None = None,
     ) -> None:
         self._logger = logging.getLogger("ibx.worker")
         self._enabled = enabled
@@ -367,6 +393,13 @@ class StrategyExecutionEngine:
         self._strategy_lock_ttl_seconds = max(1, int(strategy_lock_ttl_seconds))
         self._market_data_provider = market_data_provider
         self._order_service = order_service or _build_worker_order_service()
+        timeout_default = float(load_app_config().ib_gateway.timeout_seconds)
+        resolved_timeout = (
+            timeout_default
+            if dispatching_reconcile_timeout_seconds is None
+            else float(dispatching_reconcile_timeout_seconds)
+        )
+        self._dispatching_reconcile_timeout_seconds = max(0.1, resolved_timeout)
         self._stop_event = Event()
         self._start_lock = Lock()
         self._running = False
@@ -626,39 +659,84 @@ class StrategyExecutionEngine:
             conn.commit()
 
         try:
-            now = _utcnow()
             with get_connection() as conn:
-                row = conn.execute(
-                    """
-                    SELECT *
-                    FROM v_strategies_active
-                    WHERE id = ? AND lock_until = ?
-                    """,
-                    (task.strategy_id, lock_until_iso),
-                ).fetchone()
-                if row is None:
-                    return
-                status = str(row["status"])
-                if status in TERMINAL_STATUSES:
-                    return
+                seen_statuses: set[str] = set()
+                while True:
+                    now = _utcnow()
+                    row = conn.execute(
+                        """
+                        SELECT *
+                        FROM v_strategies_active
+                        WHERE id = ? AND lock_until = ?
+                        """,
+                        (task.strategy_id, lock_until_iso),
+                    ).fetchone()
+                    if row is None:
+                        return
+                    status_before = str(row["status"])
+                    if status_before in TERMINAL_STATUSES:
+                        return
 
-                if self._expire_if_needed(conn, strategy_row=row, now=now):
+                    if self._expire_if_needed(conn, strategy_row=row, now=now):
+                        conn.commit()
+                        return
+
+                    latest = conn.execute(
+                        """
+                        SELECT *
+                        FROM v_strategies_active
+                        WHERE id = ? AND lock_until = ?
+                        """,
+                        (task.strategy_id, lock_until_iso),
+                    ).fetchone()
+                    if latest is None:
+                        return
+                    status_before = str(latest["status"])
+                    if status_before in seen_statuses:
+                        self._logger.warning(
+                            "stop inline chaining strategy_id=%s reason=%s repeated_status=%s seen=%s",
+                            task.strategy_id,
+                            task.reason,
+                            status_before,
+                            sorted(seen_statuses),
+                        )
+                        return
+                    seen_statuses.add(status_before)
+                    handler = self._handlers.get(status_before, self._handle_noop)
+                    handler(conn, latest, now)
                     conn.commit()
-                    return
 
-                latest = conn.execute(
-                    """
-                    SELECT *
-                    FROM v_strategies_active
-                    WHERE id = ? AND lock_until = ?
-                    """,
-                    (task.strategy_id, lock_until_iso),
-                ).fetchone()
-                if latest is None:
-                    return
-                handler = self._handlers.get(str(latest["status"]), self._handle_noop)
-                handler(conn, latest, now)
-                conn.commit()
+                    refreshed = conn.execute(
+                        """
+                        SELECT status
+                        FROM v_strategies_active
+                        WHERE id = ? AND lock_until = ?
+                        """,
+                        (task.strategy_id, lock_until_iso),
+                    ).fetchone()
+                    if refreshed is None:
+                        return
+                    status_after = str(refreshed["status"])
+                    if status_after == status_before:
+                        return
+                    # ACTIVE handler requires market data provider; stop inline chaining
+                    # when it is unavailable and wait for the next scheduling cycle.
+                    if status_after == "ACTIVE" and self._market_data_provider is None:
+                        self._logger.debug(
+                            "stop inline chaining strategy_id=%s status=%s (missing market data provider)",
+                            task.strategy_id,
+                            status_after,
+                        )
+                        return
+
+                    self._logger.debug(
+                        "inline transition strategy_id=%s reason=%s %s->%s seen_count=%s",
+                        task.strategy_id,
+                        task.reason,
+                        status_before,
+                        status_after,
+                        len(seen_statuses),
+                    )
         finally:
             if lock_until_iso is not None:
                 with get_connection() as conn:
@@ -734,6 +812,286 @@ class StrategyExecutionEngine:
             """,
             (strategy_id, _to_iso_utc(ts), event_type, detail),
         )
+
+    def _find_dispatching_trade_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_id: str,
+    ) -> DispatchingTradeState | None:
+        row = conn.execute(
+            """
+            SELECT ti.trade_id AS trade_id,
+                   ti.updated_at AS instruction_updated_at,
+                   o.updated_at AS order_updated_at,
+                   o.ib_order_id AS ib_order_id
+            FROM trade_instructions ti
+            LEFT JOIN orders o
+              ON o.id = ti.trade_id
+             AND o.strategy_id = ti.strategy_id
+            WHERE ti.strategy_id = ?
+              AND ti.status = 'ORDER_DISPATCHING'
+            ORDER BY ti.updated_at DESC
+            LIMIT 1
+            """,
+            (strategy_id,),
+        ).fetchone()
+        if row is not None and row["trade_id"] is not None:
+            instruction_updated_at = _parse_iso_utc(row["instruction_updated_at"])
+            order_updated_at = _parse_iso_utc(row["order_updated_at"])
+            updated_at = instruction_updated_at
+            if updated_at is None or (
+                order_updated_at is not None and order_updated_at > updated_at
+            ):
+                updated_at = order_updated_at
+            return DispatchingTradeState(
+                trade_id=str(row["trade_id"]),
+                updated_at=updated_at,
+                ib_order_id=_to_int_or_none(row["ib_order_id"]),
+            )
+
+        row = conn.execute(
+            """
+            SELECT id, updated_at, ib_order_id
+            FROM orders
+            WHERE strategy_id = ?
+              AND status = 'ORDER_DISPATCHING'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (strategy_id,),
+        ).fetchone()
+        if row is not None and row["id"] is not None:
+            return DispatchingTradeState(
+                trade_id=str(row["id"]),
+                updated_at=_parse_iso_utc(row["updated_at"]),
+                ib_order_id=_to_int_or_none(row["ib_order_id"]),
+            )
+        return None
+
+    def _find_order_submitted_trade_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_id: str,
+    ) -> OrderSubmittedTradeState | None:
+        row = conn.execute(
+            """
+            SELECT ti.trade_id AS trade_id,
+                   ti.status AS instruction_status,
+                   o.status AS order_status,
+                   o.ib_order_id AS ib_order_id,
+                   o.avg_fill_price AS avg_fill_price,
+                   o.filled_qty AS filled_qty,
+                   o.error_message AS error_message
+            FROM trade_instructions ti
+            LEFT JOIN orders o
+              ON o.id = ti.trade_id
+             AND o.strategy_id = ti.strategy_id
+            WHERE ti.strategy_id = ?
+            ORDER BY ti.updated_at DESC, ti.trade_id DESC
+            LIMIT 1
+            """,
+            (strategy_id,),
+        ).fetchone()
+        if row is None or row["trade_id"] is None:
+            return None
+
+        instruction_status = str(row["instruction_status"] or "ORDER_SUBMITTED").strip().upper()
+        order_status = str(row["order_status"] or instruction_status).strip().upper()
+        ib_order_id_raw_text = str(row["ib_order_id"] or "").strip()
+        ib_order_id_raw = ib_order_id_raw_text or None
+        avg_fill_price = _to_float(row["avg_fill_price"], default=0.0)
+        if avg_fill_price <= 0:
+            avg_fill_price = None
+        filled_qty = max(0.0, _to_float(row["filled_qty"], default=0.0))
+        error_message = str(row["error_message"] or "").strip() or None
+        return OrderSubmittedTradeState(
+            trade_id=str(row["trade_id"]),
+            instruction_status=instruction_status,
+            order_status=order_status,
+            ib_order_id=_to_int_or_none(ib_order_id_raw),
+            ib_order_id_raw=ib_order_id_raw,
+            avg_fill_price=avg_fill_price,
+            filled_qty=filled_qty,
+            error_message=error_message,
+        )
+
+    def _reconcile_dispatching_trade(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        strategy_id: str,
+        trade_state: DispatchingTradeState,
+        now: datetime,
+    ) -> None:
+        trade_id = trade_state.trade_id
+        snapshot: Any | None = None
+        lookup_error: str | None = None
+        try:
+            if trade_state.ib_order_id is not None:
+                snapshot = self._order_service.poll_order_status(perm_id=trade_state.ib_order_id)
+            if snapshot is None:
+                poll_by_ref = getattr(self._order_service, "poll_order_status_by_order_ref", None)
+                if callable(poll_by_ref):
+                    snapshot = poll_by_ref(order_ref=trade_id)
+        except Exception as exc:  # noqa: BLE001
+            lookup_error = str(exc).strip() or exc.__class__.__name__
+            self._logger.warning(
+                "dispatching trade lookup failed strategy_id=%s trade_id=%s error=%s",
+                strategy_id,
+                trade_id,
+                lookup_error,
+            )
+
+        now_iso = _to_iso_utc(now)
+        if snapshot is not None:
+            recovered_status = str(getattr(snapshot, "normalized_status", "") or "ORDER_SUBMITTED").upper()
+            recovered_order_id = _to_int_or_none(getattr(snapshot, "order_id", None))
+            recovered_perm_id = _to_int_or_none(getattr(snapshot, "perm_id", None))
+            recovered_ib_order_id = (
+                str(recovered_perm_id)
+                if recovered_perm_id is not None
+                else (str(trade_state.ib_order_id) if trade_state.ib_order_id is not None else None)
+            )
+            recovered_error = str(getattr(snapshot, "error_message", "") or "").strip() or None
+            recovered_avg_fill_price = _to_float(getattr(snapshot, "avg_fill_price", None), default=0.0)
+            if recovered_avg_fill_price <= 0:
+                recovered_avg_fill_price = None
+            recovered_filled_qty = _to_float(getattr(snapshot, "filled_qty", 0.0), default=0.0)
+
+            conn.execute(
+                """
+                UPDATE trade_instructions
+                SET status = ?, updated_at = ?
+                WHERE trade_id = ? AND strategy_id = ?
+                """,
+                (recovered_status, now_iso, trade_id, strategy_id),
+            )
+            conn.execute(
+                """
+                UPDATE orders
+                SET ib_order_id = ?,
+                    status = ?,
+                    avg_fill_price = ?,
+                    filled_qty = ?,
+                    error_message = ?,
+                    updated_at = ?
+                WHERE id = ? AND strategy_id = ?
+                """,
+                (
+                    recovered_ib_order_id,
+                    recovered_status,
+                    recovered_avg_fill_price,
+                    recovered_filled_qty,
+                    recovered_error,
+                    now_iso,
+                    trade_id,
+                    strategy_id,
+                ),
+            )
+            detail = (
+                f"reconciled ORDER_DISPATCHING trade_id={trade_id} "
+                f"order_id={recovered_order_id or '-'} perm_id={recovered_perm_id or '-'} "
+                f"status={recovered_status}"
+            )
+            conn.execute(
+                """
+                INSERT INTO trade_logs (timestamp, strategy_id, trade_id, stage, result, detail)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (now_iso, strategy_id, trade_id, "EXECUTION", recovered_status, detail),
+            )
+            target_status = _strategy_status_from_trade_status(recovered_status)
+            final_cursor = conn.execute(
+                """
+                UPDATE strategies
+                SET status = ?, updated_at = ?, version = version + 1
+                WHERE id = ?
+                  AND status IN ('TRIGGERED', 'ORDER_SUBMITTED')
+                  AND is_deleted = 0
+                """,
+                (target_status, now_iso, strategy_id),
+            )
+            if final_cursor.rowcount > 0:
+                self._append_event(
+                    conn,
+                    strategy_id=strategy_id,
+                    event_type=target_status,
+                    detail=f"恢复挂起交易指令 {trade_id}: {recovered_status}",
+                    ts=now,
+                )
+            return
+
+        dispatch_updated_at = trade_state.updated_at
+        elapsed_seconds = 0.0
+        if dispatch_updated_at is not None:
+            elapsed_seconds = max(0.0, (now - dispatch_updated_at).total_seconds())
+        timeout_seconds = float(self._dispatching_reconcile_timeout_seconds)
+        if elapsed_seconds < timeout_seconds:
+            self._logger.info(
+                "dispatching trade not found yet strategy_id=%s trade_id=%s age=%.1fs timeout=%.1fs",
+                strategy_id,
+                trade_id,
+                elapsed_seconds,
+                timeout_seconds,
+            )
+            return
+
+        timeout_reason = (
+            f"ORDER_DISPATCHING timeout>{timeout_seconds:.1f}s broker order not found"
+            + (f" lookup_error={lookup_error}" if lookup_error else "")
+        )
+        conn.execute(
+            """
+            UPDATE trade_instructions
+            SET status = 'FAILED', updated_at = ?
+            WHERE trade_id = ? AND strategy_id = ?
+            """,
+            (now_iso, trade_id, strategy_id),
+        )
+        conn.execute(
+            """
+            UPDATE orders
+            SET status = 'FAILED',
+                error_message = ?,
+                updated_at = ?
+            WHERE id = ? AND strategy_id = ?
+            """,
+            (timeout_reason, now_iso, trade_id, strategy_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO trade_logs (timestamp, strategy_id, trade_id, stage, result, detail)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now_iso,
+                strategy_id,
+                trade_id,
+                "EXECUTION",
+                "FAILED",
+                f"dispatch timeout failed trade_id={trade_id} reason={timeout_reason}",
+            ),
+        )
+        final_cursor = conn.execute(
+            """
+            UPDATE strategies
+            SET status = 'FAILED', updated_at = ?, version = version + 1
+            WHERE id = ?
+              AND status IN ('TRIGGERED', 'ORDER_SUBMITTED')
+              AND is_deleted = 0
+            """,
+            (now_iso, strategy_id),
+        )
+        if final_cursor.rowcount > 0:
+            self._append_event(
+                conn,
+                strategy_id=strategy_id,
+                event_type="FAILED",
+                detail=f"交易指令 {trade_id} 提交超时：{timeout_reason}",
+                ts=now,
+            )
 
     def _get_runtime_state(
         self,
@@ -1065,6 +1423,7 @@ class StrategyExecutionEngine:
                         {
                             "contract_id": contract_req.contract_id,
                             "base_bar": contract_req.base_bar,
+                            "effective_window_points": int(contract_req.effective_window_points),
                             "required_points": int(contract_req.required_points),
                             "include_partial_bar": bool(contract_req.include_partial_bar),
                             "use_rth": True,
@@ -1096,6 +1455,7 @@ class StrategyExecutionEngine:
                 contract_summary: dict[str, Any] = {
                     "contract_id": contract_id,
                     "status": "waiting",
+                    "effective_window_points": int(contract_req.effective_window_points),
                     "required_points": int(contract_req.required_points),
                     "include_partial_bar": bool(contract_req.include_partial_bar),
                     "base_bar": contract_req.base_bar,
@@ -1128,13 +1488,19 @@ class StrategyExecutionEngine:
                 lookback_points = max(3, int(contract_req.required_points) + 2)
                 contract_summary["lookback_points"] = lookback_points
                 required_start_time = now - (bar_delta * lookback_points)
-                requirement_last_end_at = self._resolve_requirement_last_monitoring_data_end_at(
+                recorded_last_end_at, has_recorded_last_end = self._resolve_requirement_last_monitoring_data_end_at(
                     last_monitoring_data_end_map=last_monitoring_data_end_map,
                     condition_id=prepared.condition_id,
                     contract_id=contract_id,
                     default_last_monitoring_data_end_at=initial_last_monitoring_data_end_at,
                 )
-                contract_summary["last_monitoring_data_end_at"] = _to_iso_utc(requirement_last_end_at)
+                overlap_points = max(0, int(contract_req.effective_window_points) - 1)
+                requirement_last_end_at = recorded_last_end_at
+                if has_recorded_last_end and overlap_points > 0:
+                    requirement_last_end_at = recorded_last_end_at - (bar_delta * overlap_points)
+                contract_summary["last_monitoring_data_end_at"] = _to_iso_utc(recorded_last_end_at)
+                contract_summary["fetch_anchor_monitoring_end_at"] = _to_iso_utc(requirement_last_end_at)
+                contract_summary["overlap_points"] = overlap_points
                 start_time = requirement_last_end_at if required_start_time > requirement_last_end_at else required_start_time
                 cache_key = (
                     f"{payload['market']}|{payload['code']}",
@@ -1181,7 +1547,7 @@ class StrategyExecutionEngine:
                 )
                 if latest_non_partial_bar is not None:
                     contract_summary["last_non_partial_bar_at"] = _to_iso_utc(latest_non_partial_bar)
-                    if latest_non_partial_bar > requirement_last_end_at:
+                    if latest_non_partial_bar > recorded_last_end_at:
                         condition_has_new_data = True
                         contract_summary["has_new_data"] = True
                         key = (prepared.condition_id, contract_id)
@@ -1522,11 +1888,14 @@ class StrategyExecutionEngine:
         condition_id: str,
         contract_id: int,
         default_last_monitoring_data_end_at: datetime,
-    ) -> datetime:
+    ) -> tuple[datetime, bool]:
         by_contract = last_monitoring_data_end_map.get(condition_id)
         if by_contract is None:
-            return default_last_monitoring_data_end_at
-        return by_contract.get(str(contract_id), default_last_monitoring_data_end_at)
+            return default_last_monitoring_data_end_at, False
+        resolved = by_contract.get(str(contract_id))
+        if resolved is None:
+            return default_last_monitoring_data_end_at, False
+        return resolved, True
 
     def _handle_active(self, conn: sqlite3.Connection, strategy_row: sqlite3.Row, now: datetime) -> None:
         strategy_id = strategy_row["id"]
@@ -1761,7 +2130,21 @@ class StrategyExecutionEngine:
             conn,
             strategy_id=strategy_id,
             strategy_row=strategy_row,
+            trade_service=self._order_service,
         )
+        if verification_result.trade_validation_context is not None:
+            context_detail = json.dumps(
+                verification_result.trade_validation_context,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            self._append_event(
+                conn,
+                strategy_id=strategy_id,
+                event_type="VERIFY_TRADE_ACTION_CONTEXT",
+                detail=context_detail,
+                ts=now,
+            )
         if not verification_result.passed:
             cursor = conn.execute(
                 """
@@ -1843,50 +2226,36 @@ class StrategyExecutionEngine:
         )
 
         if isinstance(trade_action_json, dict):
-            trade_id = f"T-{uuid4().hex[:10].upper()}"
-            instruction_summary = _build_instruction_summary(trade_action_json)
-            submit_status = "ORDER_SUBMITTED"
-            submit_detail = instruction_summary
-            ib_order_id: str | None = None
-            avg_fill_price: float | None = None
-            filled_qty = 0.0
-            error_message: str | None = None
-            quantity = _safe_positive_quantity(trade_action_json.get("quantity"))
-            order_payload: dict[str, Any] = dict(trade_action_json)
-            try:
-                submit_result = self._order_service.submit_trade_action(
-                    market=str(strategy_row["market"] or "").strip().upper(),
-                    trade_action=trade_action_json,
-                    order_ref=trade_id,
+            dispatching_trade_state = self._find_dispatching_trade_state(conn, strategy_id=strategy_id)
+            if dispatching_trade_state is not None:
+                self._reconcile_dispatching_trade(
+                    conn,
+                    strategy_id=strategy_id,
+                    trade_state=dispatching_trade_state,
+                    now=now,
                 )
-                submit_status = str(submit_result.normalized_status or "ORDER_SUBMITTED").upper()
-                ib_order_id = None if submit_result.order_id is None else str(submit_result.order_id)
-                avg_fill_price = submit_result.avg_fill_price
-                filled_qty = float(submit_result.filled_qty)
-                quantity = _safe_positive_quantity(submit_result.quantity)
-                order_payload = {
-                    "trade_action": trade_action_json,
-                    "submit_result": {
-                        "order_id": submit_result.order_id,
-                        "perm_id": submit_result.perm_id,
-                        "status": submit_result.status,
-                        "normalized_status": submit_result.normalized_status,
-                        "filled_qty": submit_result.filled_qty,
-                        "remaining_qty": submit_result.remaining_qty,
-                        "avg_fill_price": submit_result.avg_fill_price,
-                    },
-                }
-                submit_detail = (
-                    f"{instruction_summary} "
-                    f"ib_order_id={submit_result.order_id or '-'} "
-                    f"perm_id={submit_result.perm_id or '-'} "
-                    f"status={submit_result.normalized_status}"
-                )
-            except Exception as exc:  # noqa: BLE001
-                submit_status = "FAILED"
-                error_message = str(exc).strip() or exc.__class__.__name__
-                submit_detail = f"{instruction_summary} submit_failed={error_message}"
+                return
 
+            trade_action_payload = dict(trade_action_json)
+            trade_action_payload["market"] = str(strategy_row["market"] or "").strip().upper()
+            if not str(trade_action_payload.get("account_code", "")).strip():
+                trade_action_payload["account_code"] = getattr(
+                    self._order_service,
+                    "default_account_code",
+                    None,
+                )
+            trade_id = f"T-{uuid4().hex[:10].upper()}"
+            instruction_summary = _build_instruction_summary(trade_action_payload)
+            quantity = _safe_positive_quantity(trade_action_payload.get("quantity"))
+
+            dispatch_payload: dict[str, Any] = {
+                "trade_action": trade_action_payload,
+                "dispatch": {
+                    "order_ref": trade_id,
+                    "client_id": getattr(self._order_service, "client_id", None),
+                },
+            }
+            dispatch_detail = f"{instruction_summary} order_ref={trade_id} status=ORDER_DISPATCHING"
             conn.execute(
                 """
                 INSERT INTO trade_instructions (
@@ -1897,7 +2266,7 @@ class StrategyExecutionEngine:
                     trade_id,
                     strategy_id,
                     instruction_summary,
-                    submit_status,
+                    "ORDER_DISPATCHING",
                     None,
                     now_iso,
                 ),
@@ -1912,13 +2281,13 @@ class StrategyExecutionEngine:
                 (
                     trade_id,
                     strategy_id,
-                    ib_order_id,
-                    submit_status,
+                    None,
+                    "ORDER_DISPATCHING",
                     quantity,
-                    avg_fill_price,
-                    filled_qty,
-                    error_message,
-                    json.dumps(order_payload, ensure_ascii=False, separators=(",", ":")),
+                    None,
+                    0.0,
+                    None,
+                    json.dumps(dispatch_payload, ensure_ascii=False, separators=(",", ":")),
                     now_iso,
                     now_iso,
                 ),
@@ -1933,26 +2302,139 @@ class StrategyExecutionEngine:
                     strategy_id,
                     trade_id,
                     "EXECUTION",
+                    "ORDER_DISPATCHING",
+                    dispatch_detail,
+                ),
+            )
+            self._append_event(
+                conn,
+                strategy_id=strategy_id,
+                event_type="ORDER_DISPATCHING",
+                detail=f"开始提交交易指令 {trade_id}",
+                ts=now,
+            )
+
+            # Persist dispatch marker before touching external broker side effects.
+            conn.commit()
+
+            submit_status = "FAILED"
+            submit_detail = instruction_summary
+            ib_order_id: str | None = None
+            avg_fill_price: float | None = None
+            filled_qty = 0.0
+            error_message: str | None = None
+            order_payload: dict[str, Any] = dict(dispatch_payload)
+            try:
+                submit_result = self._order_service.submit_trade_action(
+                    trade_action=trade_action_payload,
+                    order_ref=trade_id,
+                )
+                submit_status = str(submit_result.normalized_status or "ORDER_SUBMITTED").upper()
+                ib_order_id = None if submit_result.perm_id is None else str(submit_result.perm_id)
+                avg_fill_price = submit_result.avg_fill_price
+                filled_qty = float(submit_result.filled_qty)
+                quantity = _safe_positive_quantity(submit_result.quantity)
+                order_payload = {
+                    "trade_action": trade_action_payload,
+                    "submit_result": {
+                        "order_id": submit_result.order_id,
+                        "perm_id": submit_result.perm_id,
+                        "status": submit_result.status,
+                        "normalized_status": submit_result.normalized_status,
+                        "filled_qty": submit_result.filled_qty,
+                        "remaining_qty": submit_result.remaining_qty,
+                        "avg_fill_price": submit_result.avg_fill_price,
+                    },
+                }
+                submit_detail = (
+                    f"{instruction_summary} "
+                    f"ib_order_id={submit_result.perm_id or '-'} "
+                    f"order_id={submit_result.order_id or '-'} "
+                    f"perm_id={submit_result.perm_id or '-'} "
+                    f"status={submit_result.normalized_status}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                submit_status = "FAILED"
+                error_message = str(exc).strip() or exc.__class__.__name__
+                submit_detail = f"{instruction_summary} submit_failed={error_message}"
+
+            finished_at = _utcnow()
+            finished_iso = _to_iso_utc(finished_at)
+            conn.execute(
+                """
+                UPDATE trade_instructions
+                SET status = ?, updated_at = ?
+                WHERE trade_id = ? AND strategy_id = ?
+                """,
+                (submit_status, finished_iso, trade_id, strategy_id),
+            )
+            conn.execute(
+                """
+                UPDATE orders
+                SET ib_order_id = ?,
+                    status = ?,
+                    qty = ?,
+                    avg_fill_price = ?,
+                    filled_qty = ?,
+                    error_message = ?,
+                    order_payload_json = ?,
+                    updated_at = ?
+                WHERE id = ? AND strategy_id = ?
+                """,
+                (
+                    ib_order_id,
+                    submit_status,
+                    quantity,
+                    avg_fill_price,
+                    filled_qty,
+                    error_message,
+                    json.dumps(order_payload, ensure_ascii=False, separators=(",", ":")),
+                    finished_iso,
+                    trade_id,
+                    strategy_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO trade_logs (timestamp, strategy_id, trade_id, stage, result, detail)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    finished_iso,
+                    strategy_id,
+                    trade_id,
+                    "EXECUTION",
                     submit_status,
                     submit_detail,
                 ),
             )
+            if submit_status != "ORDER_SUBMITTED":
+                self._append_event(
+                    conn,
+                    strategy_id=strategy_id,
+                    event_type="ORDER_SUBMITTED_SKIPPED",
+                    detail=f"提交交易指令 {trade_id} 直接返回 {submit_status}，跳过 ORDER_SUBMITTED",
+                    ts=finished_at,
+                )
+
             target_status = _strategy_status_from_trade_status(submit_status)
-            cursor = conn.execute(
+            final_cursor = conn.execute(
                 """
                 UPDATE strategies
                 SET status = ?, updated_at = ?, version = version + 1
-                WHERE id = ? AND status = 'TRIGGERED' AND is_deleted = 0
+                WHERE id = ?
+                  AND status IN ('TRIGGERED', 'ORDER_SUBMITTED')
+                  AND is_deleted = 0
                 """,
-                (target_status, now_iso, strategy_id),
+                (target_status, finished_iso, strategy_id),
             )
-            if cursor.rowcount > 0:
+            if final_cursor.rowcount > 0:
                 self._append_event(
                     conn,
                     strategy_id=strategy_id,
                     event_type=target_status,
                     detail=f"提交交易指令 {trade_id}: {submit_status}",
-                    ts=now,
+                    ts=finished_at,
                 )
             return
 
@@ -1998,7 +2480,125 @@ class StrategyExecutionEngine:
         strategy_row: sqlite3.Row,
         now: datetime,
     ) -> None:
-        sync_order_submitted_strategy_status(conn, strategy_row=strategy_row, now=now)
+        strategy_id = str(strategy_row["id"])
+        trade_state = self._find_order_submitted_trade_state(conn, strategy_id=strategy_id)
+        if trade_state is None:
+            return
+
+        now_iso = _to_iso_utc(now)
+        reconciled_status = trade_state.instruction_status
+        reconciled_ib_order_id = trade_state.ib_order_id_raw
+        reconciled_avg_fill_price = trade_state.avg_fill_price
+        reconciled_filled_qty = trade_state.filled_qty
+        reconciled_error_message = trade_state.error_message
+        snapshot: Any | None = None
+        lookup_error: str | None = None
+        try:
+            if trade_state.ib_order_id is not None:
+                snapshot = self._order_service.poll_order_status(perm_id=trade_state.ib_order_id)
+            if snapshot is None:
+                poll_by_ref = getattr(self._order_service, "poll_order_status_by_order_ref", None)
+                if callable(poll_by_ref):
+                    snapshot = poll_by_ref(order_ref=trade_state.trade_id)
+        except Exception as exc:  # noqa: BLE001
+            lookup_error = str(exc).strip() or exc.__class__.__name__
+            self._logger.warning(
+                "order_submitted poll failed strategy_id=%s trade_id=%s error=%s",
+                strategy_id,
+                trade_state.trade_id,
+                lookup_error,
+            )
+
+        if snapshot is not None:
+            reconciled_status = str(getattr(snapshot, "normalized_status", "") or "ORDER_SUBMITTED").upper()
+            perm_id = _to_int_or_none(getattr(snapshot, "perm_id", None))
+            if perm_id is not None:
+                reconciled_ib_order_id = str(perm_id)
+            reconciled_avg_fill_price = _to_float(getattr(snapshot, "avg_fill_price", None), default=0.0)
+            if reconciled_avg_fill_price <= 0:
+                reconciled_avg_fill_price = None
+            reconciled_filled_qty = max(0.0, _to_float(getattr(snapshot, "filled_qty", 0.0), default=0.0))
+            reconciled_error_message = str(getattr(snapshot, "error_message", "") or "").strip() or None
+
+        instruction_changed = reconciled_status != trade_state.instruction_status
+        order_changed = (
+            reconciled_status != trade_state.order_status
+            or reconciled_ib_order_id != trade_state.ib_order_id_raw
+            or reconciled_avg_fill_price != trade_state.avg_fill_price
+            or abs(reconciled_filled_qty - trade_state.filled_qty) > 1e-9
+            or reconciled_error_message != trade_state.error_message
+        )
+        if instruction_changed:
+            conn.execute(
+                """
+                UPDATE trade_instructions
+                SET status = ?, updated_at = ?
+                WHERE trade_id = ? AND strategy_id = ?
+                """,
+                (reconciled_status, now_iso, trade_state.trade_id, strategy_id),
+            )
+        if order_changed:
+            conn.execute(
+                """
+                UPDATE orders
+                SET ib_order_id = ?,
+                    status = ?,
+                    avg_fill_price = ?,
+                    filled_qty = ?,
+                    error_message = ?,
+                    updated_at = ?
+                WHERE id = ? AND strategy_id = ?
+                """,
+                (
+                    reconciled_ib_order_id,
+                    reconciled_status,
+                    reconciled_avg_fill_price,
+                    reconciled_filled_qty,
+                    reconciled_error_message,
+                    now_iso,
+                    trade_state.trade_id,
+                    strategy_id,
+                ),
+            )
+        if snapshot is not None and (instruction_changed or order_changed):
+            recovered_order_id = _to_int_or_none(getattr(snapshot, "order_id", None))
+            recovered_perm_id = _to_int_or_none(getattr(snapshot, "perm_id", None))
+            detail = (
+                f"polled ORDER_SUBMITTED trade_id={trade_state.trade_id} "
+                f"order_id={recovered_order_id or '-'} perm_id={recovered_perm_id or '-'} "
+                f"status={reconciled_status}"
+            )
+            conn.execute(
+                """
+                INSERT INTO trade_logs (timestamp, strategy_id, trade_id, stage, result, detail)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (now_iso, strategy_id, trade_state.trade_id, "EXECUTION", reconciled_status, detail),
+            )
+
+        target_status = _strategy_status_from_trade_status(reconciled_status)
+        if target_status == "ORDER_SUBMITTED":
+            return
+
+        final_cursor = conn.execute(
+            """
+            UPDATE strategies
+            SET status = ?, updated_at = ?, version = version + 1
+            WHERE id = ? AND status = 'ORDER_SUBMITTED' AND is_deleted = 0
+            """,
+            (target_status, now_iso, strategy_id),
+        )
+        if final_cursor.rowcount > 0:
+            detail = f"订单状态同步 {trade_state.trade_id}: {reconciled_status}"
+            if lookup_error:
+                detail = f"{detail} (poll_error={lookup_error})"
+            self._append_event(
+                conn,
+                strategy_id=strategy_id,
+                event_type=target_status,
+                detail=detail,
+                ts=now,
+            )
 
     def _handle_noop(self, conn: sqlite3.Connection, strategy_row: sqlite3.Row, now: datetime) -> None:
         _ = (conn, strategy_row, now)

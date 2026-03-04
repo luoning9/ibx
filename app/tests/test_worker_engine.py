@@ -224,6 +224,108 @@ class _FakeOrderService:
         return self.poll_snapshot
 
 
+def _run_market_data_start_case(
+    tmp_path: Path,
+    *,
+    case_id: str,
+    trigger_mode: str,
+    evaluation_window: str,
+    activation_at: datetime | None = None,
+    last_monitoring_data_end_at_map: dict[str, dict[str, str]] | None = None,
+) -> HistoricalBarsRequest:
+    strategy_id = f"S-WORKER-MD-START-{case_id}"
+    db_path = tmp_path / f"ibx_worker_market_data_start_{case_id}.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        strategy_id,
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": trigger_mode,
+                    "evaluation_window": evaluation_window,
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        strategy_id,
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+    if activation_at is not None:
+        activation_iso = activation_at.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        with get_connection(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE strategies
+                SET activated_at = ?, logical_activated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (activation_iso, activation_iso, _iso_now(), strategy_id),
+            )
+            conn.commit()
+    if last_monitoring_data_end_at_map is not None:
+        with get_connection(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO strategy_runs (
+                    strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
+                    condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    strategy_id,
+                    json.dumps(last_monitoring_data_end_at_map),
+                    _iso_now(),
+                    _iso_now(),
+                    0,
+                    "conditions_not_met",
+                    "evaluated",
+                    1,
+                    "{}",
+                    _iso_now(),
+                ),
+            )
+            conn.commit()
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0, 102.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once(strategy_id, reason="unit_test")
+        assert provider.requests
+        return provider.requests[0]
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
+
+
 def test_strategy_task_queue_deduplicates_inflight() -> None:
     task_queue = StrategyTaskQueue(maxsize=8)
     task = StrategyTask(
@@ -329,6 +431,62 @@ def test_process_once_skips_when_already_inflight(tmp_path) -> None:
             assert run_row["c"] == 0
     finally:
         engine._queue.release("S-WORKER-INFLIGHT")
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_task_stops_inline_chaining_when_status_repeats(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_inline_repeat_stop.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy("S-WORKER-INLINE-REPEAT", db_path=db_path, status="ACTIVE")
+
+    call_count = {"ACTIVE": 0, "TRIGGERED": 0}
+
+    def _to_iso(dt: datetime) -> str:
+        return dt.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _flip_to_triggered(conn, strategy_row, now):  # type: ignore[no-untyped-def]
+        call_count["ACTIVE"] += 1
+        conn.execute(
+            """
+            UPDATE strategies
+            SET status = 'TRIGGERED', updated_at = ?, version = version + 1
+            WHERE id = ? AND status = 'ACTIVE' AND is_deleted = 0
+            """,
+            (_to_iso(now), strategy_row["id"]),
+        )
+
+    def _flip_to_active(conn, strategy_row, now):  # type: ignore[no-untyped-def]
+        call_count["TRIGGERED"] += 1
+        conn.execute(
+            """
+            UPDATE strategies
+            SET status = 'ACTIVE', updated_at = ?, version = version + 1
+            WHERE id = ? AND status = 'TRIGGERED' AND is_deleted = 0
+            """,
+            (_to_iso(now), strategy_row["id"]),
+        )
+
+    engine = StrategyExecutionEngine(enabled=False, monitor_interval_seconds=60, worker_count=1)
+    engine.register_handler(["ACTIVE"], _flip_to_triggered)
+    engine.register_handler(["TRIGGERED"], _flip_to_active)
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-INLINE-REPEAT", reason="unit_test")
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-INLINE-REPEAT",),
+            ).fetchone()
+            assert row is not None
+            assert row["status"] == "ACTIVE"
+        assert call_count["ACTIVE"] == 1
+        assert call_count["TRIGGERED"] == 1
+    finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
         else:
@@ -727,7 +885,18 @@ def test_process_once_active_uses_market_data_provider_and_triggers(tmp_path) ->
                 ("S-WORKER-MD",),
             ).fetchone()
             assert strategy_row is not None
-            assert strategy_row["status"] == "TRIGGERED"
+            assert strategy_row["status"] == "FAILED"
+
+            triggered_event = conn.execute(
+                """
+                SELECT 1
+                FROM strategy_events
+                WHERE strategy_id = ? AND event_type = 'TRIGGERED'
+                LIMIT 1
+                """,
+                ("S-WORKER-MD",),
+            ).fetchone()
+            assert triggered_event is not None
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
@@ -817,6 +986,185 @@ def test_market_data_requirement_uses_per_key_last_monitoring_end_as_start_time(
             os.environ.pop("IBX_GATEWAY_READY", None)
         else:
             os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
+
+
+def test_market_data_requirement_with_window_overlap_uses_shifted_anchor(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_market_data_window_overlap.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-WINDOW-OVERLAP",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_CONFIRM",
+                    "evaluation_window": "30m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-WINDOW-OVERLAP",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+    last_end = (datetime.now(UTC) - timedelta(minutes=10)).replace(microsecond=0)
+    last_end_iso = last_end.isoformat().replace("+00:00", "Z")
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-WORKER-MD-WINDOW-OVERLAP",
+                json.dumps({"c1": {"1": last_end_iso}}),
+                _iso_now(),
+                _iso_now(),
+                0,
+                "conditions_not_met",
+                "evaluated",
+                1,
+                "{}",
+                _iso_now(),
+            ),
+        )
+        conn.commit()
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.0, 102.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once("S-WORKER-MD-WINDOW-OVERLAP", reason="unit_test")
+        assert len(provider.requests) > 0
+        request = provider.requests[0]
+        # LEVEL_CONFIRM + 30m => base_bar=5m, effective_window_points=6, overlap=(6-1)=5 bars.
+        expected_start = (last_end - timedelta(minutes=25)).isoformat().replace("+00:00", "Z")
+        actual_start = request.start_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        assert actual_start == expected_start
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
+
+
+def test_market_data_requirement_without_history_uses_initial_activation_when_older_than_lookback(tmp_path) -> None:
+    activation_at = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+    request = _run_market_data_start_case(
+        tmp_path,
+        case_id="NO-HISTORY-INITIAL-OLD",
+        trigger_mode="LEVEL_INSTANT",
+        evaluation_window="1m",
+        activation_at=activation_at,
+        last_monitoring_data_end_at_map=None,
+    )
+    actual_start = request.start_time.replace(microsecond=0)
+    assert actual_start == activation_at
+
+
+def test_market_data_requirement_without_history_uses_required_lookback_when_initial_recent(tmp_path) -> None:
+    request = _run_market_data_start_case(
+        tmp_path,
+        case_id="NO-HISTORY-INITIAL-RECENT",
+        trigger_mode="LEVEL_INSTANT",
+        evaluation_window="1m",
+        last_monitoring_data_end_at_map=None,
+    )
+    expected_start = (request.end_time - timedelta(minutes=3)).replace(microsecond=0)
+    actual_start = request.start_time.replace(microsecond=0)
+    assert actual_start == expected_start
+
+
+def test_market_data_requirement_with_recent_last_end_prefers_required_lookback_for_instant(tmp_path) -> None:
+    recorded_last_end = (datetime.now(UTC) - timedelta(minutes=1)).replace(microsecond=0)
+    request = _run_market_data_start_case(
+        tmp_path,
+        case_id="RECENT-LAST-END-INSTANT",
+        trigger_mode="LEVEL_INSTANT",
+        evaluation_window="1m",
+        last_monitoring_data_end_at_map={
+            "c1": {"1": recorded_last_end.isoformat().replace("+00:00", "Z")},
+        },
+    )
+    expected_start = (request.end_time - timedelta(minutes=3)).replace(microsecond=0)
+    actual_start = request.start_time.replace(microsecond=0)
+    assert actual_start == expected_start
+
+
+def test_market_data_requirement_with_recent_last_end_and_overlap_prefers_required_lookback(tmp_path) -> None:
+    # LEVEL_CONFIRM + 5m => base_bar=1m, required_points=4, effective_window_points=5, overlap=4.
+    # For recent recorded_last_end, required_start(now-6m) should be earlier than shifted anchor(now-5m).
+    recorded_last_end = (datetime.now(UTC) - timedelta(minutes=1)).replace(microsecond=0)
+    request = _run_market_data_start_case(
+        tmp_path,
+        case_id="RECENT-LAST-END-CONFIRM-OVERLAP",
+        trigger_mode="LEVEL_CONFIRM",
+        evaluation_window="5m",
+        last_monitoring_data_end_at_map={
+            "c1": {"1": recorded_last_end.isoformat().replace("+00:00", "Z")},
+        },
+    )
+    expected_start = (request.end_time - timedelta(minutes=6)).replace(microsecond=0)
+    actual_start = request.start_time.replace(microsecond=0)
+    assert actual_start == expected_start
+
+
+def test_market_data_requirement_falls_back_to_initial_when_condition_key_missing(tmp_path) -> None:
+    activation_at = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+    request = _run_market_data_start_case(
+        tmp_path,
+        case_id="MISSING-CONDITION-KEY",
+        trigger_mode="LEVEL_INSTANT",
+        evaluation_window="1m",
+        activation_at=activation_at,
+        last_monitoring_data_end_at_map={
+            "other_condition": {"1": (datetime.now(UTC) - timedelta(minutes=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")},
+        },
+    )
+    actual_start = request.start_time.replace(microsecond=0)
+    assert actual_start == activation_at
+
+
+def test_market_data_requirement_falls_back_to_initial_when_contract_key_missing(tmp_path) -> None:
+    activation_at = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+    request = _run_market_data_start_case(
+        tmp_path,
+        case_id="MISSING-CONTRACT-KEY",
+        trigger_mode="LEVEL_INSTANT",
+        evaluation_window="1m",
+        activation_at=activation_at,
+        last_monitoring_data_end_at_map={
+            "c1": {"999": (datetime.now(UTC) - timedelta(minutes=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")},
+        },
+    )
+    actual_start = request.start_time.replace(microsecond=0)
+    assert actual_start == activation_at
 
 
 def test_waiting_for_market_data_does_not_advance_last_monitoring_end(tmp_path) -> None:
@@ -1462,6 +1810,142 @@ def test_process_once_triggered_creates_trade_instruction(tmp_path) -> None:
             assert order_row["status"] == "ORDER_SUBMITTED"
             assert order_row["ib_order_id"] == "91001"
             assert len(order_service.calls) == 1
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_triggered_logs_order_submitted_skipped_when_submit_returns_filled(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_triggered_immediate_filled.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-TRIG-FILLED",
+        db_path=db_path,
+        status="TRIGGERED",
+        trade_action_json=json.dumps(
+            {
+                "action_type": "STOCK_TRADE",
+                "symbol": "AAPL",
+                "side": "BUY",
+                "order_type": "MKT",
+                "quantity": 1,
+            }
+        ),
+    )
+    order_service = _FakeOrderService(normalized_status="FILLED", filled_qty=1.0, remaining_qty=0.0, avg_fill_price=188.5)
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        order_service=order_service,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-TRIG-FILLED", reason="unit_test")
+        with get_connection() as conn:
+            strategy_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-TRIG-FILLED",),
+            ).fetchone()
+            assert strategy_row is not None
+            assert strategy_row["status"] == "FILLED"
+
+            skipped_row = conn.execute(
+                """
+                SELECT event_type, detail
+                FROM strategy_events
+                WHERE strategy_id = ? AND event_type = 'ORDER_SUBMITTED_SKIPPED'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("S-WORKER-TRIG-FILLED",),
+            ).fetchone()
+            assert skipped_row is not None
+            assert skipped_row["event_type"] == "ORDER_SUBMITTED_SKIPPED"
+            assert "FILLED" in str(skipped_row["detail"] or "")
+            assert len(order_service.calls) == 1
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_process_once_triggered_moves_downstream_to_verifying(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_triggered_downstream_verify.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-DOWNSTREAM",
+        db_path=db_path,
+        status="PENDING_ACTIVATION",
+    )
+    _insert_strategy(
+        "S-WORKER-UPSTREAM",
+        db_path=db_path,
+        status="TRIGGERED",
+        trade_action_json=json.dumps(
+            {
+                "action_type": "STOCK_TRADE",
+                "symbol": "AAPL",
+                "side": "BUY",
+                "order_type": "MKT",
+                "quantity": 1,
+            }
+        ),
+    )
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE strategies SET next_strategy_id = ?, next_strategy_note = ? WHERE id = ?",
+            ("S-WORKER-DOWNSTREAM", "downstream link", "S-WORKER-UPSTREAM"),
+        )
+        conn.commit()
+
+    order_service = _FakeOrderService()
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        order_service=order_service,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-UPSTREAM", reason="unit_test")
+        with get_connection() as conn:
+            upstream_row = conn.execute(
+                "SELECT status FROM strategies WHERE id = ?",
+                ("S-WORKER-UPSTREAM",),
+            ).fetchone()
+            assert upstream_row is not None
+            assert upstream_row["status"] == "ORDER_SUBMITTED"
+
+            downstream_row = conn.execute(
+                "SELECT status, activated_at, logical_activated_at FROM strategies WHERE id = ?",
+                ("S-WORKER-DOWNSTREAM",),
+            ).fetchone()
+            assert downstream_row is not None
+            assert downstream_row["status"] == "VERIFYING"
+            assert downstream_row["activated_at"] is None
+            assert downstream_row["logical_activated_at"] is not None
+
+            downstream_event = conn.execute(
+                """
+                SELECT event_type, detail
+                FROM strategy_events
+                WHERE strategy_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("S-WORKER-DOWNSTREAM",),
+            ).fetchone()
+            assert downstream_event is not None
+            assert downstream_event["event_type"] == "VERIFYING"
+            assert "触发激活校验" in str(downstream_event["detail"] or "")
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
