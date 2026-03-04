@@ -14,6 +14,10 @@ export type StrategyStatus =
 export type StrategyTradeType = 'buy' | 'sell' | 'switch' | 'open' | 'close' | 'spread'
 export type SymbolTradeType = 'buy' | 'sell' | 'open' | 'close' | 'ref'
 export type StrategyMarket = string
+export type NextStrategyActivationMode =
+  | 'IMMEDIATE'
+  | 'AFTER_TRADE_SUBMITTED'
+  | 'AFTER_TRADE_COMPLETED'
 
 export type StrategySymbolItem = {
   code: string
@@ -104,6 +108,7 @@ export type StrategyDetail = {
   conditions_runtime: ConditionRuntimeItem[]
   trade_action_json: Record<string, unknown> | null
   trade_action_runtime: TradeActionRuntime
+  next_strategy_activation_mode: NextStrategyActivationMode
   next_strategy: NextStrategyProjection | null
   upstream_strategy: NextStrategyProjection | null
   strategy_run: StrategyRunSummary | null
@@ -234,6 +239,14 @@ export type StrategyCreatePayload = {
   trade_action_json?: Record<string, unknown> | null
   next_strategy_id?: string | null
   next_strategy_note?: string | null
+  next_strategy_activation_mode?: NextStrategyActivationMode
+}
+
+export type StrategyActionsPayload = {
+  trade_action_json?: Record<string, unknown> | null
+  next_strategy_id?: string | null
+  next_strategy_note?: string | null
+  next_strategy_activation_mode?: NextStrategyActivationMode
 }
 
 export type StrategyBasicPatchPayload = {

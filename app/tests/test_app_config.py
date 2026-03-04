@@ -31,21 +31,45 @@ def test_load_app_config_from_conf_file(tmp_path: Path) -> None:
         live_port = 5001
         client_id = 123
         timeout_seconds = 9
-        session_idle_ttl_seconds = 31
         trading_mode = "live"
         
-        [ib_gateway.client_ids]
-        broker_data = 223
-        market_data = 224
-        cli = 225
+        [ib_gateway.role_ports]
+        broker_data = 5101
+        market_data = 5102
+        order = 5103
+        cli = 5104
+        
+        [ib_gateway.role_connections.broker_data]
+        client_id = 223
+        readonly = true
+        
+        [ib_gateway.role_connections.market_data]
+        client_id = 224
+        readonly = true
+        
+        [ib_gateway.role_connections.order]
+        client_id = 226
+        readonly = false
+        
+        [ib_gateway.role_connections.cli]
+        client_id = 225
+        readonly = true
 
         [runtime]
         data_dir = "/tmp/ibx-data"
         enable_live_trading = true
 
+        [trade_validation]
+        allowed_sides = ["SELL"]
+        allowed_order_types = ["LMT"]
+        allow_outside_rth = false
+        buy_open_max_amount_usd = 2500
+        allow_live_orders = true
+
         [worker]
         enabled = true
         monitor_interval_seconds = 45
+        max_monitoring_interval_minutes = 75
         threads = 4
         queue_maxsize = 8000
         gateway_not_work_event_throttle_seconds = 600
@@ -62,22 +86,38 @@ def test_load_app_config_from_conf_file(tmp_path: Path) -> None:
         assert cfg.ib_gateway.paper_port == 5002
         assert cfg.ib_gateway.live_port == 5001
         assert cfg.ib_gateway.client_id == 123
-        assert cfg.ib_gateway.client_ids.broker_data == 223
-        assert cfg.ib_gateway.client_ids.market_data == 224
-        assert cfg.ib_gateway.client_ids.cli == 225
+        assert cfg.ib_gateway.role_connections.broker_data.client_id == 223
+        assert cfg.ib_gateway.role_connections.market_data.client_id == 224
+        assert cfg.ib_gateway.role_connections.order.client_id == 226
+        assert cfg.ib_gateway.role_connections.cli.client_id == 225
         assert cfg.ib_gateway.timeout_seconds == 9
-        assert cfg.ib_gateway.session_idle_ttl_seconds == 31
         assert cfg.ib_gateway.trading_mode == "live"
+        assert cfg.ib_gateway.role_ports.broker_data == 5101
+        assert cfg.ib_gateway.role_ports.market_data == 5102
+        assert cfg.ib_gateway.role_ports.order == 5103
+        assert cfg.ib_gateway.role_ports.cli == 5104
+        assert cfg.ib_gateway.role_connections.broker_data.readonly is True
+        assert cfg.ib_gateway.role_connections.market_data.readonly is True
+        assert cfg.ib_gateway.role_connections.order.readonly is False
+        assert cfg.ib_gateway.role_connections.cli.readonly is True
         assert cfg.runtime.data_dir == "/tmp/ibx-data"
         assert cfg.runtime.enable_live_trading is True
+        assert cfg.trade_validation.allowed_sides == ("SELL",)
+        assert cfg.trade_validation.allowed_order_types == ("LMT",)
+        assert cfg.trade_validation.allow_outside_rth is False
+        assert cfg.trade_validation.buy_open_max_amount_usd == 2500
+        assert cfg.trade_validation.allow_live_orders is True
         assert cfg.worker.enabled is True
         assert cfg.worker.monitor_interval_seconds == 45
+        assert cfg.worker.max_monitoring_interval_minutes == 75
         assert cfg.worker.threads == 4
         assert cfg.worker.queue_maxsize == 8000
         assert cfg.worker.gateway_not_work_event_throttle_seconds == 600
         assert cfg.worker.waiting_for_market_data_event_throttle_seconds == 180
         assert cfg.providers.broker_data == "ib"
         assert cfg.providers.market_data == "ib"
+        assert cfg.providers.market_data_disable_cache is False
+        assert cfg.providers.market_data_delay_window_minutes == 20
     finally:
         if old_config_path is None:
             os.environ.pop("IBX_APP_CONFIG", None)
@@ -155,6 +195,38 @@ def test_resolve_db_path_from_conf(tmp_path: Path) -> None:
         clear_app_config_cache()
 
 
+def test_trade_validation_defaults_when_not_configured(tmp_path: Path) -> None:
+    conf_path = tmp_path / "app.toml"
+    _write_toml(
+        conf_path,
+        """
+        [ib_gateway]
+        host = "127.0.0.1"
+        """,
+    )
+
+    old_config_path = os.getenv("IBX_APP_CONFIG")
+    os.environ["IBX_APP_CONFIG"] = str(conf_path)
+    clear_app_config_cache()
+    try:
+        cfg = load_app_config()
+        assert cfg.ib_gateway.role_connections.broker_data.readonly is True
+        assert cfg.ib_gateway.role_connections.market_data.readonly is True
+        assert cfg.ib_gateway.role_connections.order.readonly is False
+        assert cfg.ib_gateway.role_connections.cli.readonly is True
+        assert cfg.trade_validation.allowed_sides == ("BUY", "SELL")
+        assert cfg.trade_validation.allowed_order_types == ("MKT", "LMT")
+        assert cfg.trade_validation.allow_outside_rth is True
+        assert cfg.trade_validation.buy_open_max_amount_usd == 1000.0
+        assert cfg.trade_validation.allow_live_orders is False
+    finally:
+        if old_config_path is None:
+            os.environ.pop("IBX_APP_CONFIG", None)
+        else:
+            os.environ["IBX_APP_CONFIG"] = old_config_path
+        clear_app_config_cache()
+
+
 def test_trigger_mode_policy_loaded_from_json() -> None:
     clear_app_config_cache()
     instant_policy = resolve_trigger_window_policy("LEVEL_INSTANT", "1m")
@@ -209,6 +281,8 @@ def test_provider_broker_data_can_be_configured(tmp_path: Path) -> None:
         [providers]
         broker_data = "fixture"
         market_data = "fixture"
+        market_data_disable_cache = true
+        market_data_delay_window_minutes = 25
         """,
     )
 
@@ -219,6 +293,8 @@ def test_provider_broker_data_can_be_configured(tmp_path: Path) -> None:
         cfg = load_app_config()
         assert cfg.providers.broker_data == "fixture"
         assert cfg.providers.market_data == "fixture"
+        assert cfg.providers.market_data_disable_cache is True
+        assert cfg.providers.market_data_delay_window_minutes == 25
     finally:
         if old_config_path is None:
             os.environ.pop("IBX_APP_CONFIG", None)
@@ -227,7 +303,7 @@ def test_provider_broker_data_can_be_configured(tmp_path: Path) -> None:
         clear_app_config_cache()
 
 
-def test_client_ids_fallback_to_client_id_when_not_configured(tmp_path: Path) -> None:
+def test_role_connections_fallback_to_client_id_when_not_configured(tmp_path: Path) -> None:
     conf_path = tmp_path / "app.toml"
     _write_toml(
         conf_path,
@@ -243,10 +319,50 @@ def test_client_ids_fallback_to_client_id_when_not_configured(tmp_path: Path) ->
     try:
         cfg = load_app_config()
         assert cfg.ib_gateway.client_id == 321
-        assert cfg.ib_gateway.session_idle_ttl_seconds == 30
-        assert cfg.ib_gateway.client_ids.broker_data == 321
-        assert cfg.ib_gateway.client_ids.market_data == 321
-        assert cfg.ib_gateway.client_ids.cli == 321
+        assert cfg.ib_gateway.role_connections.broker_data.client_id == 321
+        assert cfg.ib_gateway.role_connections.market_data.client_id == 322
+        assert cfg.ib_gateway.role_connections.order.client_id == 323
+        assert cfg.ib_gateway.role_connections.cli.client_id == 324
+        assert cfg.ib_gateway.role_connections.broker_data.readonly is True
+        assert cfg.ib_gateway.role_connections.market_data.readonly is True
+        assert cfg.ib_gateway.role_connections.order.readonly is False
+        assert cfg.ib_gateway.role_connections.cli.readonly is True
+        assert cfg.ib_gateway.role_ports.broker_data == 4002
+        assert cfg.ib_gateway.role_ports.market_data == 4002
+        assert cfg.ib_gateway.role_ports.order == 4002
+        assert cfg.ib_gateway.role_ports.cli == 4002
+    finally:
+        if old_config_path is None:
+            os.environ.pop("IBX_APP_CONFIG", None)
+        else:
+            os.environ["IBX_APP_CONFIG"] = old_config_path
+        clear_app_config_cache()
+
+
+def test_role_connections_reject_conflicting_readonly_for_same_client_id(tmp_path: Path) -> None:
+    conf_path = tmp_path / "app.toml"
+    _write_toml(
+        conf_path,
+        """
+        [ib_gateway]
+        client_id = 321
+
+        [ib_gateway.role_connections.broker_data]
+        client_id = 1001
+        readonly = true
+
+        [ib_gateway.role_connections.market_data]
+        client_id = 1001
+        readonly = false
+        """,
+    )
+
+    old_config_path = os.getenv("IBX_APP_CONFIG")
+    os.environ["IBX_APP_CONFIG"] = str(conf_path)
+    clear_app_config_cache()
+    try:
+        with pytest.raises(RuntimeError, match="conflicting readonly"):
+            load_app_config()
     finally:
         if old_config_path is None:
             os.environ.pop("IBX_APP_CONFIG", None)

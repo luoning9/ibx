@@ -7,26 +7,38 @@
 # IB Gateway / TWS 连接参数
 # - trading_mode 决定默认走 paper_port 还是 live_port
 # - paper/live 端口都保留，便于同一份配置切换模式
-# - client_id 为兜底值；建议在 [ib_gateway.client_ids] 为不同角色分配独立 client id
+# - client_id 为兜底值；未显式配置时按 broker_data/market_data/order/cli => +0/+1/+2/+3 分配
 host = "127.0.0.1"
 paper_port = 4002
 live_port = 4001
-client_id = 99
-timeout_seconds = 5
-# 单个 client 连接空闲保持时长（秒）；超过后自动释放，下一次请求再重连
-session_idle_ttl_seconds = 30
+timeout_seconds = 42
 # 账户代码；留空表示由 IB 返回的默认账户
 account_code = ""
 # 可选: "paper" | "live"
-trading_mode = "live"
+trading_mode = "paper"
 
-[ib_gateway.client_ids]
-# Broker 数据（API + worker 共享 provider 单例）
-broker_data = 99
-# 市场数据（启用 IB 行情拉取时使用）
-market_data = 98
-# CLI 脚本共用（如 make portfolio / get_latest_bar）
-cli = 97
+[ib_gateway.role_ports]
+# 按角色分别指定 API 端口（一个 broker 线程管理多连接）
+broker_data = 4002
+market_data = 4002
+order = 4002
+cli = 4002
+
+[ib_gateway.role_connections.broker_data]
+client_id = 99
+readonly = true
+
+[ib_gateway.role_connections.market_data]
+client_id = 98
+readonly = true
+
+[ib_gateway.role_connections.order]
+client_id = 96
+readonly = false
+
+[ib_gateway.role_connections.cli]
+client_id = 97
+readonly = true
 
 [runtime]
 # 运行时路径与全局开关
@@ -42,15 +54,30 @@ market_config_path = "conf/markets.json"
 # live 交易总开关（即使 trading_mode=live，也需该开关显式为 true）
 enable_live_trading = false
 
+[trade_validation]
+# 下单前核验配置
+# 允许的下单方向（默认 BUY/SELL）
+allowed_sides = ["BUY", "SELL"]
+# 允许的订单类型（默认 MKT/LMT）
+allowed_order_types = ["MKT", "LMT"]
+# 是否允许盘前/盘后（outside regular trading hours）下单
+allow_outside_rth = true
+# BUY/OPEN 的最大金额（USD）
+buy_open_max_amount_usd = 1000
+# 是否允许 live 下单
+allow_live_orders = false
+
 [worker]
 # 策略执行引擎配置（扫描 + 线程池）
-enabled = false
+enabled = true
 # 扫描周期（秒）
-monitor_interval_seconds = 60
+monitor_interval_seconds = 20
+# 最大监测间隔（分钟）：当 now < suggested_next_monitor_at 且 now < evaluated_at + 本值 时，ACTIVE 直接跳过本轮
+max_monitoring_interval_minutes = 60
 # worker 线程数
-threads = 2
+threads = 1
 # 策略任务队列上限
-queue_maxsize = 4096
+queue_maxsize = 128
 # 事件节流：网关不可用事件最小间隔（秒）
 gateway_not_work_event_throttle_seconds = 300
 # 事件节流：行情未就绪事件最小间隔（秒）
@@ -61,4 +88,9 @@ waiting_for_market_data_event_throttle_seconds = 120
 # - "ib": 真实 IB 连接
 # - "fixture": 本地样本数据（离线测试）
 broker_data = "ib"
-market_data = "fixture"
+market_data = "ib"
+# true 时 market_data 直连 IB，不读写本地行情缓存
+market_data_disable_cache = false
+# 行情延迟窗口（分钟）：窗口内末端空白会保留为“待重拉”
+# 默认 20 = 15 分钟免费延迟 + 5 分钟缓冲
+market_data_delay_window_minutes = 20

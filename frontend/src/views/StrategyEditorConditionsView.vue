@@ -4,8 +4,14 @@ import { Delete } from '@element-plus/icons-vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { fetchConditionRules, fetchStrategyDetail, putStrategyConditions } from '../api/services'
-import type { ConditionRulesResponse } from '../api/types'
+import {
+  fetchConditionRules,
+  fetchGeneratedStrategyDescription,
+  fetchStrategyDetail,
+  patchStrategyBasic,
+  putStrategyConditions,
+} from '../api/services'
+import type { ConditionRulesResponse, StrategyDetail } from '../api/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -435,12 +441,27 @@ function buildConditionPayload(row: ConditionRow) {
   return payload
 }
 
+async function ensureStrategyDescription(detail: StrategyDetail) {
+  if (String(detail.description || '').trim()) return detail
+  if (!detail.editable) return detail
+
+  try {
+    const generated = await fetchGeneratedStrategyDescription(detail.id)
+    const generatedDescription = String(generated.description || '').trim()
+    if (!generatedDescription) return detail
+    return await patchStrategyBasic(detail.id, { description: generatedDescription })
+  } catch {
+    return detail
+  }
+}
+
 async function loadDetail() {
   if (!strategyId.value) return
   loading.value = true
   error.value = ''
   try {
-    const detail = await fetchStrategyDetail(strategyId.value)
+    const fetchedDetail = await fetchStrategyDetail(strategyId.value)
+    const detail = await ensureStrategyDescription(fetchedDetail)
     const symbolTypeMap = new Map<string, Set<string>>()
     for (const item of detail.symbols) {
       const code = asString(item.code).trim().toUpperCase()
@@ -566,10 +587,12 @@ onMounted(async () => {
       />
 
       <div class="editor-note">
-        编辑规则：第一行固定 <code>condition_id / type(单选) / product / evaluation_window</code>；
-        第二行设置 <code>指标（含基准） / 触发判定 / value</code>；
-        <code>condition_id</code> 自动生成；价格类窗口支持分钟级，成交量/成交额比值支持小时/天级；
-        <code>window_price_basis</code> 固定为 <code>CLOSE</code>。
+        编辑规则：最多可配置 <code>2</code> 条条件；<code>condition_id</code> 自动生成且不可编辑。条件类型为
+        <code>SINGLE_PRODUCT</code> 时只需选择 <code>product</code>，为 <code>PAIR_PRODUCTS</code> 时需同时选择
+        <code>product</code> 和 <code>product_b</code>（都必须在策略 symbols 中）。<code>metric</code>、
+        <code>触发判定</code>、<code>window</code> 三者联动，按后端规则配置（不可用时使用前端缺省规则）自动限制可选项。
+        <code>value</code> 必须是数字；比例类指标按百分比输入（如 <code>10</code> 表示 <code>10%</code>，保存为
+        <code>0.1</code>），价格/价差按美元输入。保存时 <code>window_price_basis</code> 固定为 <code>CLOSE</code>。
       </div>
 
       <div class="conditions-toolbar">

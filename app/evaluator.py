@@ -63,6 +63,7 @@ class StrategyEvaluationResult:
 class ContractDataRequirement:
     contract_id: int | None
     base_bar: str
+    effective_window_points: int
     required_points: int
     state_requirements: list[dict[str, Any]]
     include_partial_bar: bool
@@ -311,21 +312,43 @@ def _estimated_required_points(
     confirm_consecutive: int,
     confirm_ratio: float,
 ) -> int:
+    base_points = _estimated_window_points(
+        evaluation_window=evaluation_window,
+        base_bar=base_bar,
+    )
     mode = trigger_mode.strip().upper()
     if mode == "LEVEL_INSTANT":
         return 1
     if mode in {"CROSS_UP_INSTANT", "CROSS_DOWN_INSTANT"}:
         return 2
-    window_seconds = _parse_window_to_seconds(evaluation_window)
-    base_seconds = _parse_window_to_seconds(base_bar)
-    if window_seconds <= 0 or base_seconds <= 0:
-        base_points = 1
-    else:
-        base_points = max(1, math.ceil(window_seconds / base_seconds))
     confirm_points = max(confirm_consecutive, int(math.ceil(confirm_ratio * base_points)))
     if mode in {"CROSS_UP_CONFIRM", "CROSS_DOWN_CONFIRM"}:
         return confirm_points + 1
     return confirm_points
+
+
+def _estimated_window_points(
+    *,
+    evaluation_window: str,
+    base_bar: str,
+) -> int:
+    window_seconds = _parse_window_to_seconds(evaluation_window)
+    base_seconds = _parse_window_to_seconds(base_bar)
+    if window_seconds <= 0 or base_seconds <= 0:
+        return 1
+    return max(1, math.ceil(window_seconds / base_seconds))
+
+
+def _estimated_effective_window_points(
+    *,
+    trigger_mode: str,
+    nominal_points: int,
+    required_points: int,
+) -> int:
+    mode = trigger_mode.strip().upper()
+    if mode in {"LEVEL_INSTANT", "CROSS_UP_INSTANT", "CROSS_DOWN_INSTANT"}:
+        return max(1, int(required_points))
+    return max(1, int(nominal_points))
 
 
 def _require_time_alignment(metric: str) -> bool:
@@ -369,6 +392,7 @@ def _build_trigger_policy_payload(prepared: PreparedCondition) -> dict[str, Any]
             {
                 "contract_id": contract.contract_id,
                 "base_bar": contract.base_bar,
+                "effective_window_points": contract.effective_window_points,
                 "required_points": contract.required_points,
                 "include_partial_bar": contract.include_partial_bar,
                 "state_requirements": contract.state_requirements,
@@ -376,6 +400,7 @@ def _build_trigger_policy_payload(prepared: PreparedCondition) -> dict[str, Any]
             for contract in req.contracts
         ],
         "base_bar": first_contract.base_bar if first_contract else None,
+        "effective_window_points": first_contract.effective_window_points if first_contract else None,
         "required_points": first_contract.required_points if first_contract else None,
         "include_partial_bar": first_contract.include_partial_bar if first_contract else None,
     }
@@ -473,10 +498,11 @@ def _metric_observed_value(
     *,
     metric: str,
     contract_values: dict[int, float],
-    state_values: dict[str, Any],
+    state_values: dict[str, Any] | None,
     first_contract_id: int,
     second_contract_id: int | None,
 ) -> float | None:
+    state_map = state_values if isinstance(state_values, dict) else {}
     metric_key = metric.strip().upper()
     primary = contract_values.get(first_contract_id)
     if primary is None:
@@ -484,12 +510,12 @@ def _metric_observed_value(
     if metric_key == "PRICE":
         return primary
     if metric_key == "DRAWDOWN_PCT":
-        high = _to_float_or_none(state_values.get("since_activation_high"))
+        high = _to_float_or_none(state_map.get("since_activation_high"))
         if high is None or high <= 0:
             return None
         return (high - primary) / high
     if metric_key == "RALLY_PCT":
-        low = _to_float_or_none(state_values.get("since_activation_low"))
+        low = _to_float_or_none(state_map.get("since_activation_low"))
         if low is None or low <= 0:
             return None
         return (primary - low) / low
@@ -544,10 +570,20 @@ def _prepare_condition(condition: dict[str, Any]) -> PreparedCondition:
         confirm_consecutive=policy.confirm_consecutive,
         confirm_ratio=policy.confirm_ratio,
     )
+    nominal_points = _estimated_window_points(
+        evaluation_window=policy.evaluation_window,
+        base_bar=policy.base_bar,
+    )
+    effective_window_points = _estimated_effective_window_points(
+        trigger_mode=policy.trigger_mode,
+        nominal_points=nominal_points,
+        required_points=required_points,
+    )
     contracts: list[ContractDataRequirement] = [
         ContractDataRequirement(
             contract_id=contract_id,
             base_bar=policy.base_bar,
+            effective_window_points=effective_window_points,
             required_points=required_points,
             state_requirements=_state_requirements(metric, contract_id),
             include_partial_bar=policy.include_partial_bar,
@@ -558,6 +594,7 @@ def _prepare_condition(condition: dict[str, Any]) -> PreparedCondition:
             ContractDataRequirement(
                 contract_id=contract_id_b,
                 base_bar=policy.base_bar,
+                effective_window_points=effective_window_points,
                 required_points=required_points,
                 state_requirements=[],
                 include_partial_bar=policy.include_partial_bar,

@@ -169,6 +169,20 @@
 - 越界处理：自动夹紧到边界并记录 warning
 - 说明：`worker.monitor_interval_seconds` 是调度频率，`evaluation_window` 是条件计算窗口，二者独立配置。
 
+行情拉取起点计算（实现约定）：
+- 条件准备阶段按“条件 + 合约”输出 `effective_window_points`（实际回看点数）。
+- `effective_window_points` 规则：
+- `CONFIRM` 类触发模式：`effective_window_points = ceil(evaluation_window / base_bar)`。
+- `INSTANT` 类触发模式：`effective_window_points = required_points`。
+- 每次评估时先取 `recorded_last_end_at`：
+- 若 `strategy_runs.last_monitoring_data_end_at[condition_id][contract_id]` 有值，用该值；
+- 否则使用 `initial_last_monitoring_data_end_at`。
+- 若存在历史记录：`fetch_anchor = recorded_last_end_at - (effective_window_points - 1) * bar_delta`。
+- 若无历史记录：`fetch_anchor = initial_last_monitoring_data_end_at`。
+- 固定下界：`required_start_time = now - max(3, required_points + 2) * bar_delta`。
+- 最终请求起点：`start_time = min(fetch_anchor, required_start_time)`。
+- “是否有新数据”的判定基准使用 `recorded_last_end_at`，避免窗口重叠带来的重复触发。
+
 价格与价差突破定义（本版本）：
 - 基础数据粒度：统一以 `1m` 作为底层数据。
 - 确认窗口仅支持：`5m`、`30m`、`1h`。

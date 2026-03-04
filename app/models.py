@@ -26,6 +26,11 @@ ConditionState = Literal["TRUE", "FALSE", "WAITING", "NOT_EVALUATED"]
 TriggerGroupStatus = Literal["NOT_CONFIGURED", "MONITORING", "TRIGGERED", "EXPIRED"]
 StrategyTradeType = Literal["buy", "sell", "switch", "open", "close", "spread"]
 SymbolTradeType = Literal["buy", "sell", "open", "close", "ref"]
+NextStrategyActivationMode = Literal[
+    "IMMEDIATE",
+    "AFTER_TRADE_SUBMITTED",
+    "AFTER_TRADE_COMPLETED",
+]
 ConditionMetric = Literal[
     "PRICE",
     "DRAWDOWN_PCT",
@@ -285,6 +290,7 @@ class StrategyDetailOut(BaseModel):
 
     trade_action_json: dict[str, Any] | None = None
     trade_action_runtime: TradeActionRuntime
+    next_strategy_activation_mode: NextStrategyActivationMode = "IMMEDIATE"
     next_strategy: NextStrategyProjection | None = None
     upstream_strategy: NextStrategyProjection | None = None
     strategy_run: StrategyRunSummaryOut | None = None
@@ -311,6 +317,7 @@ class StrategyCreateIn(BaseModel):
     trade_action_json: dict[str, Any] | None = None
     next_strategy_id: str | None = None
     next_strategy_note: str | None = None
+    next_strategy_activation_mode: NextStrategyActivationMode = "IMMEDIATE"
 
     @model_validator(mode="after")
     def validate_trade_type_and_symbols(self) -> "StrategyCreateIn":
@@ -344,6 +351,7 @@ class StrategyActionsPutIn(BaseModel):
     trade_action_json: dict[str, Any] | None = None
     next_strategy_id: str | None = None
     next_strategy_note: str | None = None
+    next_strategy_activation_mode: NextStrategyActivationMode = "IMMEDIATE"
 
 
 class ControlResponse(BaseModel):

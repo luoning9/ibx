@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from uuid import uuid4
 
 
@@ -77,7 +77,7 @@ def activate_downstream_strategy(
 
     row = conn.execute(
         """
-        SELECT id, status, expire_mode, expire_in_seconds
+        SELECT id, status, expire_mode, expire_in_seconds, expire_at
         FROM v_strategies_active
         WHERE id = ?
         """,
@@ -90,17 +90,17 @@ def activate_downstream_strategy(
     if row["status"] not in DOWNSTREAM_ACTIVATABLE_STATUSES:
         return False
 
-    activated_at_iso = _to_iso_utc(now)
-    expire_at_iso: str | None = None
-    if row["expire_mode"] == "relative" and row["expire_in_seconds"]:
-        expire_at_iso = _to_iso_utc(now + timedelta(seconds=int(row["expire_in_seconds"])))
+    triggered_at_iso = _to_iso_utc(triggered_at)
+    expire_at_iso: str | None = str(row["expire_at"] or "").strip() or None
+    if row["expire_mode"] == "relative":
+        expire_at_iso = None
 
     cursor = conn.execute(
         """
         UPDATE strategies
-        SET status = 'ACTIVE',
+        SET status = 'VERIFYING',
             upstream_only_activation = 1,
-            activated_at = ?,
+            activated_at = NULL,
             logical_activated_at = ?,
             expire_at = ?,
             updated_at = ?,
@@ -110,10 +110,9 @@ def activate_downstream_strategy(
           AND is_deleted = 0
         """,
         (
-            activated_at_iso,
-            _to_iso_utc(triggered_at),
+            triggered_at_iso,
             expire_at_iso,
-            activated_at_iso,
+            _to_iso_utc(now),
             downstream_id,
         ),
     )
@@ -123,8 +122,8 @@ def activate_downstream_strategy(
     _append_event(
         conn,
         strategy_id=downstream_id,
-        event_type="ACTIVATED",
-        detail=f"由上游策略 {upstream_strategy_id} 激活",
+        event_type="VERIFYING",
+        detail=f"由上游策略 {upstream_strategy_id} 触发激活校验",
         ts=now,
     )
     _append_event(

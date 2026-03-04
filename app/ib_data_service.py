@@ -9,7 +9,12 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Protocol
 
-from .config import PROJECT_ROOT, infer_ib_api_port, load_app_config, resolve_ib_client_id
+from .config import (
+    PROJECT_ROOT,
+    load_app_config,
+    resolve_ib_client_id,
+)
+from .ib_compat import INSTALL_HINT, require_ib_attr
 from .ib_session_manager import get_ib_session_manager
 from .market_config import resolve_market_profile
 
@@ -104,7 +109,8 @@ def _to_int_or_none(value: Any) -> int | None:
 def _ensure_thread_event_loop() -> None:
     try:
         asyncio.get_event_loop()
-    except RuntimeError:
+    except Exception:
+        # nest_asyncio + uvloop may raise ValueError here; fallback to a fresh loop.
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 
@@ -153,11 +159,10 @@ def _default_contract_builder(
     contract_month: str | None,
 ) -> Any:
     try:
-        from ib_insync import Future, Stock
+        Future = require_ib_attr("Future")
+        Stock = require_ib_attr("Stock")
     except ModuleNotFoundError as exc:
-        raise IBDataServiceError(
-            "Missing dependency: ib_insync. Install with: pip install ib_insync"
-        ) from exc
+        raise IBDataServiceError(INSTALL_HINT) from exc
 
     sec_type_key = sec_type.strip().upper()
     if sec_type_key == "STK":
@@ -183,23 +188,18 @@ class IBDataService:
         port: int | None = None,
         client_id: int | None = None,
         timeout_seconds: float | None = None,
-        session_idle_ttl_seconds: float | None = None,
         account_code: str | None = None,
         trading_mode: str | None = None,
-        readonly: bool = True,
         contract_builder: Callable[..., Any] | None = None,
     ) -> None:
         cfg = load_app_config().ib_gateway
-        mode = str(trading_mode or cfg.trading_mode).strip().lower()
+        _ = trading_mode
         self.host = str(host or cfg.host)
-        self.port = int(port if port is not None else infer_ib_api_port(mode))
+        self.port = int(port if port is not None else cfg.role_ports.broker_data)
         self.client_id = int(client_id if client_id is not None else resolve_ib_client_id("broker_data"))
         self.timeout_seconds = float(timeout_seconds if timeout_seconds is not None else cfg.timeout_seconds)
-        self.session_idle_ttl_seconds = float(
-            session_idle_ttl_seconds if session_idle_ttl_seconds is not None else cfg.session_idle_ttl_seconds
-        )
         self.default_account_code = _normalize_account(account_code or cfg.account_code)
-        self.readonly = bool(readonly)
+        self.readonly = bool(cfg.role_connections.broker_data.readonly)
         self._ib = ib
         self._contract_builder = contract_builder or _default_contract_builder
         self._logger = logging.getLogger("ibx.broker_data")
@@ -207,7 +207,7 @@ class IBDataService:
     def _ensure_ib(self) -> Any:
         _ensure_thread_event_loop()
         if self._ib is not None:
-            # ib_insync default RequestTimeout=0 (no timeout), which can block forever.
+            # IB client default RequestTimeout=0 (no timeout), which can block forever.
             # Keep it aligned with app-level timeout to avoid stuck requests.
             try:
                 setattr(self._ib, "RequestTimeout", float(self.timeout_seconds))
@@ -215,11 +215,9 @@ class IBDataService:
                 pass
             return self._ib
         try:
-            from ib_insync import IB
+            IB = require_ib_attr("IB")
         except ModuleNotFoundError as exc:
-            raise IBDataServiceError(
-                "Missing dependency: ib_insync. Install with: pip install ib_insync"
-            ) from exc
+            raise IBDataServiceError(INSTALL_HINT) from exc
         self._ib = IB()
         try:
             setattr(self._ib, "RequestTimeout", float(self.timeout_seconds))
@@ -268,14 +266,7 @@ class IBDataService:
 
     def _get_managed_session(self) -> Any:
         manager = get_ib_session_manager()
-        return manager.get_session(
-            host=self.host,
-            port=self.port,
-            client_id=self.client_id,
-            timeout_seconds=self.timeout_seconds,
-            readonly=self.readonly,
-            idle_ttl_seconds=self.session_idle_ttl_seconds,
-        )
+        return manager.get_session(role="broker_data")
 
     def _run_with_ib(
         self,

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { CaretRight, CloseBold, Link, RefreshRight, VideoPause } from '@element-plus/icons-vue'
+import { CaretRight, CloseBold, DataAnalysis, Edit, Link, Operation, RefreshRight, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -85,14 +85,43 @@ const displayDescription = computed(() => {
   return generated || '-'
 })
 
-function startDescriptionEdit() {
+async function ensureDescriptionPersistedForEdit(current: StrategyDetail) {
+  const currentText = String(current.description || '').trim()
+  const generatedText = String(generatedDescription.value || '').trim()
+  const usesGeneratedFallback = Boolean(generatedText) && currentText === generatedText
+  if (currentText && !usesGeneratedFallback) return current
+
+  let nextDescription = generatedText
+  if (!nextDescription) {
+    try {
+      const generated = await fetchGeneratedStrategyDescription(current.id)
+      nextDescription = String(generated.description || '').trim()
+    } catch {
+      nextDescription = ''
+    }
+  }
+  if (!nextDescription) return current
+
+  try {
+    const updated = await patchStrategyBasic(current.id, { description: nextDescription })
+    const hydrated = await applyGeneratedDescriptionIfEmpty(updated)
+    detail.value = hydrated
+    return hydrated
+  } catch (err) {
+    error.value = toActionError('更新描述', err)
+    return current
+  }
+}
+
+async function startDescriptionEdit() {
   const current = detail.value
   if (!current) return
   if (!current.editable) {
     ElMessage.warning(current.editable_reason || '当前状态不可编辑描述')
     return
   }
-  descriptionDraft.value = String(current.description || '').trim()
+  const ready = await ensureDescriptionPersistedForEdit(current)
+  descriptionDraft.value = String(ready.description || '').trim()
   descriptionEditing.value = true
 }
 
@@ -262,6 +291,13 @@ function orderTypeLabel(orderType: string) {
   if (orderType === 'MKT') return '市价（MKT）'
   if (orderType === 'LMT') return '限价（LMT）'
   return orderType || '-'
+}
+
+function nextStrategyActivationModeLabel(raw: unknown) {
+  const mode = asString(raw).trim().toUpperCase()
+  if (mode === 'AFTER_TRADE_SUBMITTED') return '交易指令发送后'
+  if (mode === 'AFTER_TRADE_COMPLETED') return '交易指令完成后'
+  return '立即激活'
 }
 
 function statusTagType(statusRaw: string) {
@@ -630,7 +666,7 @@ onBeforeUnmount(() => {
                   :disabled="!detail.capabilities.can_cancel"
                 />
               </el-space>
-              <el-button class="ops-edit-btn" size="small" @click="goEditBasic" :disabled="!detail.editable">
+              <el-button class="ops-edit-btn" size="small" :icon="Edit" @click="goEditBasic" :disabled="!detail.editable">
                 编辑基本信息
               </el-button>
             </div>
@@ -639,59 +675,19 @@ onBeforeUnmount(() => {
       </el-skeleton>
     </el-card>
 
-    <!-- Runtime snapshot from strategy_runs, shown right after base strategy info. -->
-    <el-card shadow="never">
-      <template #header>
-        <div class="card-header-row">
-          <span class="card-title">strategy_runs</span>
-          <span class="card-tools">运行时记录</span>
-        </div>
-      </template>
-      <template v-if="detail?.strategy_run">
-        <el-descriptions :column="2" size="small" border>
-          <el-descriptions-item label="first_evaluated_at">
-            {{ formatIsoDateTime(detail.strategy_run.first_evaluated_at) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="evaluated_at">
-            {{ formatIsoDateTime(detail.strategy_run.evaluated_at) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="suggested_next_monitor_at">
-            {{ formatIsoDateTime(detail.strategy_run.suggested_next_monitor_at) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="updated_at">
-            {{ formatIsoDateTime(detail.strategy_run.updated_at) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="check_count">
-            {{ detail.strategy_run.check_count }}
-          </el-descriptions-item>
-          <el-descriptions-item label="condition_met">
-            {{ detail.strategy_run.condition_met ? 'true' : 'false' }}
-          </el-descriptions-item>
-          <el-descriptions-item label="last_outcome">
-            {{ detail.strategy_run.last_outcome }}
-          </el-descriptions-item>
-          <el-descriptions-item label="decision_reason">
-            {{ detail.strategy_run.decision_reason }}
-          </el-descriptions-item>
-        </el-descriptions>
-        <!-- Keep nested monitoring-end map visible for debugging condition data windows. -->
-        <details class="strategy-run-raw-details">
-          <summary>查看 last_monitoring_data_end_at</summary>
-          <pre class="json-box raw-json-box">{{ pretty(detail.strategy_run.last_monitoring_data_end_at) }}</pre>
-        </details>
-      </template>
-      <div v-else class="strategy-run-empty">
-        暂无 strategy_runs 记录（运行后自动生成）
-      </div>
-    </el-card>
-
     <el-card id="conditions-section" shadow="never">
       <template #header>
         <div class="card-header-row conditions-header-row">
           <span class="card-title">触发条件</span>
           <span class="card-tools conditions-status">条件组状态：{{ detail?.trigger_group_status || 'NOT_CONFIGURED' }}</span>
-          <el-button class="conditions-edit-btn" size="small" @click="goEditConditions" :disabled="!detail?.editable">
-            {{ (detail?.conditions_json?.length || 0) > 0 ? '编辑' : '设置触发条件' }}
+          <el-button
+            class="conditions-edit-btn"
+            size="small"
+            :icon="DataAnalysis"
+            @click="goEditConditions"
+            :disabled="!detail?.editable"
+          >
+            设置触发条件
           </el-button>
         </div>
       </template>
@@ -733,13 +729,57 @@ onBeforeUnmount(() => {
       </div>
     </el-card>
 
+    <el-card shadow="never">
+      <template #header>
+        <div class="card-header-row">
+          <span class="card-title">监测情况</span>
+        </div>
+      </template>
+      <template v-if="detail?.strategy_run">
+        <el-descriptions :column="2" size="small" border>
+          <el-descriptions-item label="first_evaluated_at">
+            {{ formatIsoDateTime(detail.strategy_run.first_evaluated_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="evaluated_at">
+            {{ formatIsoDateTime(detail.strategy_run.evaluated_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="suggested_next_monitor_at">
+            {{ formatIsoDateTime(detail.strategy_run.suggested_next_monitor_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="updated_at">
+            {{ formatIsoDateTime(detail.strategy_run.updated_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="check_count">
+            {{ detail.strategy_run.check_count }}
+          </el-descriptions-item>
+          <el-descriptions-item label="condition_met">
+            {{ detail.strategy_run.condition_met ? 'true' : 'false' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="last_outcome">
+            {{ detail.strategy_run.last_outcome }}
+          </el-descriptions-item>
+          <el-descriptions-item label="decision_reason">
+            {{ detail.strategy_run.decision_reason }}
+          </el-descriptions-item>
+        </el-descriptions>
+        <!-- Keep nested monitoring-end map visible for debugging condition data windows. -->
+        <details class="strategy-run-raw-details">
+          <summary>查看 last_monitoring_data_end_at</summary>
+          <pre class="json-box raw-json-box">{{ pretty(detail.strategy_run.last_monitoring_data_end_at) }}</pre>
+        </details>
+      </template>
+      <div v-else class="strategy-run-empty">
+        暂无 strategy_runs 记录（运行后自动生成）
+      </div>
+    </el-card>
+
     <el-card id="actions-section" shadow="never">
       <template #header>
         <div class="card-header-row actions-header-row">
           <span class="card-title">后续动作</span>
           <span class="card-tools actions-status">{{ followupStatusText }}</span>
-          <el-button class="actions-edit-btn" size="small" @click="goEditActions" :disabled="!detail?.editable">
-            {{ hasFollowupConfigured ? '编辑' : '设置后续动作' }}
+          <el-button class="actions-edit-btn" size="small" :icon="Operation" @click="goEditActions" :disabled="!detail?.editable">
+            设置后续动作
           </el-button>
         </div>
       </template>
@@ -765,6 +805,10 @@ onBeforeUnmount(() => {
                 <div class="action-field">
                   <span class="action-field-label">说明</span>
                   <span>{{ detail.next_strategy.description || '-' }}</span>
+                </div>
+                <div class="action-field">
+                  <span class="action-field-label">激活时点</span>
+                  <span>{{ nextStrategyActivationModeLabel(detail.next_strategy_activation_mode) }}</span>
                 </div>
               </template>
               <div v-else class="actions-empty-sub">未配置下游策略</div>

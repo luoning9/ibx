@@ -20,6 +20,7 @@ SUPPORTED_TRIGGER_MODES: tuple[str, ...] = (
     "CROSS_DOWN_INSTANT",
     "CROSS_DOWN_CONFIRM",
 )
+SUPPORTED_IB_ROLES: tuple[str, ...] = ("broker_data", "market_data", "order", "cli")
 
 
 @dataclass(frozen=True)
@@ -28,17 +29,32 @@ class IBGatewayConfig:
     paper_port: int
     live_port: int
     client_id: int
-    client_ids: "IBClientIDsConfig"
+    role_connections: "IBRoleConnectionsConfig"
+    role_ports: "IBRolePortsConfig"
     timeout_seconds: float
-    session_idle_ttl_seconds: float
     account_code: str
     trading_mode: str
 
 
 @dataclass(frozen=True)
-class IBClientIDsConfig:
+class IBRoleConnectionConfig:
+    client_id: int
+    readonly: bool
+
+
+@dataclass(frozen=True)
+class IBRoleConnectionsConfig:
+    broker_data: "IBRoleConnectionConfig"
+    market_data: "IBRoleConnectionConfig"
+    order: "IBRoleConnectionConfig"
+    cli: "IBRoleConnectionConfig"
+
+
+@dataclass(frozen=True)
+class IBRolePortsConfig:
     broker_data: int
     market_data: int
+    order: int
     cli: int
 
 
@@ -54,9 +70,19 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class TradeValidationConfig:
+    allowed_sides: tuple[str, ...]
+    allowed_order_types: tuple[str, ...]
+    allow_outside_rth: bool
+    buy_open_max_amount_usd: float
+    allow_live_orders: bool
+
+
+@dataclass(frozen=True)
 class WorkerConfig:
     enabled: bool
     monitor_interval_seconds: int
+    max_monitoring_interval_minutes: int
     threads: int
     queue_maxsize: int
     gateway_not_work_event_throttle_seconds: int
@@ -67,6 +93,8 @@ class WorkerConfig:
 class ProvidersConfig:
     broker_data: str
     market_data: str
+    market_data_disable_cache: bool
+    market_data_delay_window_minutes: int
 
 
 @dataclass(frozen=True)
@@ -139,6 +167,7 @@ class MetricRuleConfig:
 class AppConfig:
     ib_gateway: IBGatewayConfig
     runtime: RuntimeConfig
+    trade_validation: TradeValidationConfig
     worker: WorkerConfig
     providers: ProvidersConfig
     trigger_mode: TriggerModeConfig
@@ -220,11 +249,41 @@ def _as_bool(value: Any, default: bool) -> bool:
     return default
 
 
+def _as_upper_tuple(
+    value: Any,
+    default: tuple[str, ...],
+    *,
+    allowed: set[str] | None = None,
+) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return default
+    out: list[str] = []
+    for item in value:
+        normalized = str(item or "").strip().upper()
+        if not normalized:
+            continue
+        if allowed is not None and normalized not in allowed:
+            continue
+        if normalized in out:
+            continue
+        out.append(normalized)
+    if not out:
+        return default
+    return tuple(out)
+
+
 def _normalize_trading_mode(value: str) -> str:
     normalized = value.strip().lower()
     if normalized in {"paper", "live"}:
         return normalized
     return "paper"
+
+
+def _normalize_ib_role(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in SUPPORTED_IB_ROLES:
+        return normalized
+    return "broker_data"
 
 
 def _normalize_missing_data_policy(value: Any, default: str = "fail") -> str:
@@ -524,6 +583,7 @@ def load_app_config() -> AppConfig:
 
     ib_raw = _as_dict(raw.get("ib_gateway"))
     runtime_raw = _as_dict(raw.get("runtime"))
+    trade_validation_raw = _as_dict(raw.get("trade_validation"))
     worker_raw = _as_dict(raw.get("worker"))
     providers_raw = _as_dict(raw.get("providers"))
     condition_rules_raw = _load_condition_rules_config_raw()
@@ -531,21 +591,68 @@ def load_app_config() -> AppConfig:
     metric_rules_raw = _as_dict(condition_rules_raw.get("metric_trigger_operator_rules"))
 
     base_client_id = _as_int(ib_raw.get("client_id"), 99, minimum=1)
-    client_ids_raw = _as_dict(ib_raw.get("client_ids"))
+    role_connections_raw = _as_dict(ib_raw.get("role_connections"))
+    paper_port = _as_int(ib_raw.get("paper_port"), 4002, minimum=1, maximum=65535)
+    live_port = _as_int(ib_raw.get("live_port"), 4001, minimum=1, maximum=65535)
+    trading_mode = _normalize_trading_mode(_as_str(ib_raw.get("trading_mode"), "paper"))
+    default_role_port = live_port if trading_mode == "live" else paper_port
+    role_ports_raw = _as_dict(ib_raw.get("role_ports"))
+
+    default_role_client_ids = {
+        "broker_data": int(base_client_id),
+        "market_data": int(base_client_id + 1),
+        "order": int(base_client_id + 2),
+        "cli": int(base_client_id + 3),
+    }
+
+    def _build_role_connection(role: str, *, default_readonly: bool) -> IBRoleConnectionConfig:
+        role_raw = _as_dict(role_connections_raw.get(role))
+        return IBRoleConnectionConfig(
+            client_id=_as_int(role_raw.get("client_id"), int(default_role_client_ids[role]), minimum=1),
+            readonly=_as_bool(role_raw.get("readonly"), default_readonly),
+        )
+
+    role_connections = IBRoleConnectionsConfig(
+        broker_data=_build_role_connection("broker_data", default_readonly=True),
+        market_data=_build_role_connection("market_data", default_readonly=True),
+        order=_build_role_connection("order", default_readonly=False),
+        cli=_build_role_connection("cli", default_readonly=True),
+    )
+
+    readonly_by_client_id: dict[int, tuple[bool, str]] = {}
+    for role_name, role_cfg in (
+        ("broker_data", role_connections.broker_data),
+        ("market_data", role_connections.market_data),
+        ("order", role_connections.order),
+        ("cli", role_connections.cli),
+    ):
+        previous = readonly_by_client_id.get(role_cfg.client_id)
+        if previous is None:
+            readonly_by_client_id[role_cfg.client_id] = (bool(role_cfg.readonly), role_name)
+            continue
+        previous_readonly, previous_role = previous
+        if previous_readonly != bool(role_cfg.readonly):
+            raise RuntimeError(
+                "invalid ib_gateway.role_connections: "
+                f"client_id={role_cfg.client_id} has conflicting readonly between "
+                f"{previous_role}={previous_readonly} and {role_name}={role_cfg.readonly}"
+            )
+
     ib = IBGatewayConfig(
         host=_as_str(ib_raw.get("host"), "127.0.0.1"),
-        paper_port=_as_int(ib_raw.get("paper_port"), 4002, minimum=1, maximum=65535),
-        live_port=_as_int(ib_raw.get("live_port"), 4001, minimum=1, maximum=65535),
+        paper_port=paper_port,
+        live_port=live_port,
         client_id=base_client_id,
-        client_ids=IBClientIDsConfig(
-            broker_data=_as_int(client_ids_raw.get("broker_data"), base_client_id, minimum=1),
-            market_data=_as_int(client_ids_raw.get("market_data"), base_client_id, minimum=1),
-            cli=_as_int(client_ids_raw.get("cli"), base_client_id, minimum=1),
+        role_connections=role_connections,
+        role_ports=IBRolePortsConfig(
+            broker_data=_as_int(role_ports_raw.get("broker_data"), default_role_port, minimum=1, maximum=65535),
+            market_data=_as_int(role_ports_raw.get("market_data"), default_role_port, minimum=1, maximum=65535),
+            order=_as_int(role_ports_raw.get("order"), default_role_port, minimum=1, maximum=65535),
+            cli=_as_int(role_ports_raw.get("cli"), default_role_port, minimum=1, maximum=65535),
         ),
         timeout_seconds=_as_float(ib_raw.get("timeout_seconds"), 5.0, minimum=0.1),
-        session_idle_ttl_seconds=_as_float(ib_raw.get("session_idle_ttl_seconds"), 30.0, minimum=1.0),
         account_code=_as_str(ib_raw.get("account_code"), ""),
-        trading_mode=_normalize_trading_mode(_as_str(ib_raw.get("trading_mode"), "paper")),
+        trading_mode=trading_mode,
     )
 
     runtime = RuntimeConfig(
@@ -557,10 +664,35 @@ def load_app_config() -> AppConfig:
         market_config_path=_as_optional_str(runtime_raw.get("market_config_path")),
         enable_live_trading=_as_bool(runtime_raw.get("enable_live_trading"), False),
     )
+    trade_validation = TradeValidationConfig(
+        allowed_sides=_as_upper_tuple(
+            trade_validation_raw.get("allowed_sides"),
+            ("BUY", "SELL"),
+            allowed={"BUY", "SELL"},
+        ),
+        allowed_order_types=_as_upper_tuple(
+            trade_validation_raw.get("allowed_order_types"),
+            ("MKT", "LMT"),
+            allowed={"MKT", "LMT"},
+        ),
+        allow_outside_rth=_as_bool(trade_validation_raw.get("allow_outside_rth"), True),
+        buy_open_max_amount_usd=_as_float(
+            trade_validation_raw.get("buy_open_max_amount_usd"),
+            1000.0,
+            minimum=0.0,
+        ),
+        allow_live_orders=_as_bool(trade_validation_raw.get("allow_live_orders"), False),
+    )
 
     worker = WorkerConfig(
         enabled=_as_bool(worker_raw.get("enabled"), False),
         monitor_interval_seconds=_as_int(worker_raw.get("monitor_interval_seconds"), 60, minimum=20, maximum=300),
+        max_monitoring_interval_minutes=_as_int(
+            worker_raw.get("max_monitoring_interval_minutes"),
+            60,
+            minimum=1,
+            maximum=7 * 24 * 60,
+        ),
         threads=_as_int(worker_raw.get("threads"), 2, minimum=1, maximum=32),
         queue_maxsize=_as_int(worker_raw.get("queue_maxsize"), 4096, minimum=64, maximum=100000),
         gateway_not_work_event_throttle_seconds=_as_int(
@@ -585,6 +717,16 @@ def load_app_config() -> AppConfig:
             providers_raw.get("market_data"),
             "ib",
         ),
+        market_data_disable_cache=_as_bool(
+            providers_raw.get("market_data_disable_cache"),
+            False,
+        ),
+        market_data_delay_window_minutes=_as_int(
+            providers_raw.get("market_data_delay_window_minutes"),
+            20,
+            minimum=0,
+            maximum=24 * 60,
+        ),
     )
     trigger_mode = _build_trigger_mode_config(trigger_mode_raw)
     metric_rules = _build_metric_rule_config(metric_rules_raw)
@@ -592,6 +734,7 @@ def load_app_config() -> AppConfig:
     return AppConfig(
         ib_gateway=ib,
         runtime=runtime,
+        trade_validation=trade_validation,
         worker=worker,
         providers=providers,
         trigger_mode=trigger_mode,
@@ -609,12 +752,38 @@ def infer_ib_api_port(trading_mode: str | None = None) -> int:
 
 def resolve_ib_client_id(role: str | None = None) -> int:
     cfg = load_app_config().ib_gateway
-    normalized_role = str(role or "").strip().lower()
+    normalized_role = _normalize_ib_role(role)
     if normalized_role == "market_data":
-        return cfg.client_ids.market_data
+        return cfg.role_connections.market_data.client_id
+    if normalized_role == "order":
+        return cfg.role_connections.order.client_id
     if normalized_role == "cli":
-        return cfg.client_ids.cli
-    return cfg.client_ids.broker_data
+        return cfg.role_connections.cli.client_id
+    return cfg.role_connections.broker_data.client_id
+
+
+def resolve_ib_role_port(role: str | None = None) -> int:
+    cfg = load_app_config().ib_gateway
+    normalized_role = _normalize_ib_role(role)
+    if normalized_role == "market_data":
+        return cfg.role_ports.market_data
+    if normalized_role == "order":
+        return cfg.role_ports.order
+    if normalized_role == "cli":
+        return cfg.role_ports.cli
+    return cfg.role_ports.broker_data
+
+
+def resolve_ib_role_readonly(role: str | None = None) -> bool:
+    cfg = load_app_config().ib_gateway
+    normalized_role = _normalize_ib_role(role)
+    if normalized_role == "market_data":
+        return bool(cfg.role_connections.market_data.readonly)
+    if normalized_role == "order":
+        return bool(cfg.role_connections.order.readonly)
+    if normalized_role == "cli":
+        return bool(cfg.role_connections.cli.readonly)
+    return bool(cfg.role_connections.broker_data.readonly)
 
 
 def resolve_trigger_window_policy(

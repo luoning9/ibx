@@ -15,6 +15,7 @@ services:
       - TWS_USERID_PAPER=${IB_ACCOUNT_PAPER:-}
       - TWS_PASSWORD_PAPER=${IB_PASSWORD_PAPER:-}
       - TRADING_MODE=${TRADING_MODE:-paper} # 支持 paper/live/both
+      - READ_ONLY_API=${READ_ONLY_API:-yes}
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-123456}
       - TWS_ACCEPT_EULA=yes
       - TWOFA_DEVICE=IB Key

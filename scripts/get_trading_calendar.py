@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import infer_ib_api_port, load_app_config, resolve_ib_client_id
+from app.ib_compat import INSTALL_HINT, require_ib_attr
 from app.market_config import resolve_market_profile
 
 
@@ -76,9 +77,10 @@ def _pick_front_future_contract(ib: Any, details: list[Any]) -> Any:
 def _resolve_contract_with_ib(ib: Any, *, code: str, market: str, contract_month: str | None) -> Any:
     profile = resolve_market_profile(market, None)
     try:
-        from ib_insync import Future, Stock
+        Future = require_ib_attr("Future")
+        Stock = require_ib_attr("Stock")
     except ModuleNotFoundError as exc:
-        raise RuntimeError("ib_insync is required; install with: pip install ib_insync") from exc
+        raise RuntimeError(INSTALL_HINT) from exc
 
     symbol = code.strip().upper()
     if not symbol:
@@ -198,9 +200,9 @@ def main() -> int:
     end_dt_local = datetime.combine(tomorrow_local, time(23, 59, 59), tzinfo=LOCAL_TZ)
 
     try:
-        from ib_insync import IB
+        IB = require_ib_attr("IB")
     except ModuleNotFoundError:
-        print("ERROR: missing dependency ib_insync. Install with: pip install ib_insync", file=sys.stderr)
+        print(f"ERROR: {INSTALL_HINT}", file=sys.stderr)
         return 2
 
     ib = IB()

@@ -1,11 +1,14 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import EventsView from '../views/EventsView.vue'
+import MarketDataProbeView from '../views/MarketDataProbeView.vue'
 import PositionsView from '../views/PositionsView.vue'
 import StrategyDetailView from '../views/StrategyDetailView.vue'
 import StrategyEditorActionsView from '../views/StrategyEditorActionsView.vue'
 import StrategyEditorBasicView from '../views/StrategyEditorBasicView.vue'
 import StrategyEditorConditionsView from '../views/StrategyEditorConditionsView.vue'
 import StrategiesView from '../views/StrategiesView.vue'
+import SystemStatusView from '../views/SystemStatusView.vue'
+import TradeLogsView from '../views/TradeLogsView.vue'
 import TradeInstructionsView from '../views/TradeInstructionsView.vue'
 
 const router = createRouter({
@@ -31,12 +34,15 @@ const router = createRouter({
       component: StrategyEditorActionsView,
     },
     { path: '/events', name: 'events', component: EventsView },
+    { path: '/market-data-probe', name: 'market-data-probe', component: MarketDataProbeView },
     { path: '/positions', name: 'positions', component: PositionsView },
+    { path: '/system-status', name: 'system-status', component: SystemStatusView },
     {
       path: '/trade-instructions',
       name: 'trade-instructions',
       component: TradeInstructionsView,
     },
+    { path: '/trade-logs', name: 'trade-logs', component: TradeLogsView },
   ],
 })
 

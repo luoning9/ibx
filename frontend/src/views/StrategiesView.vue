@@ -1,15 +1,19 @@
 <script setup lang="ts">
+import { CaretRight, CopyDocument } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { deleteStrategy, fetchStrategies } from '../api/services'
+import { activateStrategy, copyStrategy, deleteStrategy, fetchStrategies } from '../api/services'
 import type { StrategySummary } from '../api/types'
 import { formatIsoDateTime } from '../utils/format'
 
 const rows = ref<StrategySummary[]>([])
 const loading = ref(false)
 const error = ref('')
+const activatingId = ref('')
+const copyingId = ref('')
+const deleteEnabled = ref(false)
 const router = useRouter()
 
 function statusType(status: string) {
@@ -49,6 +53,32 @@ async function onDelete(row: StrategySummary) {
     await loadStrategies()
   } catch (err) {
     ElMessage.error(`删除失败：${String(err)}`)
+  }
+}
+
+async function onActivate(row: StrategySummary) {
+  activatingId.value = row.id
+  try {
+    await activateStrategy(row.id)
+    ElMessage.success(`已发起激活：${row.id}`)
+    await loadStrategies()
+  } catch (err) {
+    ElMessage.error(`激活失败：${String(err)}`)
+  } finally {
+    activatingId.value = ''
+  }
+}
+
+async function onCopy(row: StrategySummary) {
+  copyingId.value = row.id
+  try {
+    const created = await copyStrategy(row.id)
+    ElMessage.success(`复制成功：${row.id} -> ${created.id}`)
+    router.push(`/strategies/${created.id}`)
+  } catch (err) {
+    ElMessage.error(`复制失败：${String(err)}`)
+  } finally {
+    copyingId.value = ''
   }
 }
 
@@ -104,18 +134,50 @@ onMounted(loadStrategies)
         <el-table-column label="最近更新" width="180">
           <template #default="{ row }">{{ formatIsoDateTime(row.updated_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="90">
+        <el-table-column label="操作" width="120">
           <template #default="{ row }">
             <el-space>
-              <el-button
-                size="small"
-                type="danger"
-                :disabled="!row.capabilities?.can_delete"
-                @click.stop="onDelete(row)"
-              >
-                删除
-              </el-button>
+              <el-tooltip content="激活策略" placement="top">
+                <el-button
+                  class="ops-icon-btn"
+                  size="small"
+                  circle
+                  :disabled="!row.capabilities?.can_activate"
+                  :loading="activatingId === row.id"
+                  title="激活"
+                  aria-label="激活"
+                  @click.stop="onActivate(row)"
+                >
+                  <el-icon v-if="row.capabilities?.can_activate"><CaretRight /></el-icon>
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="复制策略" placement="top">
+                <el-button
+                  class="ops-icon-btn"
+                  size="small"
+                  circle
+                  :loading="copyingId === row.id"
+                  @click.stop="onCopy(row)"
+                >
+                  <el-icon><CopyDocument /></el-icon>
+                </el-button>
+              </el-tooltip>
             </el-space>
+          </template>
+        </el-table-column>
+        <el-table-column width="90" align="center">
+          <template #header>
+            <el-checkbox v-model="deleteEnabled">删除</el-checkbox>
+          </template>
+          <template #default="{ row }">
+            <el-button
+              v-if="deleteEnabled && row.capabilities?.can_delete"
+              size="small"
+              type="danger"
+              @click.stop="onDelete(row)"
+            >
+              删除
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -136,5 +198,28 @@ onMounted(loadStrategies)
 
 :deep(.clickable-row) {
   cursor: pointer;
+}
+
+.ops-icon-btn :deep(.el-icon) {
+  font-size: 15px;
+}
+
+.ops-icon-btn.el-button {
+  color: var(--el-text-color-regular);
+  border-color: var(--el-border-color);
+  background-color: transparent;
+}
+
+.ops-icon-btn.el-button:hover,
+.ops-icon-btn.el-button:focus-visible {
+  color: var(--el-text-color-regular);
+  border-color: var(--el-border-color);
+  background-color: transparent;
+}
+
+.ops-icon-btn.el-button.is-disabled,
+.ops-icon-btn.el-button.is-disabled:hover {
+  border-color: var(--el-border-color-light);
+  background-color: transparent;
 }
 </style>

@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -31,6 +31,7 @@ from .models import (
     ControlResponse,
     EventLogItem,
     NextStrategyProjection,
+    NextStrategyActivationMode,
     PortfolioSummaryOut,
     PositionItemOut,
     StrategyActionsPutIn,
@@ -58,6 +59,7 @@ from .strategy_description import generate_strategy_description
 
 TERMINAL_STATUSES: set[str] = {"FILLED", "EXPIRED", "CANCELLED", "FAILED"}
 TRADE_INSTRUCTION_TERMINAL_STATUSES: tuple[str, ...] = ("FILLED", "CANCELLED", "FAILED", "EXPIRED")
+CANCEL_BLOCKED_STATUSES: set[str] = {"VERIFYING", "TRIGGERED", "ORDER_SUBMITTED"}
 CANCEL_OTHER_OPEN_ORDER_WAIT_TIMEOUT_SECONDS = 5.0
 EDITABLE_STATUSES: set[str] = {"PENDING_ACTIVATION", "PAUSED", "VERIFY_FAILED"}
 STOCK_TRADE_TYPES: set[str] = {"buy", "sell", "switch"}
@@ -65,6 +67,11 @@ ACTIVE_STRATEGIES_SOURCE = "v_strategies_active"
 RUNTIME_KEY_PAUSED_FROM_STATUS = "paused_from_status"
 STRATEGY_LOCKED_ERROR_CODE = "STRATEGY_LOCKED"
 _LOGGER = logging.getLogger("ibx.store")
+NEXT_STRATEGY_ACTIVATION_MODES: set[str] = {
+    "IMMEDIATE",
+    "AFTER_TRADE_SUBMITTED",
+    "AFTER_TRADE_COMPLETED",
+}
 
 
 def utcnow() -> datetime:
@@ -156,11 +163,35 @@ def _normalize_strategy_id(value: str | None) -> str | None:
     return normalized or None
 
 
-def _normalize_optional_text(value: str | None) -> str | None:
+def _normalize_optional_text(value: Any) -> str | None:
     if value is None:
         return None
-    normalized = value.strip()
+    normalized = str(value).strip()
     return normalized or None
+
+
+def _normalize_next_strategy_activation_mode(value: str | None) -> NextStrategyActivationMode:
+    normalized = str(value or "").strip().upper()
+    if normalized in NEXT_STRATEGY_ACTIVATION_MODES:
+        return cast(NextStrategyActivationMode, normalized)
+    return "IMMEDIATE"
+
+
+def _resolve_next_strategy_activation_mode(
+    *,
+    next_strategy_id: str | None,
+    trade_action_json: dict[str, Any] | None,
+    requested_mode: str | None,
+) -> NextStrategyActivationMode:
+    if next_strategy_id is None:
+        return "IMMEDIATE"
+    normalized = _normalize_next_strategy_activation_mode(requested_mode)
+    if normalized in {"AFTER_TRADE_SUBMITTED", "AFTER_TRADE_COMPLETED"} and trade_action_json is None:
+        raise HTTPException(
+            status_code=422,
+            detail="next_strategy_activation_mode requires trade_action_json when next_strategy_id is set",
+        )
+    return normalized
 
 
 def _to_int_or_none(value: Any) -> int | None:
@@ -301,7 +332,7 @@ def _capabilities(
 
     can_pause = status in {"ACTIVE", "VERIFYING"}
     can_resume = status == "PAUSED"
-    can_cancel = status not in TERMINAL_STATUSES
+    can_cancel, cancel_reason = _cancel_capability(status=status)
     can_delete, delete_reason = _delete_capability(
         status=status,
         has_active_trade_instruction=has_active_trade_instruction,
@@ -319,7 +350,7 @@ def _capabilities(
         can_activate=activate_reason,
         can_pause=None if can_pause else "仅 ACTIVE / VERIFYING 可暂停",
         can_resume=None if can_resume else "仅 PAUSED 可恢复",
-        can_cancel=None if can_cancel else "终态策略不可取消",
+        can_cancel=cancel_reason,
         can_delete=delete_reason,
     )
     return caps, reasons
@@ -331,14 +362,20 @@ def _delete_capability(
     has_active_trade_instruction: bool,
     has_upstream_strategy: bool,
 ) -> tuple[bool, str | None]:
-    if status == "ACTIVE":
-        return False, "ACTIVE 状态不可删除"
-    if status == "PAUSED":
-        return False, "PAUSED 状态不可删除"
+    if status in {"ACTIVE", "PAUSED", "VERIFYING", "TRIGGERED"}:
+        return False, f"{status} 状态不可删除"
     if has_upstream_strategy:
         return False, "存在上游策略，不可删除"
     if has_active_trade_instruction:
         return False, "交易未终止，不可删除"
+    return True, None
+
+
+def _cancel_capability(*, status: str) -> tuple[bool, str | None]:
+    if status in CANCEL_BLOCKED_STATUSES:
+        return False, f"{status} 状态不可取消"
+    if status in TERMINAL_STATUSES:
+        return False, "终态策略不可取消"
     return True, None
 
 
@@ -763,6 +800,9 @@ class SQLiteStore:
             trade_action_runtime=self._load_trade_action_runtime(
                 conn, strategy_id=strategy_id, has_trade_action=trade_action_json is not None
             ),
+            next_strategy_activation_mode=_normalize_next_strategy_activation_mode(
+                row["next_strategy_activation_mode"]
+            ),
             next_strategy=self._load_next_strategy(
                 conn,
                 next_strategy_id=row["next_strategy_id"],
@@ -987,6 +1027,11 @@ class SQLiteStore:
             market=market_profile.market,
             account_code=_resolve_trade_action_account_code(),
         )
+        next_strategy_activation_mode = _resolve_next_strategy_activation_mode(
+            next_strategy_id=next_strategy_id,
+            trade_action_json=trade_action_json,
+            requested_mode=payload.next_strategy_activation_mode,
+        )
 
         conditions: list[ConditionItem] = []
         for idx, cond in enumerate(payload.conditions, start=1):
@@ -1008,8 +1053,8 @@ class SQLiteStore:
                     trade_type, upstream_only_activation,
                     expire_mode, expire_in_seconds, expire_at, status, condition_logic,
                     conditions_json, trade_action_json, next_strategy_id, next_strategy_note,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    next_strategy_activation_mode, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     strategy_id,
@@ -1030,6 +1075,7 @@ class SQLiteStore:
                     dumps_json(trade_action_json) if trade_action_json is not None else None,
                     next_strategy_id,
                     next_strategy_note,
+                    next_strategy_activation_mode,
                     to_iso(now),
                     to_iso(now),
                 ),
@@ -1115,6 +1161,9 @@ class SQLiteStore:
                 # 不复制上下游关系，避免复制后形成链路冲突。
                 next_strategy_id=None,
                 next_strategy_note=None,
+                next_strategy_activation_mode=_normalize_next_strategy_activation_mode(
+                    source["next_strategy_activation_mode"]
+                ),
             )
             detail = self._create_strategy_locked(
                 conn,
@@ -1152,9 +1201,32 @@ class SQLiteStore:
                 raise HTTPException(status_code=422, detail=str(exc))
 
             _validate_trade_symbol_combo(next_trade_type, next_symbols)
-            _validate_trade_action_compatibility(next_trade_type, current_trade_action)
+            old_next_strategy_activation_mode = _normalize_next_strategy_activation_mode(
+                row["next_strategy_activation_mode"]
+            )
+            next_strategy_activation_mode = old_next_strategy_activation_mode
+            trade_action_auto_cleared = False
+            next_trade_action = current_trade_action
+            try:
+                _validate_trade_action_compatibility(next_trade_type, current_trade_action)
+            except HTTPException as exc:
+                if (
+                    exc.status_code == 422
+                    and "trade_type" in fields_set
+                    and current_trade_action is not None
+                ):
+                    next_trade_action = None
+                    trade_action_auto_cleared = True
+                    if (
+                        _normalize_strategy_id(row["next_strategy_id"]) is not None
+                        and next_strategy_activation_mode
+                        in {"AFTER_TRADE_SUBMITTED", "AFTER_TRADE_COMPLETED"}
+                    ):
+                        next_strategy_activation_mode = "IMMEDIATE"
+                else:
+                    raise
             next_trade_action_json = _enrich_trade_action_with_strategy_context(
-                trade_action_json=current_trade_action,
+                trade_action_json=next_trade_action,
                 market=market_profile.market,
                 account_code=_resolve_trade_action_account_code(),
             )
@@ -1208,6 +1280,15 @@ class SQLiteStore:
                 old_expire_at=_normalize_optional_text(row["expire_at"]),
                 new_expire_at=_normalize_optional_text(expire_at),
             )
+            if trade_action_auto_cleared:
+                basic_update_event_detail = (
+                    f"{basic_update_event_detail}；trade_action_json: 因 trade_type 变更自动清空不兼容交易动作"
+                )
+            if old_next_strategy_activation_mode != next_strategy_activation_mode:
+                basic_update_event_detail = (
+                    f"{basic_update_event_detail}；next_strategy_activation_mode: "
+                    f"{old_next_strategy_activation_mode} -> {next_strategy_activation_mode}"
+                )
 
             now = utcnow()
             conn.execute(
@@ -1215,6 +1296,7 @@ class SQLiteStore:
                 UPDATE strategies
                 SET description = ?, market = ?, sec_type = ?, exchange = ?, currency = ?, trade_type = ?,
                     trade_action_json = ?,
+                    next_strategy_activation_mode = ?,
                     upstream_only_activation = ?,
                     logical_activated_at = ?,
                     expire_mode = ?, expire_in_seconds = ?, expire_at = ?, updated_at = ?,
@@ -1229,6 +1311,7 @@ class SQLiteStore:
                     market_profile.currency,
                     next_trade_type,
                     dumps_json(next_trade_action_json) if next_trade_action_json is not None else None,
+                    next_strategy_activation_mode,
                     upstream_only_activation,
                     logical_activated_at,
                     expire_mode,
@@ -1331,12 +1414,20 @@ class SQLiteStore:
                 market=str(row["market"] or "").strip().upper(),
                 account_code=_resolve_trade_action_account_code(),
             )
+            next_strategy_activation_mode = _resolve_next_strategy_activation_mode(
+                next_strategy_id=next_strategy_id,
+                trade_action_json=trade_action_json,
+                requested_mode=payload.next_strategy_activation_mode,
+            )
             now = utcnow()
             try:
                 conn.execute(
                     """
                     UPDATE strategies
-                    SET trade_action_json = ?, next_strategy_id = ?, next_strategy_note = ?,
+                    SET trade_action_json = ?,
+                        next_strategy_id = ?,
+                        next_strategy_note = ?,
+                        next_strategy_activation_mode = ?,
                         updated_at = ?, version = version + 1
                     WHERE id = ?
                     """,
@@ -1344,6 +1435,7 @@ class SQLiteStore:
                         dumps_json(trade_action_json) if trade_action_json is not None else None,
                         next_strategy_id,
                         next_strategy_note,
+                        next_strategy_activation_mode,
                         to_iso(now),
                         strategy_id,
                     ),
@@ -1466,8 +1558,9 @@ class SQLiteStore:
         with self._lock, self._conn() as conn:
             row = self._get_strategy_row(conn, strategy_id)
             _raise_if_strategy_locked(row=row, now=utcnow(), action="cancel")
-            if row["status"] in TERMINAL_STATUSES:
-                raise HTTPException(status_code=409, detail="terminal status cannot cancel")
+            can_cancel, cancel_reason = _cancel_capability(status=str(row["status"] or ""))
+            if not can_cancel:
+                raise HTTPException(status_code=409, detail=cancel_reason or "strategy cannot cancel")
             now = utcnow()
             conn.execute(
                 """
@@ -1511,7 +1604,11 @@ class SQLiteStore:
             conn.execute(
                 """
                 UPDATE strategies
-                SET next_strategy_id = NULL, next_strategy_note = NULL, updated_at = ?, version = version + 1
+                SET next_strategy_id = NULL,
+                    next_strategy_note = NULL,
+                    next_strategy_activation_mode = 'IMMEDIATE',
+                    updated_at = ?,
+                    version = version + 1
                 WHERE next_strategy_id = ? AND is_deleted = 0
                 """,
                 (now_iso, strategy_id),
@@ -1530,6 +1627,7 @@ class SQLiteStore:
                 SET status = 'CANCELLED',
                     next_strategy_id = NULL,
                     next_strategy_note = NULL,
+                    next_strategy_activation_mode = 'IMMEDIATE',
                     upstream_strategy_id = NULL,
                     is_deleted = 1,
                     deleted_at = ?,

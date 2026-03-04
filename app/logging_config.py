@@ -54,6 +54,12 @@ def configure_logging() -> Path:
         if logger.level == logging.NOTSET or logger.level > logging.INFO:
             logger.setLevel(logging.INFO)
 
+    # IB client wrapper emits verbose account sync INFO logs on each connect
+    # (positions/portfolio/commissions). Keep warnings/errors only.
+    ib_wrapper_logger = logging.getLogger("ib_async.wrapper")
+    if ib_wrapper_logger.level == logging.NOTSET or ib_wrapper_logger.level < logging.WARNING:
+        ib_wrapper_logger.setLevel(logging.WARNING)
+
     root_logger.info("File logging initialized at %s", log_path)
     _CONFIGURED = True
     return log_path

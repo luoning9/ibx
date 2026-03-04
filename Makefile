@@ -35,7 +35,7 @@ check-market-data:
 		--page-size 500 \
 		--no-cache
 
-# 检查 trade：通过 IBOrderService 查询当前活动订单（默认使用 cli client id）
+# 检查 trade：通过 IBTradeService 查询当前活动订单（默认使用 cli client id）
 check-trade:
 	$(PYTHON) scripts/check_trade.py
 

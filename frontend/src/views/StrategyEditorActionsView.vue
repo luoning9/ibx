@@ -3,8 +3,19 @@ import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { fetchStrategies, fetchStrategyDetail, putStrategyActions } from '../api/services'
-import type { StrategyDetail, StrategySummary, StrategyTradeType } from '../api/types'
+import {
+  fetchGeneratedStrategyDescription,
+  fetchStrategies,
+  fetchStrategyDetail,
+  patchStrategyBasic,
+  putStrategyActions,
+} from '../api/services'
+import type {
+  NextStrategyActivationMode,
+  StrategyDetail,
+  StrategySummary,
+  StrategyTradeType,
+} from '../api/types'
 
 type ActionType = 'STOCK_TRADE' | 'FUT_POSITION' | 'FUT_ROLL'
 type OrderType = 'MKT' | 'LMT'
@@ -24,6 +35,7 @@ const strategyOptions = ref<StrategySummary[]>([])
 const form = reactive({
   nextStrategyId: '',
   nextStrategyNote: '',
+  nextStrategyActivationMode: 'IMMEDIATE' as NextStrategyActivationMode,
   enableTradeAction: true,
   actionType: 'STOCK_TRADE' as ActionType,
   symbol: '',
@@ -52,9 +64,18 @@ const actionTypeChoices = {
   FUT_ROLL: '期货展期（FUT_ROLL）',
 } as const
 
+const nextStrategyActivationModeChoices: Array<{
+  value: NextStrategyActivationMode
+  label: string
+}> = [
+  { value: 'IMMEDIATE', label: '立即激活' },
+  { value: 'AFTER_TRADE_SUBMITTED', label: '交易指令发送后' },
+  { value: 'AFTER_TRADE_COMPLETED', label: '交易指令完成后' },
+]
+
 const actionStatusText = computed(() => {
   if (!detail.value) return '后续动作状态：编辑中'
-  if (!form.enableTradeAction && !form.nextStrategyId.trim()) return '后续动作状态：未设置'
+  if (!form.enableTradeAction && !normalizeText(form.nextStrategyId)) return '后续动作状态：未设置'
   if (form.enableTradeAction) return `后续动作状态：${detail.value.trade_action_runtime.trade_status || 'NOT_SET'}`
   return '后续动作状态：仅激活下游策略'
 })
@@ -257,6 +278,7 @@ function loadFromDetail(d: StrategyDetail) {
   detail.value = d
   form.nextStrategyId = d.next_strategy?.id ?? ''
   form.nextStrategyNote = d.next_strategy?.description ?? ''
+  form.nextStrategyActivationMode = d.next_strategy_activation_mode || 'IMMEDIATE'
 
   const action = d.trade_action_json ? asObject(d.trade_action_json) : null
   form.enableTradeAction = Boolean(action)
@@ -301,12 +323,27 @@ function loadFromDetail(d: StrategyDetail) {
   applyActionDefaults()
 }
 
+async function ensureStrategyDescription(detail: StrategyDetail) {
+  if (String(detail.description || '').trim()) return detail
+  if (!detail.editable) return detail
+
+  try {
+    const generated = await fetchGeneratedStrategyDescription(detail.id)
+    const generatedDescription = String(generated.description || '').trim()
+    if (!generatedDescription) return detail
+    return await patchStrategyBasic(detail.id, { description: generatedDescription })
+  } catch {
+    return detail
+  }
+}
+
 async function loadDetail() {
   if (!strategyId.value) return
   loading.value = true
   error.value = ''
   try {
-    const d = await fetchStrategyDetail(strategyId.value)
+    const fetchedDetail = await fetchStrategyDetail(strategyId.value)
+    const d = await ensureStrategyDescription(fetchedDetail)
     loadFromDetail(d)
 
     try {
@@ -413,7 +450,7 @@ async function saveActions() {
   saving.value = true
   error.value = ''
   try {
-    const nextStrategyId = form.nextStrategyId.trim().toUpperCase()
+    const nextStrategyId = normalizeText(form.nextStrategyId).toUpperCase()
     if (nextStrategyId && nextStrategyId === strategyId.value.toUpperCase()) {
       throw new Error('下游策略不能指向当前策略自身')
     }
@@ -428,11 +465,18 @@ async function saveActions() {
     if (!tradeAction && !nextStrategyId) {
       throw new Error('交易动作和下游策略至少配置一个')
     }
+    const nextStrategyActivationMode: NextStrategyActivationMode = nextStrategyId
+      ? form.nextStrategyActivationMode
+      : 'IMMEDIATE'
+    if (!tradeAction && nextStrategyId && nextStrategyActivationMode !== 'IMMEDIATE') {
+      throw new Error('未配置交易动作时，下游策略激活时点只能选择“立即激活”')
+    }
 
     const updated = await putStrategyActions(strategyId.value, {
       trade_action_json: tradeAction,
       next_strategy_id: nextStrategyId || null,
-      next_strategy_note: form.nextStrategyNote.trim() || null,
+      next_strategy_note: normalizeText(form.nextStrategyNote) || null,
+      next_strategy_activation_mode: nextStrategyActivationMode,
     })
 
     ElMessage.success(`已保存后续动作（${updated.id}）`)
@@ -456,6 +500,9 @@ watch(
   (nextId) => {
     const selected = nextStrategyChoices.value.find((item) => item.id === nextId)
     form.nextStrategyNote = selected?.description || ''
+    if (!nextId) {
+      form.nextStrategyActivationMode = 'IMMEDIATE'
+    }
   },
 )
 
@@ -538,6 +585,22 @@ onMounted(loadDetail)
                 :rows="3"
                 placeholder="例如：SLV 回撤达到 20% 时再卖出 100 股"
               />
+            </div>
+
+            <div class="form-field">
+              <label class="field-label">激活时点</label>
+              <el-select
+                v-model="form.nextStrategyActivationMode"
+                :disabled="!form.nextStrategyId"
+                placeholder="选择下游策略激活时点"
+              >
+                <el-option
+                  v-for="item in nextStrategyActivationModeChoices"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                />
+              </el-select>
             </div>
           </div>
 

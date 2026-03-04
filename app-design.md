@@ -116,7 +116,7 @@ flowchart LR
 - `condition_id`
 - `require_time_alignment`
 - `missing_data_policy`
-- `contracts[]`（每项：`contract_id`、`base_bar`、`required_points`、`state_requirements`、`include_partial_bar`）
+- `contracts[]`（每项：`contract_id`、`base_bar`、`effective_window_points`、`required_points`、`state_requirements`、`include_partial_bar`）
 - 同时在实例内缓存 `PreparedCondition`（供 `evaluate()` 使用）
 - `condition_id`、`metric`、`trigger_mode`、`evaluation_window`、`operator`、`threshold`
 - `evaluate(evaluation_input)` 输入：
@@ -396,6 +396,13 @@ IB 会话循环约束（实现说明）：
 1. 每 `worker.monitor_interval_seconds` 扫描策略（R4.3）。
 2. 计算触发条件（R4.1）：
 - 对 `DRAWDOWN_PCT/RALLY_PCT`，使用 `logical_activated_at` 作为统计起点。
+- 行情拉取起点按“条件 + 合约”计算：
+- 先取 `recorded_last_end_at`：优先 `strategy_runs.last_monitoring_data_end_at[condition_id][contract_id]`，无则 `initial_last_monitoring_data_end_at`。
+- 若存在历史记录：`fetch_anchor = recorded_last_end_at - (effective_window_points - 1) * bar_delta`。
+- 若无历史记录：`fetch_anchor = initial_last_monitoring_data_end_at`。
+- 另有固定下界：`required_start_time = now - max(3, required_points + 2) * bar_delta`。
+- 最终请求起点：`start_time = min(fetch_anchor, required_start_time)`。
+- 新数据判定仍以 `recorded_last_end_at` 为基准（而非回看锚点），避免重叠窗口导致重复触发。
 3. 命中后执行 `Risk Engine` 与 `Verification Engine`（R4.4, R4.11）。
 4. 通过则下单；失败则记 `FAILED` 并保留原因（R5.2）。
 

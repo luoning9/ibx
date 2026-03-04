@@ -132,14 +132,7 @@ def test_session_manager_reuses_connection_before_idle_ttl() -> None:
     fake = _FakeIB()
     manager = IBSessionManager(ib_factory=lambda: fake, sweep_interval_seconds=0.5)
     try:
-        session = manager.get_session(
-            host="127.0.0.1",
-            port=4002,
-            client_id=99,
-            timeout_seconds=5.0,
-            readonly=True,
-            idle_ttl_seconds=2.0,
-        )
+        session = manager.get_session(role="order")
         first = session.run(lambda ib: bool(ib.isConnected()))
         second = session.run(lambda ib: bool(ib.isConnected()))
         assert first is True
@@ -149,27 +142,20 @@ def test_session_manager_reuses_connection_before_idle_ttl() -> None:
         manager.close_all()
 
 
-def test_session_manager_closes_idle_connection_and_reconnects_on_next_request() -> None:
+def test_session_manager_keeps_connection_alive_when_reap_requested() -> None:
     fake = _FakeIB()
     manager = IBSessionManager(ib_factory=lambda: fake, sweep_interval_seconds=0.5)
     try:
-        session = manager.get_session(
-            host="127.0.0.1",
-            port=4002,
-            client_id=99,
-            timeout_seconds=5.0,
-            readonly=True,
-            idle_ttl_seconds=1.0,
-        )
+        session = manager.get_session(role="order")
         session.run(lambda ib: bool(ib.isConnected()))
         assert fake.connect_calls == 1
         assert fake.disconnect_calls == 0
 
-        time.sleep(1.1)
+        time.sleep(0.1)
         manager.reap_once()
-        assert fake.disconnect_calls == 1
+        assert fake.disconnect_calls == 0
 
         session.run(lambda ib: bool(ib.isConnected()))
-        assert fake.connect_calls == 2
+        assert fake.connect_calls == 1
     finally:
         manager.close_all()

@@ -3,12 +3,21 @@ import type {
   ActiveTradeInstruction,
   ConditionRulesResponse,
   EventItem,
+  MarketProfile,
+  MarketDataProbePayload,
+  MarketDataProbeResponse,
   PortfolioSummary,
   PositionItem,
+  OtherOpenOrder,
+  OpenOrderCancelResult,
+  StrategyActionsPayload,
   StrategyBasicPatchPayload,
   StrategyCreatePayload,
+  StrategyDescriptionResult,
   StrategyDetail,
+  SystemStatus,
   StrategySummary,
+  TradeOrder,
   TradeLogItem,
 } from './types'
 
@@ -22,6 +31,11 @@ export async function fetchStrategyDetail(strategyId: string) {
   return data
 }
 
+export async function copyStrategy(strategyId: string) {
+  const { data } = await http.post<StrategyDetail>(`/strategies/${strategyId}/copy`)
+  return data
+}
+
 export async function createStrategy(payload: StrategyCreatePayload) {
   const { data } = await http.post<StrategyDetail>('/strategies', payload)
   return data
@@ -29,6 +43,14 @@ export async function createStrategy(payload: StrategyCreatePayload) {
 
 export async function patchStrategyBasic(strategyId: string, payload: StrategyBasicPatchPayload) {
   const { data } = await http.patch<StrategyDetail>(`/strategies/${strategyId}/basic`, payload)
+  return data
+}
+
+export async function fetchGeneratedStrategyDescription(strategyId: string) {
+  const normalized = String(strategyId || '').trim()
+  const { data } = await http.get<StrategyDescriptionResult>(
+    `/strategies/${encodeURIComponent(normalized)}/description/generate`,
+  )
   return data
 }
 
@@ -42,11 +64,7 @@ export async function putStrategyConditions(
 
 export async function putStrategyActions(
   strategyId: string,
-  payload: {
-    trade_action_json?: Record<string, unknown> | null
-    next_strategy_id?: string | null
-    next_strategy_note?: string | null
-  },
+  payload: StrategyActionsPayload,
 ) {
   const { data } = await http.put<StrategyDetail>(`/strategies/${strategyId}/actions`, payload)
   return data
@@ -72,8 +90,10 @@ export async function resumeStrategy(strategyId: string) {
   await http.post(`/strategies/${strategyId}/resume`)
 }
 
-export async function fetchEvents() {
-  const { data } = await http.get<EventItem[]>('/events')
+export async function fetchEvents(strategyId?: string) {
+  const normalized = (strategyId || '').trim()
+  const path = normalized ? `/strategies/${encodeURIComponent(normalized)}/events` : '/events'
+  const { data } = await http.get<EventItem[]>(path)
   return data
 }
 
@@ -97,7 +117,48 @@ export async function fetchActiveTradeInstructions() {
   return data
 }
 
-export async function fetchTradeLogs() {
-  const { data } = await http.get<TradeLogItem[]>('/trade-logs')
+export async function fetchRecentCompletedTradeInstructions() {
+  const { data } = await http.get<ActiveTradeInstruction[]>('/trade-instructions/completed-recent')
+  return data
+}
+
+export async function fetchOtherOpenOrders() {
+  const { data } = await http.get<OtherOpenOrder[]>('/trade-instructions/open-orders/others')
+  return data
+}
+
+export async function cancelOtherOpenOrder(permId: number) {
+  const { data } = await http.post<OpenOrderCancelResult>(`/trade-instructions/open-orders/${permId}/cancel`)
+  return data
+}
+
+export async function fetchTradeLogs(tradeId?: string) {
+  const normalized = (tradeId || '').trim()
+  const { data } = await http.get<TradeLogItem[]>('/trade-logs', {
+    params: normalized ? { trade_id: normalized } : undefined,
+  })
+  return data
+}
+
+export async function fetchTradeInstructionOrders(tradeId: string) {
+  const normalized = (tradeId || '').trim()
+  const { data } = await http.get<TradeOrder[]>(
+    `/trade-instructions/${encodeURIComponent(normalized)}/orders`,
+  )
+  return data
+}
+
+export async function fetchSystemStatus() {
+  const { data } = await http.get<SystemStatus>('/system-status')
+  return data
+}
+
+export async function fetchMarkets() {
+  const { data } = await http.get<MarketProfile[]>('/markets')
+  return data
+}
+
+export async function probeMarketData(payload: MarketDataProbePayload) {
+  const { data } = await http.post<MarketDataProbeResponse>('/market-data/probe', payload)
   return data
 }

@@ -15,7 +15,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import infer_ib_api_port, load_app_config, resolve_ib_client_id
-from app.ib_trade_service import ActiveOrderSnapshot, IBOrderService
+from app.ib_compat import INSTALL_HINT, is_missing_ib_dependency_error
+from app.ib_trade_service import ActiveOrderSnapshot, IBTradeService
 from app.ib_session_manager import close_ib_session_manager
 
 
@@ -132,22 +133,19 @@ def print_table(rows: list[ActiveOrderSnapshot]) -> None:
 
 def main() -> int:
     args = parse_args()
-    cfg = load_app_config().ib_gateway
-    service = IBOrderService(
+    service = IBTradeService(
         host=str(args.host),
         port=int(args.port),
         client_id=int(args.client_id),
         timeout_seconds=float(args.timeout),
-        session_idle_ttl_seconds=float(cfg.session_idle_ttl_seconds),
-        readonly=True,
     )
 
     try:
         rows = service.list_active_orders()
     except Exception as exc:  # noqa: BLE001
-        if "ib_insync is not installed" in str(exc):
+        if is_missing_ib_dependency_error(exc):
             print(
-                "[ERROR] Missing dependency: ib_insync. Install with: pip install ib_insync",
+                f"[ERROR] {INSTALL_HINT}",
                 file=sys.stderr,
             )
             return 3

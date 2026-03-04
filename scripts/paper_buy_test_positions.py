@@ -16,8 +16,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import load_app_config, resolve_ib_client_id
+from app.ib_compat import INSTALL_HINT, is_missing_ib_dependency_error, require_ib_attr
 from app.ib_session_manager import close_ib_session_manager, get_ib_session_manager
-from app.ib_trade_service import IBOrderService
+from app.ib_trade_service import IBTradeService
 
 
 @dataclass
@@ -130,27 +131,15 @@ def _parse_symbols(raw: str) -> list[str]:
 
 def _qualify_symbol(
     *,
-    host: str,
-    port: int,
-    client_id: int,
-    timeout_seconds: float,
-    idle_ttl_seconds: float,
     symbol: str,
 ) -> int | None:
-    session = get_ib_session_manager().get_session(
-        host=host,
-        port=port,
-        client_id=client_id,
-        timeout_seconds=timeout_seconds,
-        readonly=True,
-        idle_ttl_seconds=idle_ttl_seconds,
-    )
+    session = get_ib_session_manager().get_session(role="order")
 
     def _run(ib: Any) -> int | None:
         try:
-            from ib_insync import Stock
+            Stock = require_ib_attr("Stock")
         except ModuleNotFoundError as exc:
-            raise RuntimeError("ib_insync is not installed") from exc
+            raise RuntimeError("ib_async is not installed") from exc
         contract = Stock(symbol=symbol, exchange="SMART", currency="USD")
         qualified = list(ib.qualifyContracts(contract))
         if not qualified:
@@ -162,6 +151,8 @@ def _qualify_symbol(
 
 def _build_trade_action(args: argparse.Namespace, *, symbol: str) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "market": "US_STOCK",
+        "account_code": str(args.account or "").strip() or None,
         "action_type": "STOCK_TRADE",
         "symbol": symbol,
         "side": "BUY",
@@ -200,14 +191,12 @@ def main() -> int:
         )
         return 2
 
-    order_service = IBOrderService(
+    order_service = IBTradeService(
         host=str(args.host),
         port=int(args.port),
         client_id=int(args.client_id),
         timeout_seconds=float(args.timeout),
-        session_idle_ttl_seconds=float(cfg.session_idle_ttl_seconds),
         account_code=args.account,
-        readonly=False,
     )
 
     try:
@@ -215,11 +204,6 @@ def main() -> int:
         for symbol in symbols:
             if args.dry_run:
                 con_id = _qualify_symbol(
-                    host=str(args.host),
-                    port=int(args.port),
-                    client_id=int(args.client_id),
-                    timeout_seconds=float(args.timeout),
-                    idle_ttl_seconds=float(cfg.session_idle_ttl_seconds),
                     symbol=symbol,
                 )
                 results.append(
@@ -237,9 +221,7 @@ def main() -> int:
                 continue
             trade_action = _build_trade_action(args, symbol=symbol)
             submit = order_service.submit_trade_action(
-                market="US_STOCK",
                 trade_action=trade_action,
-                account_code=args.account,
                 order_ref=f"PAPER-{symbol}",
             )
             con_id = submit.con_id
@@ -271,11 +253,8 @@ def main() -> int:
                 )
             )
     except Exception as exc:  # noqa: BLE001
-        if "ib_insync is not installed" in str(exc):
-            print(
-                "[ERROR] Missing dependency: ib_insync. Install with: pip install ib_insync",
-                file=sys.stderr,
-            )
+        if is_missing_ib_dependency_error(exc):
+            print(f"[ERROR] {INSTALL_HINT}", file=sys.stderr)
             return 3
         print(f"[ERROR] submit failed: {exc}", file=sys.stderr)
         return 1

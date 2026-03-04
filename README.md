@@ -12,7 +12,7 @@
 
 - **跨平台适配**：针对 macOS 本地开发、Synology NAS 长期运行以及 AWS 云端部署进行了优化。
 - **安全隔离**：严格遵循网络安全规范，通过环境变量（`.env`）管理敏感凭据，确保账号安全。
-- **异步驱动**：基于 `ib_insync` 构建，支持异步非阻塞的 API 调用，提升高频/多路交易的响应速度。
+- **异步驱动**：基于 `ib_async` 构建，支持异步非阻塞的 API 调用，提升高频/多路交易的响应速度。
 - **模块化架构**：将交易策略逻辑与底层执行逻辑解耦，支持快速接入自定义算法。
 
 ---
@@ -229,11 +229,11 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 - `IBX_MARKET_CACHE_DB_PATH`：仅覆盖行情缓存数据库路径
 
 IB 连接会话策略（当前实现）：
-- 按 `host + port + client_id + readonly` 复用会话；
+- 按 `client_id` 复用会话（`host/port/readonly` 来自当前 role 配置）；
 - 每个会话固定由一个专用工作线程处理（connect/request/disconnect 全部在同一线程）；
 - 同一会话内请求串行执行（避免同一 `client_id` 并发冲突）；
-- 空闲超过 `ib_gateway.session_idle_ttl_seconds`（默认 30 秒）自动断开；
-- 下一次请求会自动重连。
+- 默认保持长连接，不做空闲 TTL 主动断开；
+- 连接中断后，下一次请求会自动重连。
 
 样本数据：
 - `make seed-sample` 会先清空运行时业务数据，再灌入干净的 `SMP-*` 样本（策略、事件、交易、持仓与组合快照）。
@@ -306,3 +306,25 @@ IB 连接会话策略（当前实现）：
 - `evaluation_input.state_values`：传入运行时状态值（如 `since_activation_high/low`）。
 - 仅做单条件比较，返回 `TRUE/FALSE/WAITING`。
 - 返回结构：`state`、`observed_value`、`reason`。
+
+### ACTIVE 阶段行情拉取起点计算（当前实现）
+
+实现文件：`app/worker.py`（`_build_condition_inputs_from_market_data`）。
+
+- 粒度：按“条件 + 合约”独立计算拉取起点。
+- 先取 `bar_delta`：由 `base_bar` 换算（如 `1m/5m/15m/1h`）。
+- 先取 `recorded_last_end_at`：
+- 若 `strategy_runs.last_monitoring_data_end_at[condition_id][contract_id]` 存在，使用该值；
+- 否则使用 `initial_last_monitoring_data_end_at`（激活起点）。
+- 若存在历史 `recorded_last_end_at`，回看锚点为：
+- `fetch_anchor = recorded_last_end_at - (effective_window_points - 1) * bar_delta`
+- 若不存在历史记录，回看锚点为：
+- `fetch_anchor = initial_last_monitoring_data_end_at`
+- 同时保留固定 lookback 下界：
+- `required_start_time = now - max(3, required_points + 2) * bar_delta`
+- 最终请求起点：
+- `start_time = min(fetch_anchor, required_start_time)`
+
+补充说明：
+- `effective_window_points` 表示实际回看点数：`CONFIRM` 模式等于 `evaluation_window/base_bar`（向上取整），`INSTANT` 模式等于 `required_points`。
+- “是否有新数据”的判断基准仍是 `recorded_last_end_at`（不是 `fetch_anchor`），避免重叠回看导致重复触发。

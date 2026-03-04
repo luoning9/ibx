@@ -111,6 +111,10 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
             CHECK (trade_action_json IS NULL OR json_valid(trade_action_json)),
           next_strategy_id TEXT REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE SET NULL,
           next_strategy_note TEXT,
+          next_strategy_activation_mode TEXT NOT NULL DEFAULT "IMMEDIATE"
+            CHECK (next_strategy_activation_mode IN (
+              "IMMEDIATE", "AFTER_TRADE_SUBMITTED", "AFTER_TRADE_COMPLETED"
+            )),
           upstream_strategy_id TEXT,
           is_deleted INTEGER NOT NULL DEFAULT 0
             CHECK (is_deleted IN (0, 1)),
@@ -124,6 +128,11 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
           version INTEGER NOT NULL DEFAULT 1
             CHECK (version > 0),
           CHECK (next_strategy_id IS NULL OR next_strategy_id <> id),
+          CHECK (
+            next_strategy_id IS NULL
+            OR next_strategy_activation_mode = "IMMEDIATE"
+            OR trade_action_json IS NOT NULL
+          ),
           CHECK (upstream_strategy_id IS NULL OR upstream_strategy_id <> id),
           CHECK (
             (expire_mode = "relative" AND expire_in_seconds IS NOT NULL)
@@ -139,7 +148,8 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
           id, idempotency_key, description, market, sec_type, exchange, trade_type, currency,
           upstream_only_activation,
           expire_mode, expire_in_seconds, expire_at, status, condition_logic, conditions_json,
-          trade_action_json, next_strategy_id, next_strategy_note, upstream_strategy_id,
+          trade_action_json, next_strategy_id, next_strategy_note, next_strategy_activation_mode,
+          upstream_strategy_id,
           is_deleted, deleted_at, anchor_price, activated_at, logical_activated_at,
           lock_until, created_at, updated_at, version
         )
@@ -163,7 +173,12 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
           COALESCE(NULLIF(trim(currency), ""), "USD") AS currency,
           upstream_only_activation,
           expire_mode, expire_in_seconds, expire_at, status, condition_logic, conditions_json,
-          trade_action_json, next_strategy_id, next_strategy_note, upstream_strategy_id,
+          trade_action_json, next_strategy_id, next_strategy_note,
+          COALESCE(
+            NULLIF(trim(next_strategy_activation_mode), ""),
+            "IMMEDIATE"
+          ) AS next_strategy_activation_mode,
+          upstream_strategy_id,
           COALESCE(is_deleted, 0), deleted_at, anchor_price, activated_at, logical_activated_at,
           lock_until,
           created_at, updated_at, version
@@ -178,6 +193,7 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     strategy_columns = _table_columns(conn, "strategies")
     strategy_symbol_columns = _table_columns(conn, "strategy_symbols")
+    order_columns = _table_columns(conn, "orders")
     if "market" not in strategy_columns:
         conn.execute(
             """
@@ -227,6 +243,13 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             ADD COLUMN lock_until TEXT
             """
         )
+    if "next_strategy_activation_mode" not in strategy_columns:
+        conn.execute(
+            """
+            ALTER TABLE strategies
+            ADD COLUMN next_strategy_activation_mode TEXT NOT NULL DEFAULT "IMMEDIATE"
+            """
+        )
 
     if (
         _strategies_has_upstream_fk(conn)
@@ -274,6 +297,28 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         WHERE currency IS NULL OR trim(currency) = ""
         """
     )
+    conn.execute(
+        """
+        UPDATE strategies
+        SET next_strategy_activation_mode = "IMMEDIATE"
+        WHERE next_strategy_activation_mode IS NULL
+           OR trim(next_strategy_activation_mode) = ""
+           OR next_strategy_activation_mode NOT IN (
+             "IMMEDIATE", "AFTER_TRADE_SUBMITTED", "AFTER_TRADE_COMPLETED"
+           )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE strategies
+        SET next_strategy_activation_mode = "IMMEDIATE"
+        WHERE next_strategy_id IS NULL
+           OR (
+             next_strategy_activation_mode IN ("AFTER_TRADE_SUBMITTED", "AFTER_TRADE_COMPLETED")
+             AND trade_action_json IS NULL
+           )
+        """
+    )
     if "contract_id" not in strategy_symbol_columns:
         conn.execute(
             """
@@ -281,6 +326,51 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             ADD COLUMN contract_id INTEGER
             """
         )
+    if "trade_id" not in order_columns:
+        conn.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN trade_id TEXT
+            """
+        )
+    if "leg_role" not in order_columns:
+        conn.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN leg_role TEXT NOT NULL DEFAULT 'SINGLE'
+            """
+        )
+    if "sequence_no" not in order_columns:
+        conn.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN sequence_no INTEGER NOT NULL DEFAULT 1
+            """
+        )
+    conn.execute(
+        """
+        UPDATE orders
+        SET trade_id = id
+        WHERE trade_id IS NULL OR trim(trade_id) = ''
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_legs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id TEXT NOT NULL REFERENCES orders(id) ON UPDATE CASCADE ON DELETE CASCADE,
+          leg_index INTEGER NOT NULL CHECK (leg_index >= 1),
+          con_id INTEGER,
+          symbol TEXT,
+          contract_month TEXT,
+          side TEXT NOT NULL,
+          ratio REAL NOT NULL DEFAULT 1 CHECK (ratio > 0),
+          exchange TEXT,
+          created_at TEXT NOT NULL,
+          UNIQUE (order_id, leg_index)
+        )
+        """
+    )
 
     conn.execute(
         """
@@ -292,6 +382,24 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_strategies_is_deleted_updated
         ON strategies (is_deleted, updated_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_orders_trade_updated
+        ON orders (trade_id, updated_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_orders_trade_sequence
+        ON orders (trade_id, sequence_no ASC, updated_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_legs_order_index
+        ON order_legs (order_id, leg_index ASC)
         """
     )
     conn.execute("DROP VIEW IF EXISTS v_strategies_active")

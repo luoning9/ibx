@@ -3,8 +3,14 @@ import { ElMessage } from 'element-plus'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { createStrategy, fetchStrategyDetail, patchStrategyBasic, putStrategyActions } from '../api/services'
-import type { StrategyMarket, StrategySymbolItem, StrategyTradeType } from '../api/types'
+import {
+  createStrategy,
+  fetchMarkets,
+  fetchStrategyDetail,
+  patchStrategyBasic,
+  putStrategyActions,
+} from '../api/services'
+import type { MarketProfile, StrategyMarket, StrategySymbolItem, StrategyTradeType } from '../api/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -28,24 +34,53 @@ const form = reactive({
   market: 'US_STOCK' as StrategyMarket,
   trade_type: 'buy' as StrategyTradeType,
   upstream_only_activation: false,
+  logical_activated_at: '',
   expire_mode: 'relative' as 'relative' | 'absolute',
   expire_in_seconds: 86400,
   expire_at: '',
 })
 
-const marketOptions: Array<{ label: string; value: StrategyMarket }> = [
-  { label: '美股', value: 'US_STOCK' },
-  { label: 'COMEX期货', value: 'COMEX_FUTURES' },
-]
-const tradeTypesByMarket: Record<StrategyMarket, StrategyTradeType[]> = {
-  US_STOCK: ['buy', 'sell', 'switch'],
-  COMEX_FUTURES: ['open', 'close', 'spread'],
+const marketProfiles = ref<MarketProfile[]>([])
+const marketsLoading = ref(false)
+const MARKET_LABELS: Record<string, string> = {
+  US_STOCK: '美股',
+  COMEX_FUTURES: 'COMEX期货',
 }
-const defaultTradeTypeByMarket: Record<StrategyMarket, StrategyTradeType> = {
-  US_STOCK: 'buy',
-  COMEX_FUTURES: 'open',
+const ALL_TRADE_TYPES: StrategyTradeType[] = ['buy', 'sell', 'switch', 'open', 'close', 'spread']
+const STRATEGY_TRADE_TYPE_SET = new Set<StrategyTradeType>(ALL_TRADE_TYPES)
+
+function isStrategyTradeType(value: string): value is StrategyTradeType {
+  return STRATEGY_TRADE_TYPE_SET.has(value as StrategyTradeType)
 }
-const tradeTypes = computed(() => tradeTypesByMarket[form.market])
+
+function marketLabel(profile: MarketProfile) {
+  const short = MARKET_LABELS[profile.market] || profile.market
+  return `${short} (${profile.market} / ${profile.sec_type} / ${profile.exchange})`
+}
+
+function resolveAllowedTradeTypes(profile: MarketProfile | undefined): StrategyTradeType[] {
+  if (!profile) return ALL_TRADE_TYPES
+  const allowed = Array.from(
+    new Set(
+      profile.allowed_trade_types
+        .map((item) => String(item).trim().toLowerCase())
+        .filter(isStrategyTradeType),
+    ),
+  )
+  return allowed.length > 0 ? allowed : ALL_TRADE_TYPES
+}
+
+const marketOptions = computed(() =>
+  marketProfiles.value.map((profile) => ({
+    label: marketLabel(profile),
+    value: profile.market,
+  })),
+)
+
+const tradeTypes = computed(() => {
+  const profile = marketProfiles.value.find((item) => item.market === form.market)
+  return resolveAllowedTradeTypes(profile)
+})
 type CoreSymbolTradeType = Exclude<StrategySymbolItem['trade_type'], 'ref'>
 type RequiredSymbolSpec = { type: CoreSymbolTradeType; label: string; placeholder: string }
 type RelativeExpirePreset = '1h' | '2h' | 'today' | '1d' | '2d' | '3d' | '5d' | '1w'
@@ -54,7 +89,7 @@ type TimeZoneDateParts = { year: number; month: number; day: number; hour: numbe
 const MARKET_TIME_ZONE = 'America/New_York'
 
 const coreSymbolCodes = reactive<Record<CoreSymbolTradeType, string>>({
-  buy: 'SLV',
+  buy: '',
   sell: '',
   open: '',
   close: '',
@@ -196,6 +231,26 @@ function formatForLocalDateTimeInput(iso: string | null | undefined) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+function formatDateForCompactDateTimeInput(date: Date) {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function applyLogicalActivatedAtPreset(preset: 'today_start' | 'minus_12h' | 'minus_24h') {
+  const now = new Date()
+  let target = now
+
+  if (preset === 'today_start') {
+    target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0)
+  } else if (preset === 'minus_12h') {
+    target = new Date(now.getTime() - 12 * 60 * 60 * 1000)
+  } else if (preset === 'minus_24h') {
+    target = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+  }
+
+  form.logical_activated_at = formatDateForCompactDateTimeInput(target)
+}
+
 function normalizeAbsoluteExpireAt(raw: string) {
   const value = raw.trim()
   if (!value) throw new Error('请填写绝对过期时间')
@@ -227,6 +282,29 @@ function normalizeAbsoluteExpireAt(raw: string) {
   }
 
   return date.toISOString()
+}
+
+function normalizeLogicalActivatedAt(raw: string) {
+  const value = raw.trim()
+  if (!value) return null
+  return normalizeAbsoluteExpireAt(value)
+}
+
+function toReadableError(err: unknown) {
+  if (!err || typeof err !== 'object') return String(err)
+  const candidate = err as {
+    response?: { data?: { detail?: unknown } }
+    message?: string
+  }
+  const detail = candidate.response?.data?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail.trim()
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0] as { msg?: unknown; loc?: unknown }
+    const msg = typeof first?.msg === 'string' ? first.msg : ''
+    if (msg) return msg
+  }
+  if (typeof candidate.message === 'string' && candidate.message.trim()) return candidate.message.trim()
+  return String(err)
 }
 
 const requiredSymbolSpecsMap: Record<StrategyTradeType, RequiredSymbolSpec[]> = {
@@ -273,14 +351,33 @@ function applySymbolsToInputs(symbols: StrategySymbolItem[]) {
 }
 
 watch(
-  () => form.market,
-  (nextMarket) => {
-    const availableTypes = tradeTypesByMarket[nextMarket]
+  tradeTypes,
+  (availableTypes) => {
+    const first = availableTypes[0]
+    if (!first) return
     if (!availableTypes.includes(form.trade_type)) {
-      form.trade_type = defaultTradeTypeByMarket[nextMarket]
+      form.trade_type = first
     }
   },
+  { immediate: true },
 )
+
+async function loadMarkets() {
+  marketsLoading.value = true
+  try {
+    const rows = await fetchMarkets()
+    marketProfiles.value = rows
+    const currentMarket = form.market.trim().toUpperCase()
+    const first = rows[0]
+    if (first && !rows.some((item) => item.market === currentMarket)) {
+      form.market = first.market
+    }
+  } catch (err) {
+    error.value = `加载市场配置失败：${String(err)}`
+  } finally {
+    marketsLoading.value = false
+  }
+}
 
 function appendRefSymbols(raw: string) {
   const tokens = raw
@@ -341,12 +438,13 @@ async function loadDetail() {
     form.trade_type = detail.trade_type
     applySymbolsToInputs(detail.symbols)
     form.upstream_only_activation = detail.upstream_only_activation
+    form.logical_activated_at = formatForLocalDateTimeInput(detail.logical_activated_at || detail.activated_at)
     form.expire_mode = detail.expire_at ? 'absolute' : 'relative'
     form.expire_in_seconds = detail.expire_in_seconds ?? 86400
     relativeExpirePreset.value = inferRelativeExpirePreset(form.expire_in_seconds)
     form.expire_at = formatForLocalDateTimeInput(detail.expire_at)
   } catch (err) {
-    error.value = `加载策略失败：${String(err)}`
+    error.value = `加载策略失败：${toReadableError(err)}`
   } finally {
     loading.value = false
   }
@@ -361,11 +459,12 @@ async function saveBasic() {
     }
     commitRefInput()
     const symbols = buildSymbolsPayload()
+    const normalizedDescription = form.description.trim()
+    form.description = normalizedDescription
 
     if (isCreateMode.value) {
       const created = await createStrategy({
-        id: form.id.trim() || undefined,
-        description: form.description,
+        description: normalizedDescription,
         market: form.market,
         trade_type: form.trade_type,
         symbols,
@@ -388,7 +487,7 @@ async function saveBasic() {
           ElMessage.success(`策略 ${created.id} 已创建，并已关联到上游 ${upstreamId}`)
           router.push(`/strategies/${upstreamId}/edit/actions`)
         } catch (linkErr) {
-          ElMessage.warning(`策略 ${created.id} 已创建，但自动关联上游失败：${String(linkErr)}`)
+          ElMessage.warning(`策略 ${created.id} 已创建，但自动关联上游失败：${toReadableError(linkErr)}`)
           router.push(`/strategies/${created.id}`)
         }
         return
@@ -400,11 +499,12 @@ async function saveBasic() {
     }
 
     const updated = await patchStrategyBasic(strategyId.value, {
-      description: form.description,
+      description: normalizedDescription,
       market: form.market,
       trade_type: form.trade_type,
       symbols,
       upstream_only_activation: form.upstream_only_activation,
+      logical_activated_at: normalizeLogicalActivatedAt(form.logical_activated_at),
       expire_mode: form.expire_mode,
       expire_in_seconds: form.expire_mode === 'relative' ? form.expire_in_seconds : null,
       expire_at: form.expire_mode === 'absolute' ? normalizeAbsoluteExpireAt(form.expire_at) : null,
@@ -412,13 +512,16 @@ async function saveBasic() {
     ElMessage.success(`策略 ${updated.id} 已更新`)
     router.push(`/strategies/${updated.id}`)
   } catch (err) {
-    error.value = `保存失败：${String(err)}`
+    error.value = `保存失败：${toReadableError(err)}`
   } finally {
     saving.value = false
   }
 }
 
-onMounted(loadDetail)
+onMounted(async () => {
+  await loadMarkets()
+  await loadDetail()
+})
 </script>
 
 <template>
@@ -446,14 +549,14 @@ onMounted(loadDetail)
       />
 
       <el-form label-width="140px" v-loading="loading">
-        <el-form-item label="策略ID（可选）" v-if="isCreateMode">
-          <el-input v-model="form.id" placeholder="留空自动生成" />
+        <el-form-item label="策略ID" v-if="!isCreateMode">
+          <el-input :model-value="form.id || strategyId" disabled />
         </el-form-item>
         <el-form-item label="自然语言描述">
-          <el-input v-model="form.description" type="textarea" :rows="2" />
+          <el-input v-model="form.description" type="textarea" :rows="2" placeholder="留空自动生成" />
         </el-form-item>
         <el-form-item label="market">
-          <el-select v-model="form.market" class="trade-type-select">
+          <el-select v-model="form.market" class="trade-type-select" :loading="marketsLoading">
             <el-option v-for="opt in marketOptions" :key="opt.value" :value="opt.value" :label="opt.label" />
           </el-select>
         </el-form-item>
@@ -500,6 +603,22 @@ onMounted(loadDetail)
 
         <el-form-item label="仅上游激活">
           <el-switch v-model="form.upstream_only_activation" />
+        </el-form-item>
+
+        <el-form-item v-if="!isCreateMode" label="logical activate at">
+          <div class="expire-row">
+            <el-input
+              v-model="form.logical_activated_at"
+              class="logical-activate-input"
+              placeholder="例如 20260222 或 20260222 10:00（按浏览器时区）"
+            />
+            <el-space size="small" wrap>
+              <el-button size="small" @click="applyLogicalActivatedAtPreset('today_start')">今天凌晨</el-button>
+              <el-button size="small" @click="applyLogicalActivatedAtPreset('minus_12h')">12小时前</el-button>
+              <el-button size="small" @click="applyLogicalActivatedAtPreset('minus_24h')">24小时前</el-button>
+            </el-space>
+            <span class="timezone-note">当前时区：{{ browserTimeZone }}</span>
+          </div>
         </el-form-item>
 
         <el-form-item label="过期模式">
@@ -619,6 +738,10 @@ onMounted(loadDetail)
 }
 
 .absolute-expire-input {
+  max-width: 360px;
+}
+
+.logical-activate-input {
   max-width: 360px;
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """List current IB portfolio positions.
 
-Connects to IB Gateway/TWS using ib_insync and prints portfolio holdings.
+Connects to IB Gateway/TWS using ib_async and prints portfolio holdings.
 """
 
 from __future__ import annotations
@@ -19,15 +19,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import infer_ib_api_port, load_app_config, resolve_ib_client_id
-
-try:
-    from ib_insync import IB
-except ModuleNotFoundError:
-    print(
-        "[ERROR] Missing dependency: ib_insync. Install with: pip install ib_insync",
-        file=sys.stderr,
-    )
-    sys.exit(3)
+from app.ib_compat import INSTALL_HINT, is_missing_ib_dependency_error
+from app.ib_session_manager import close_ib_session_manager, get_ib_session_manager
 
 
 @dataclass
@@ -190,32 +183,25 @@ def print_table(holdings: list[Holding]) -> None:
 
 def main() -> int:
     args = parse_args()
-    ib = IB()
+    session = get_ib_session_manager().get_session(role="broker_data")
 
     try:
-        ib.connect(
-            host=args.host,
-            port=args.port,
-            clientId=args.client_id,
-            timeout=args.timeout,
-            readonly=True,
-        )
+        raw_items = session.run(lambda ib: list(ib.portfolio()))
     except Exception as exc:  # noqa: BLE001
-        print(f"[ERROR] Failed to connect IB API: {exc}", file=sys.stderr)
+        if is_missing_ib_dependency_error(exc):
+            print(f"[ERROR] {INSTALL_HINT}", file=sys.stderr)
+            return 3
+        print(f"[ERROR] Failed to query IB API: {exc}", file=sys.stderr)
         return 1
-
-    try:
-        raw_items = ib.portfolio()
-        holdings = build_holdings(raw_items, args.account.strip())
-
-        if args.json:
-            print(json.dumps([asdict(h) for h in holdings], ensure_ascii=False, indent=2))
-        else:
-            print_table(holdings)
-        return 0
     finally:
-        if ib.isConnected():
-            ib.disconnect()
+        close_ib_session_manager()
+
+    holdings = build_holdings(raw_items, args.account.strip())
+    if args.json:
+        print(json.dumps([asdict(h) for h in holdings], ensure_ascii=False, indent=2))
+    else:
+        print_table(holdings)
+    return 0
 
 
 if __name__ == "__main__":

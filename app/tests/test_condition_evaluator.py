@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from app.config import (
@@ -45,6 +47,53 @@ def _build_condition_payload(
     return payload
 
 
+def _window_to_seconds(window: str) -> int:
+    text = str(window or "").strip().lower()
+    if not text:
+        return 0
+    unit = text[-1]
+    raw_amount = text[:-1]
+    try:
+        amount = int(raw_amount)
+    except ValueError:
+        return 0
+    if amount <= 0:
+        return 0
+    if unit == "m":
+        return amount * 60
+    if unit == "h":
+        return amount * 3600
+    if unit == "d":
+        return amount * 86400
+    return 0
+
+
+def _expected_points(*, trigger_mode: str, evaluation_window: str, base_bar: str, confirm_consecutive: int, confirm_ratio: float) -> tuple[int, int]:
+    window_seconds = _window_to_seconds(evaluation_window)
+    base_seconds = _window_to_seconds(base_bar)
+    nominal_points = 1
+    if window_seconds > 0 and base_seconds > 0:
+        nominal_points = max(1, math.ceil(window_seconds / base_seconds))
+
+    mode = str(trigger_mode or "").strip().upper()
+    if mode == "LEVEL_INSTANT":
+        required_points = 1
+    elif mode in {"CROSS_UP_INSTANT", "CROSS_DOWN_INSTANT"}:
+        required_points = 2
+    else:
+        confirm_points = max(int(confirm_consecutive), int(math.ceil(float(confirm_ratio) * nominal_points)))
+        if mode in {"CROSS_UP_CONFIRM", "CROSS_DOWN_CONFIRM"}:
+            required_points = confirm_points + 1
+        else:
+            required_points = confirm_points
+
+    if mode in {"LEVEL_INSTANT", "CROSS_UP_INSTANT", "CROSS_DOWN_INSTANT"}:
+        effective_window_points = required_points
+    else:
+        effective_window_points = nominal_points
+    return required_points, effective_window_points
+
+
 def test_condition_evaluator_prepare_resolves_policy() -> None:
     evaluator = ConditionEvaluator(
         {
@@ -70,6 +119,7 @@ def test_condition_evaluator_prepare_resolves_policy() -> None:
     assert len(prepared.requirement.contracts) == 1
     contract_req = prepared.requirement.contracts[0]
     assert contract_req.contract_id == 265598
+    assert contract_req.effective_window_points == 1
     assert contract_req.required_points == 1
     assert contract_req.state_requirements == []
     assert contract_req.base_bar == "1m"
@@ -139,6 +189,85 @@ def test_condition_evaluator_true_false() -> None:
     assert failed.state == "FALSE"
 
 
+def test_condition_evaluator_level_instant_uses_all_points() -> None:
+    evaluator = ConditionEvaluator(
+        {
+            "condition_id": "c1",
+            "condition_type": "SINGLE_PRODUCT",
+            "metric": "PRICE",
+            "trigger_mode": "LEVEL_INSTANT",
+            "evaluation_window": "1m",
+            "operator": "<=",
+            "value": 10,
+            "product": "AAPL",
+            "contract_id": 265598,
+        }
+    )
+    evaluator.prepare()
+
+    prepared = evaluator.prepared
+    assert prepared is not None
+    contract_id = prepared.requirement.contracts[0].contract_id
+    assert contract_id is not None
+
+    # Any point satisfying the rule should pass.
+    passed = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [12.0, 11.0, 9.9, 11.5]},
+            state_values={},
+        )
+    )
+    # No point satisfying the rule should fail.
+    failed = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [12.0, 11.0, 10.1]},
+            state_values={},
+        )
+    )
+
+    assert passed.state == "TRUE"
+    assert failed.state == "FALSE"
+
+
+def test_condition_evaluator_cross_up_instant_uses_all_adjacent_points() -> None:
+    evaluator = ConditionEvaluator(
+        {
+            "condition_id": "c1",
+            "condition_type": "SINGLE_PRODUCT",
+            "metric": "PRICE",
+            "trigger_mode": "CROSS_UP_INSTANT",
+            "evaluation_window": "1m",
+            "operator": ">=",
+            "value": 10,
+            "product": "AAPL",
+            "contract_id": 265598,
+        }
+    )
+    evaluator.prepare()
+
+    prepared = evaluator.prepared
+    assert prepared is not None
+    contract_id = prepared.requirement.contracts[0].contract_id
+    assert contract_id is not None
+
+    # Cross happened on an earlier adjacent pair (9 -> 11), even though the latest pair is down.
+    passed = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [9.0, 11.0, 10.2]},
+            state_values={},
+        )
+    )
+    failed = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [11.0, 10.5, 9.8]},
+            state_values={},
+        )
+    )
+
+    assert passed.state == "TRUE"
+    assert failed.state == "FALSE"
+
+
 def test_condition_evaluator_metric_specific_requirements() -> None:
     spread_evaluator = ConditionEvaluator(
         {
@@ -163,6 +292,8 @@ def test_condition_evaluator_metric_specific_requirements() -> None:
     second_contract = spread_prepared.requirement.contracts[1]
     assert first_contract.contract_id == 11
     assert second_contract.contract_id == 22
+    assert first_contract.effective_window_points == 6
+    assert second_contract.effective_window_points == 6
     assert first_contract.required_points == 4
     assert second_contract.required_points == 4
     assert first_contract.state_requirements == []
@@ -289,6 +420,7 @@ def test_condition_evaluator_prepare_metric_trigger_window_matrix() -> None:
                 assert prepared.evaluation_window == policy.evaluation_window
                 assert prepared.requirement.contracts
                 assert prepared.requirement.contracts[0].base_bar == policy.base_bar
+                assert prepared.requirement.contracts[0].effective_window_points >= 1
                 assert prepared.requirement.contracts[0].required_points >= 1
                 if metric in PAIR_METRICS:
                     assert len(prepared.requirement.contracts) == 2
@@ -322,3 +454,89 @@ def test_condition_evaluator_prepare_rejects_disallowed_metric_rule_matrix() -> 
                         continue
                     with pytest.raises(ValueError):
                         ConditionEvaluator(payload).prepare()
+
+
+def test_condition_evaluator_prepare_points_exact_for_all_supported_success_cases() -> None:
+    checked_cases = 0
+    saw_instant_mode = False
+    saw_confirm_mode = False
+    for metric in ALL_METRICS:
+        allowed_rules = resolve_metric_allowed_rules(metric)
+        allowed_windows = resolve_metric_allowed_windows(metric)
+        for trigger_mode, operator in sorted(allowed_rules):
+            for evaluation_window in sorted(allowed_windows):
+                try:
+                    policy = resolve_trigger_window_policy(trigger_mode, evaluation_window)
+                except ValueError:
+                    continue
+
+                payload = _build_condition_payload(
+                    metric=metric,
+                    trigger_mode=trigger_mode,
+                    operator=operator,
+                    evaluation_window=evaluation_window,
+                )
+                requirement = ConditionEvaluator(payload).prepare()
+                expected_required_points, expected_effective_window_points = _expected_points(
+                    trigger_mode=policy.trigger_mode,
+                    evaluation_window=policy.evaluation_window,
+                    base_bar=policy.base_bar,
+                    confirm_consecutive=policy.confirm_consecutive,
+                    confirm_ratio=policy.confirm_ratio,
+                )
+
+                assert requirement.contracts
+                for contract_req in requirement.contracts:
+                    assert contract_req.base_bar == policy.base_bar
+                    assert contract_req.required_points == expected_required_points
+                    assert contract_req.effective_window_points == expected_effective_window_points
+
+                mode = str(policy.trigger_mode).strip().upper()
+                if mode in {"LEVEL_INSTANT", "CROSS_UP_INSTANT", "CROSS_DOWN_INSTANT"}:
+                    saw_instant_mode = True
+                    assert expected_effective_window_points == expected_required_points
+                else:
+                    saw_confirm_mode = True
+
+                checked_cases += 1
+
+    assert checked_cases > 0
+    assert saw_instant_mode is True
+    assert saw_confirm_mode is True
+
+
+@pytest.mark.parametrize(
+    ("metric", "condition_value"),
+    [
+        ("DRAWDOWN_PCT", 0.05),
+        ("RALLY_PCT", 0.05),
+    ],
+)
+def test_condition_evaluator_extrema_metric_with_none_state_values_returns_waiting(
+    metric: str,
+    condition_value: float,
+) -> None:
+    evaluator = ConditionEvaluator(
+        {
+            "condition_id": f"c-{metric.lower()}",
+            "condition_type": "SINGLE_PRODUCT",
+            "metric": metric,
+            "trigger_mode": "LEVEL_CONFIRM",
+            "evaluation_window": "5m",
+            "operator": ">=",
+            "value": condition_value,
+            "product": "AAPL",
+            "contract_id": 101,
+        }
+    )
+    evaluator.prepare()
+
+    result = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={101: [10.0, 10.2, 10.1, 10.3]},
+            state_values=None,
+        )
+    )
+
+    assert result.state == "WAITING"
+    assert result.reason == "missing_metric_inputs"

@@ -22,8 +22,22 @@ def _insert_strategy(
     market: str = "US_STOCK",
     trade_type: str = "buy",
     conditions_json: str = "[]",
+    trade_action_json: str | None = None,
 ) -> None:
     now_iso = _iso_now()
+    trade_action_payload = (
+        trade_action_json
+        if trade_action_json is not None
+        else json.dumps(
+            {
+                "action_type": "STOCK_TRADE",
+                "symbol": "AAPL",
+                "side": "BUY",
+                "order_type": "MKT",
+                "quantity": 1,
+            }
+        )
+    )
     with get_connection(db_path) as conn:
         conn.execute(
             """
@@ -49,7 +63,7 @@ def _insert_strategy(
                 "VERIFYING",
                 "AND",
                 conditions_json,
-                None,
+                trade_action_payload,
                 now_iso,
                 now_iso,
                 now_iso,
@@ -96,6 +110,24 @@ class _FakeBrokerProvider:
         return self._contract_ids[key]
 
 
+class _FakeTradeService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def validate_trade_action(self, *, trade_action):  # type: ignore[no-untyped-def]
+        payload = dict(trade_action)
+        self.calls.append(payload)
+        market = str(payload.get("market", "")).strip().upper()
+        if not market:
+            raise ValueError("trade_action.market is required")
+        side = str(payload.get("side", "")).strip().upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("trade_action.side is invalid")
+        order_type = str(payload.get("order_type", "")).strip().upper()
+        if order_type not in {"MKT", "LMT"}:
+            raise ValueError("trade_action.order_type is invalid")
+
+
 def test_run_activation_verification_resolves_symbol_and_condition_contract_ids(tmp_path) -> None:
     db_path = tmp_path / "ibx_verify_success.sqlite3"
     init_db(db_path=db_path)
@@ -135,6 +167,7 @@ def test_run_activation_verification_resolves_symbol_and_condition_contract_ids(
     _insert_symbol(strategy_id, db_path=db_path, position=2, code="MSFT", contract_id=None)
 
     provider = _FakeBrokerProvider(contract_ids={"AAPL": 101, "MSFT": 202})
+    trade_service = _FakeTradeService()
     with get_connection(db_path) as conn:
         row = conn.execute(
             "SELECT * FROM v_strategies_active WHERE id = ?",
@@ -146,6 +179,7 @@ def test_run_activation_verification_resolves_symbol_and_condition_contract_ids(
             strategy_id=strategy_id,
             strategy_row=row,
             broker_data_provider=provider,
+            trade_service=trade_service,
         )
         conn.commit()
 
@@ -202,6 +236,7 @@ def test_run_activation_verification_fails_when_snapshot_unavailable(tmp_path) -
     _insert_symbol(strategy_id, db_path=db_path, position=1, code="AAPL", contract_id=None)
 
     provider = _FakeBrokerProvider(contract_ids={"AAPL": 101}, fail_snapshot=True)
+    trade_service = _FakeTradeService()
     with get_connection(db_path) as conn:
         row = conn.execute(
             "SELECT * FROM v_strategies_active WHERE id = ?",
@@ -213,7 +248,112 @@ def test_run_activation_verification_fails_when_snapshot_unavailable(tmp_path) -
             strategy_id=strategy_id,
             strategy_row=row,
             broker_data_provider=provider,
+            trade_service=trade_service,
         )
 
     assert result.passed is False
     assert "get_account_snapshot failed" in result.reason
+
+
+def test_run_activation_verification_fails_when_follow_up_actions_missing(tmp_path) -> None:
+    db_path = tmp_path / "ibx_verify_follow_up_actions_missing.sqlite3"
+    init_db(db_path=db_path)
+    strategy_id = "S-VERIFY-NO-ACTION"
+    _insert_strategy(
+        strategy_id,
+        db_path=db_path,
+        trade_action_json="{}",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                }
+            ]
+        ),
+    )
+    _insert_symbol(strategy_id, db_path=db_path, position=1, code="AAPL", contract_id=None)
+
+    provider = _FakeBrokerProvider(contract_ids={"AAPL": 101})
+    trade_service = _FakeTradeService()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE strategies SET trade_action_json = NULL, next_strategy_id = NULL WHERE id = ?",
+            (strategy_id,),
+        )
+        row = conn.execute(
+            "SELECT * FROM v_strategies_active WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
+        assert row is not None
+        result = run_activation_verification(
+            conn,
+            strategy_id=strategy_id,
+            strategy_row=row,
+            broker_data_provider=provider,
+            trade_service=trade_service,
+        )
+
+    assert result.passed is False
+    assert result.reason == "follow-up actions not configured"
+
+
+def test_run_activation_verification_fails_when_trade_action_invalid(tmp_path) -> None:
+    db_path = tmp_path / "ibx_verify_trade_action_invalid.sqlite3"
+    init_db(db_path=db_path)
+    strategy_id = "S-VERIFY-INVALID-TRADE-ACTION"
+    _insert_strategy(
+        strategy_id,
+        db_path=db_path,
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                }
+            ]
+        ),
+        trade_action_json=json.dumps(
+            {
+                "action_type": "STOCK_TRADE",
+                "symbol": "AAPL",
+                "side": "HOLD",
+                "order_type": "MKT",
+                "quantity": 1,
+            }
+        ),
+    )
+    _insert_symbol(strategy_id, db_path=db_path, position=1, code="AAPL", contract_id=None)
+
+    provider = _FakeBrokerProvider(contract_ids={"AAPL": 101})
+    trade_service = _FakeTradeService()
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM v_strategies_active WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
+        assert row is not None
+        result = run_activation_verification(
+            conn,
+            strategy_id=strategy_id,
+            strategy_row=row,
+            broker_data_provider=provider,
+            trade_service=trade_service,
+        )
+
+    assert result.passed is False
+    assert "trade_action validation failed" in result.reason

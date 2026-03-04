@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from app.market_data import HistoricalBar, HistoricalBarsRequest, SQLiteMarketDataCache
 
@@ -64,6 +67,119 @@ class FakeFetcher:
         return out
 
 
+class AlignedMinuteFetcher:
+    def __init__(self) -> None:
+        self.calls: list[FetchCall] = []
+
+    def fetch(
+        self,
+        *,
+        contract: dict[str, Any] | str,
+        start_time: datetime,
+        end_time: datetime,
+        bar_size: str,
+        what_to_show: str,
+        use_rth: bool,
+    ) -> list[HistoricalBar]:
+        self.calls.append(
+            FetchCall(
+                start=start_time,
+                end=end_time,
+                bar_size=bar_size,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            )
+        )
+        step = timedelta(minutes=1)
+        cursor = start_time.replace(second=0, microsecond=0)
+        out: list[HistoricalBar] = []
+        while cursor < end_time:
+            n = int(cursor.timestamp() // 60)
+            out.append(
+                HistoricalBar(
+                    ts=cursor,
+                    open=float(n),
+                    high=float(n) + 1,
+                    low=float(n) - 1,
+                    close=float(n) + 0.5,
+                    volume=100.0,
+                    wap=float(n) + 0.2,
+                    count=10,
+                )
+            )
+            cursor += step
+        return out
+
+
+class EmptyFetcher:
+    def __init__(self) -> None:
+        self.calls: list[FetchCall] = []
+
+    def fetch(
+        self,
+        *,
+        contract: dict[str, Any] | str,
+        start_time: datetime,
+        end_time: datetime,
+        bar_size: str,
+        what_to_show: str,
+        use_rth: bool,
+    ) -> list[HistoricalBar]:
+        _ = contract
+        self.calls.append(
+            FetchCall(
+                start=start_time,
+                end=end_time,
+                bar_size=bar_size,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            )
+        )
+        return []
+
+
+class SingleLateBarFetcher:
+    def __init__(self, bar_ts: datetime) -> None:
+        self.calls: list[FetchCall] = []
+        self._bar_ts = bar_ts
+
+    def fetch(
+        self,
+        *,
+        contract: dict[str, Any] | str,
+        start_time: datetime,
+        end_time: datetime,
+        bar_size: str,
+        what_to_show: str,
+        use_rth: bool,
+    ) -> list[HistoricalBar]:
+        _ = contract
+        self.calls.append(
+            FetchCall(
+                start=start_time,
+                end=end_time,
+                bar_size=bar_size,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            )
+        )
+        if not (start_time <= self._bar_ts < end_time):
+            return []
+        n = int(self._bar_ts.timestamp() // 60)
+        return [
+            HistoricalBar(
+                ts=self._bar_ts,
+                open=float(n),
+                high=float(n) + 1,
+                low=float(n) - 1,
+                close=float(n) + 0.5,
+                volume=100.0,
+                wap=float(n) + 0.2,
+                count=10,
+            )
+        ]
+
+
 def _dt(text: str) -> datetime:
     return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(UTC)
 
@@ -72,6 +188,7 @@ def _request(
     start: str,
     end: str,
     *,
+    bar_size: str = "1 min",
     include_partial_bar: bool = False,
     max_bars: int | None = None,
     page_size: int | None = 500,
@@ -80,7 +197,7 @@ def _request(
         contract={"conId": 12345, "secType": "STK"},
         start_time=_dt(start),
         end_time=_dt(end),
-        bar_size="1 min",
+        bar_size=bar_size,
         what_to_show="TRADES",
         use_rth=True,
         include_partial_bar=include_partial_bar,
@@ -172,3 +289,156 @@ def test_max_bars_returns_latest_slice(tmp_path: Path) -> None:
         _dt("2026-02-22T10:08:00Z"),
         _dt("2026-02-22T10:09:00Z"),
     ]
+
+
+def test_cache_aligns_fetch_window_to_bar_boundary(tmp_path: Path) -> None:
+    fetcher = AlignedMinuteFetcher()
+    cache = SQLiteMarketDataCache(fetcher=fetcher, db_path=tmp_path / "market_cache.sqlite3")
+
+    first = cache.get_historical_bars(_request("2026-02-22T10:00:20Z", "2026-02-22T10:03:20Z"))
+    assert len(first.bars) == 3
+    assert len(fetcher.calls) == 1
+    assert fetcher.calls[0].start == _dt("2026-02-22T10:00:00Z")
+    assert fetcher.calls[0].end == _dt("2026-02-22T10:04:00Z")
+
+    second = cache.get_historical_bars(_request("2026-02-22T10:00:40Z", "2026-02-22T10:03:40Z"))
+    assert len(second.bars) == 3
+    assert len(fetcher.calls) == 1
+
+
+def test_cache_marks_empty_segment_as_covered_and_skips_refetch(tmp_path: Path) -> None:
+    fetcher = EmptyFetcher()
+    cache = SQLiteMarketDataCache(
+        fetcher=fetcher,
+        db_path=tmp_path / "market_cache.sqlite3",
+        now_fn=lambda: _dt("2026-02-22T10:40:00Z"),
+        delay_window_minutes=20,
+    )
+
+    first = cache.get_historical_bars(_request("2026-02-22T10:00:00Z", "2026-02-22T10:10:00Z"))
+    assert len(first.bars) == 0
+    assert len(fetcher.calls) == 1
+    assert first.meta["has_gaps"] is True
+
+    second = cache.get_historical_bars(_request("2026-02-22T10:00:00Z", "2026-02-22T10:10:00Z"))
+    assert len(second.bars) == 0
+    assert len(fetcher.calls) == 1
+    assert second.meta["has_gaps"] is False
+    assert second.meta["cache_hit_ratio"] == 1.0
+
+
+def test_cache_keeps_refetch_for_empty_tail_within_delay_window(tmp_path: Path) -> None:
+    fetcher = EmptyFetcher()
+    cache = SQLiteMarketDataCache(
+        fetcher=fetcher,
+        db_path=tmp_path / "market_cache.sqlite3",
+        now_fn=lambda: _dt("2026-02-22T10:30:00Z"),
+        delay_window_minutes=20,
+    )
+
+    cache.get_historical_bars(_request("2026-02-22T10:20:00Z", "2026-02-22T10:25:00Z"))
+    assert len(fetcher.calls) == 1
+    cache.get_historical_bars(_request("2026-02-22T10:20:00Z", "2026-02-22T10:25:00Z"))
+    assert len(fetcher.calls) == 2
+    assert fetcher.calls[1].start == _dt("2026-02-22T10:20:00Z")
+    assert fetcher.calls[1].end == _dt("2026-02-22T10:25:00Z")
+
+
+def test_cache_marks_old_empty_tail_outside_delay_window_as_covered(tmp_path: Path) -> None:
+    fetcher = EmptyFetcher()
+    cache = SQLiteMarketDataCache(
+        fetcher=fetcher,
+        db_path=tmp_path / "market_cache.sqlite3",
+        now_fn=lambda: _dt("2026-02-22T10:30:00Z"),
+        delay_window_minutes=20,
+    )
+
+    cache.get_historical_bars(_request("2026-02-22T10:00:00Z", "2026-02-22T10:25:00Z"))
+    assert len(fetcher.calls) == 1
+    cache.get_historical_bars(_request("2026-02-22T10:00:00Z", "2026-02-22T10:25:00Z"))
+    assert len(fetcher.calls) == 2
+    assert fetcher.calls[1].start == _dt("2026-02-22T10:10:00Z")
+    assert fetcher.calls[1].end == _dt("2026-02-22T10:25:00Z")
+
+
+def test_cache_confirms_blank_before_valid_bar_even_within_delay_window(tmp_path: Path) -> None:
+    fetcher = SingleLateBarFetcher(_dt("2026-02-22T10:23:00Z"))
+    cache = SQLiteMarketDataCache(
+        fetcher=fetcher,
+        db_path=tmp_path / "market_cache.sqlite3",
+        now_fn=lambda: _dt("2026-02-22T10:30:00Z"),
+        delay_window_minutes=20,
+    )
+
+    first = cache.get_historical_bars(_request("2026-02-22T10:20:00Z", "2026-02-22T10:25:00Z"))
+    assert len(first.bars) == 1
+    assert len(fetcher.calls) == 1
+
+    second = cache.get_historical_bars(_request("2026-02-22T10:20:00Z", "2026-02-22T10:25:00Z"))
+    assert len(second.bars) == 1
+    assert len(fetcher.calls) == 2
+    assert fetcher.calls[1].start == _dt("2026-02-22T10:24:00Z")
+    assert fetcher.calls[1].end == _dt("2026-02-22T10:25:00Z")
+
+
+def test_cache_confirmed_end_aligns_to_bar_boundary(tmp_path: Path) -> None:
+    fetcher = EmptyFetcher()
+    db_path = tmp_path / "market_cache.sqlite3"
+    cache = SQLiteMarketDataCache(
+        fetcher=fetcher,
+        db_path=db_path,
+        now_fn=lambda: _dt("2026-02-22T10:30:37Z"),
+        delay_window_minutes=20,
+    )
+
+    cache.get_historical_bars(_request("2026-02-22T10:00:00Z", "2026-02-22T10:25:00Z"))
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT start_ts, end_ts
+            FROM market_coverage
+            ORDER BY start_ts ASC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "2026-02-22T10:00:00Z"
+    assert row[1] == "2026-02-22T10:10:00Z"
+
+
+def test_historical_bars_rejects_sub_minute_bar_size(tmp_path: Path) -> None:
+    fetcher = FakeFetcher()
+    cache = SQLiteMarketDataCache(fetcher=fetcher, db_path=tmp_path / "market_cache.sqlite3")
+
+    with pytest.raises(ValueError, match="bar_size must be at least 1 min"):
+        cache.get_historical_bars(
+            _request(
+                "2026-02-22T10:00:00Z",
+                "2026-02-22T10:10:00Z",
+                bar_size="30 secs",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("bar_size", "start", "end", "limit_hint"),
+    [
+        ("1 min", "2026-02-01T00:00:00Z", "2026-02-08T00:00:01Z", "7 days"),
+        ("10 min", "2026-01-01T00:00:00Z", "2026-01-31T00:00:01Z", "30 days"),
+        ("30 min", "2025-12-01T00:00:00Z", "2026-01-30T00:00:01Z", "60 days"),
+        ("1 hour", "2025-09-01T00:00:00Z", "2025-12-30T00:00:01Z", "120 days"),
+        ("4 hours", "2025-01-01T00:00:00Z", "2025-08-29T00:00:01Z", "240 days"),
+    ],
+)
+def test_historical_bars_rejects_window_exceeding_bar_limit(
+    tmp_path: Path,
+    bar_size: str,
+    start: str,
+    end: str,
+    limit_hint: str,
+) -> None:
+    fetcher = FakeFetcher()
+    cache = SQLiteMarketDataCache(fetcher=fetcher, db_path=tmp_path / "market_cache.sqlite3")
+
+    with pytest.raises(ValueError, match=limit_hint):
+        cache.get_historical_bars(_request(start, end, bar_size=bar_size))
