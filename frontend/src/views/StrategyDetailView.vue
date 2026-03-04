@@ -1,6 +1,19 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { CaretRight, CloseBold, DataAnalysis, Edit, Link, Operation, RefreshRight, VideoPause } from '@element-plus/icons-vue'
+import {
+  CaretBottom,
+  CaretRight,
+  CaretTop,
+  CloseBold,
+  DataAnalysis,
+  Edit,
+  Link,
+  List,
+  Memo,
+  Operation,
+  RefreshRight,
+  VideoPause,
+} from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -14,6 +27,7 @@ import {
   patchStrategyBasic,
   pauseStrategy,
   resumeStrategy,
+  stopStrategy,
 } from '../api/services'
 import type { StrategyDetail } from '../api/types'
 import { formatIsoDateTime } from '../utils/format'
@@ -28,6 +42,17 @@ const generatedDescription = ref('')
 const descriptionEditing = ref(false)
 const descriptionDraft = ref('')
 const descriptionEditWrapRef = ref<HTMLElement | null>(null)
+const monitoringCollapsed = ref(false)
+const conditionsCollapsed = ref(false)
+const actionsCollapsed = ref(false)
+const COLLAPSE_MONITORING_AND_CONDITIONS_STATUSES = new Set([
+  'TRIGGERED',
+  'ORDER_SUBMITTED',
+  'FILLED',
+  'EXPIRED',
+  'CANCELLED',
+  'FAILED',
+])
 
 const strategyId = computed(() => String(route.params.id || ''))
 type ConditionViewItem = {
@@ -41,6 +66,19 @@ type ConditionViewItem = {
 type FollowupField = {
   label: string
   value: string
+}
+type ConditionObservedItem = {
+  conditionId: string
+  observedValue: string
+  observedBarAt: string
+}
+type ConditionExtremaItem = {
+  conditionId: string
+  contractId: string
+  high: string
+  highBarAt: string
+  low: string
+  lowBarAt: string
 }
 
 async function applyGeneratedDescriptionIfEmpty(data: StrategyDetail) {
@@ -70,7 +108,14 @@ async function loadDetail() {
   error.value = ''
   try {
     const data = await fetchStrategyDetail(strategyId.value)
-    detail.value = await applyGeneratedDescriptionIfEmpty(data)
+    const hydrated = await applyGeneratedDescriptionIfEmpty(data)
+    detail.value = hydrated
+    const collapseMonitoringAndConditions = COLLAPSE_MONITORING_AND_CONDITIONS_STATUSES.has(
+      String(hydrated.status || '').toUpperCase(),
+    )
+    monitoringCollapsed.value = collapseMonitoringAndConditions
+    conditionsCollapsed.value = collapseMonitoringAndConditions
+    actionsCollapsed.value = false
   } catch (err) {
     error.value = `加载策略详情失败：${String(err)}`
   } finally {
@@ -254,6 +299,57 @@ const conditionViewItems = computed<ConditionViewItem[]>(() => {
 })
 
 const hasConditions = computed(() => conditionViewItems.value.length > 0)
+const conditionMetObservedItems = computed<ConditionObservedItem[]>(() => {
+  const strategy = detail.value
+  if (!strategy) return []
+  return strategy.conditions_runtime
+    .map((item, index) => {
+      const hasObservedValue = item.last_value != null
+      const hasObservedBarAt = Boolean(item.observed_bar_at)
+      if (!hasObservedValue && !hasObservedBarAt) return null
+      return {
+        conditionId: item.condition_id || `c${index + 1}`,
+        observedValue: hasObservedValue ? String(item.last_value) : '-',
+        observedBarAt: hasObservedBarAt ? formatIsoDateTime(item.observed_bar_at) : '-',
+      }
+    })
+    .filter((item): item is ConditionObservedItem => item !== null)
+})
+const conditionMetExtremaItems = computed<ConditionExtremaItem[]>(() => {
+  const run = detail.value?.strategy_run
+  if (!run) return []
+
+  const rows: ConditionExtremaItem[] = []
+  for (const [conditionId, byContractRaw] of Object.entries(run.extrema_state || {})) {
+    const byContract = asObject(byContractRaw)
+    for (const [contractId, payloadRaw] of Object.entries(byContract)) {
+      const payload = asObject(payloadRaw)
+      const highRaw = payload.since_activation_high
+      const lowRaw = payload.since_activation_low
+      const high = typeof highRaw === 'number' ? String(highRaw) : asString(highRaw) || '-'
+      const low = typeof lowRaw === 'number' ? String(lowRaw) : asString(lowRaw) || '-'
+      const highBarAtRaw = asString(payload.high_bar_at)
+      const lowBarAtRaw = asString(payload.low_bar_at)
+      const highBarAt = highBarAtRaw ? formatIsoDateTime(highBarAtRaw) : '--'
+      const lowBarAt = lowBarAtRaw ? formatIsoDateTime(lowBarAtRaw) : '--'
+      if (high === '-' && low === '-' && highBarAt === '--' && lowBarAt === '--') continue
+      rows.push({
+        conditionId,
+        contractId,
+        high,
+        highBarAt,
+        low,
+        lowBarAt,
+      })
+    }
+  }
+  return rows
+})
+const monitoringHeaderStatus = computed(() => {
+  const run = detail.value?.strategy_run
+  if (!run) return '暂无运行记录'
+  return `最近结果：${run.last_outcome}`
+})
 const hasTradeAction = computed(() => Boolean(detail.value?.trade_action_json))
 const hasNextStrategy = computed(() => Boolean(detail.value?.next_strategy))
 const hasFollowupConfigured = computed(() => hasTradeAction.value || hasNextStrategy.value)
@@ -316,7 +412,12 @@ function statusTagType(statusRaw: string) {
 const followupStatusText = computed(() => {
   if (!hasFollowupConfigured.value) return '后续动作状态：未设置'
   if (hasTradeAction.value) {
-    return `后续动作状态：${detail.value?.trade_action_runtime?.trade_status || 'NOT_SET'}`
+    const tradeStatus = detail.value?.trade_action_runtime?.trade_status || 'NOT_SET'
+    const tradeId = String(detail.value?.trade_action_runtime?.trade_id || '').trim()
+    if (tradeId) {
+      return `后续动作状态：${tradeStatus}（trade_id: ${tradeId}）`
+    }
+    return `后续动作状态：${tradeStatus}`
   }
   if (hasNextStrategy.value) return '后续动作状态：仅激活下游策略'
   return '后续动作状态：未设置'
@@ -440,6 +541,17 @@ async function doPause() {
   }
 }
 
+async function doStop() {
+  if (!detail.value) return
+  try {
+    await stopStrategy(detail.value.id)
+    ElMessage.success(`策略 ${detail.value.id} 已停止并重置为待激活`)
+    await loadDetail()
+  } catch (err) {
+    error.value = toActionError('停止', err)
+  }
+}
+
 async function doResume() {
   if (!detail.value) return
   try {
@@ -477,6 +589,15 @@ function goEditActions() {
 function openRunningLogs() {
   if (!strategyId.value) return
   router.push({ path: '/events', query: { strategy_id: strategyId.value } })
+}
+
+function openTradeInstruction() {
+  const tradeId = String(detail.value?.trade_action_runtime?.trade_id || '').trim()
+  if (tradeId) {
+    router.push(`/trade-instructions/${encodeURIComponent(tradeId)}`)
+    return
+  }
+  router.push('/trade-instructions')
 }
 
 function scrollToSection(section: 'conditions' | 'actions') {
@@ -570,7 +691,6 @@ onBeforeUnmount(() => {
           </div>
           <el-space>
             <el-button size="small" @click="loadDetail">刷新</el-button>
-            <el-button size="small" @click="openRunningLogs">运行日志</el-button>
             <el-button size="small" @click="router.push('/strategies')">返回列表</el-button>
           </el-space>
         </div>
@@ -616,6 +736,7 @@ onBeforeUnmount(() => {
               <el-descriptions-item label="capabilities">
                 <el-space>
                   <el-tag :type="detail.capabilities.can_activate ? 'success' : 'info'">activate</el-tag>
+                  <el-tag :type="detail.capabilities.can_stop ? 'warning' : 'info'">stop</el-tag>
                   <el-tag :type="detail.capabilities.can_pause ? 'success' : 'info'">pause</el-tag>
                   <el-tag :type="detail.capabilities.can_resume ? 'success' : 'info'">resume</el-tag>
                   <el-tag :type="detail.capabilities.can_cancel ? 'danger' : 'info'">cancel</el-tag>
@@ -636,6 +757,19 @@ onBeforeUnmount(() => {
                   @click="doActivate"
                   :disabled="!detail.capabilities.can_activate"
                 />
+                <el-button
+                  class="ops-icon-btn"
+                  size="small"
+                  type="warning"
+                  plain
+                  circle
+                  :title="detail.capabilities.can_stop ? '停止' : ''"
+                  :aria-label="detail.capabilities.can_stop ? '停止' : ''"
+                  @click="doStop"
+                  :disabled="!detail.capabilities.can_stop"
+                >
+                  <span v-if="detail.capabilities.can_stop" class="stop-char-icon" aria-hidden="true">■</span>
+                </el-button>
                 <el-button
                   class="ops-icon-btn"
                   size="small"
@@ -678,23 +812,112 @@ onBeforeUnmount(() => {
       </el-skeleton>
     </el-card>
 
-    <el-card id="conditions-section" shadow="never">
+    <el-card :class="['compact-section-card', 'monitoring-card', { 'is-collapsed': monitoringCollapsed }]" shadow="never">
       <template #header>
-        <div class="card-header-row conditions-header-row">
-          <span class="card-title">触发条件</span>
-          <span class="card-tools conditions-status">条件组状态：{{ detail?.trigger_group_status || 'NOT_CONFIGURED' }}</span>
-          <el-button
-            class="conditions-edit-btn"
-            size="small"
-            :icon="DataAnalysis"
-            @click="goEditConditions"
-            :disabled="!detail?.editable"
-          >
-            设置触发条件
-          </el-button>
+        <div class="card-header-row section-header-row">
+          <span class="card-title">监测情况</span>
+          <span class="card-tools section-header-status">{{ monitoringHeaderStatus }}</span>
+          <div class="section-header-actions">
+            <el-button size="small" :icon="Memo" @click="openRunningLogs">运行日志</el-button>
+            <el-button
+              class="section-toggle-btn"
+              text
+              :icon="monitoringCollapsed ? CaretBottom : CaretTop"
+              :title="monitoringCollapsed ? '展开监测情况' : '收起监测情况'"
+              :aria-label="monitoringCollapsed ? '展开监测情况' : '收起监测情况'"
+              @click="monitoringCollapsed = !monitoringCollapsed"
+            />
+          </div>
         </div>
       </template>
-      <div class="conditions-content">
+      <div v-show="!monitoringCollapsed">
+        <template v-if="detail?.strategy_run">
+          <el-descriptions :column="2" size="small" border>
+            <el-descriptions-item label="first_evaluated_at">
+              {{ formatIsoDateTime(detail.strategy_run.first_evaluated_at) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="evaluated_at">
+              {{ formatIsoDateTime(detail.strategy_run.evaluated_at) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="suggested_next_monitor_at">
+              {{ formatIsoDateTime(detail.strategy_run.suggested_next_monitor_at) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="updated_at">
+              {{ formatIsoDateTime(detail.strategy_run.updated_at) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="check_count">
+              {{ detail.strategy_run.check_count }}
+            </el-descriptions-item>
+            <el-descriptions-item label="condition_met">
+              <div class="condition-met-block">
+                <div>{{ detail.strategy_run.condition_met ? 'true' : 'false' }}</div>
+                <div v-if="conditionMetObservedItems.length > 0" class="condition-met-observed-list">
+                  <div
+                    v-for="item in conditionMetObservedItems"
+                    :key="`condition-met-observed-${item.conditionId}`"
+                    class="condition-met-observed-line"
+                  >
+                    {{ item.conditionId }} observed_value: {{ item.observedValue }}; bar_at: {{ item.observedBarAt }}
+                  </div>
+                </div>
+                <div v-if="conditionMetExtremaItems.length > 0" class="condition-met-extrema-list">
+                  <div
+                    v-for="item in conditionMetExtremaItems"
+                    :key="`condition-met-extrema-${item.conditionId}-${item.contractId}`"
+                    class="condition-met-extrema-line"
+                  >
+                    {{ item.conditionId }}/{{ item.contractId }} high: {{ item.high }} @ {{ item.highBarAt }}; low:
+                    {{ item.low }} @ {{ item.lowBarAt }}
+                  </div>
+                </div>
+              </div>
+            </el-descriptions-item>
+            <el-descriptions-item label="last_outcome">
+              {{ detail.strategy_run.last_outcome }}
+            </el-descriptions-item>
+            <el-descriptions-item label="decision_reason">
+              {{ detail.strategy_run.decision_reason }}
+            </el-descriptions-item>
+          </el-descriptions>
+          <!-- Keep nested monitoring-end map visible for debugging condition data windows. -->
+          <details class="strategy-run-raw-details">
+            <summary>查看 last_monitoring_data_end_at</summary>
+            <pre class="json-box raw-json-box">{{ pretty(detail.strategy_run.last_monitoring_data_end_at) }}</pre>
+          </details>
+        </template>
+        <div v-else class="strategy-run-empty">
+          暂无 strategy_runs 记录（运行后自动生成）
+        </div>
+      </div>
+    </el-card>
+
+    <el-card id="conditions-section" :class="['compact-section-card', { 'is-collapsed': conditionsCollapsed }]" shadow="never">
+      <template #header>
+        <div class="card-header-row section-header-row">
+          <span class="card-title">触发条件</span>
+          <span class="card-tools section-header-status">条件组状态：{{ detail?.trigger_group_status || 'NOT_CONFIGURED' }}</span>
+          <div class="section-header-actions">
+            <el-button
+              v-if="detail?.editable"
+              class="conditions-edit-btn"
+              size="small"
+              :icon="DataAnalysis"
+              @click="goEditConditions"
+            >
+              设置触发条件
+            </el-button>
+            <el-button
+              class="section-toggle-btn"
+              text
+              :icon="conditionsCollapsed ? CaretBottom : CaretTop"
+              :title="conditionsCollapsed ? '展开触发条件' : '收起触发条件'"
+              :aria-label="conditionsCollapsed ? '展开触发条件' : '收起触发条件'"
+              @click="conditionsCollapsed = !conditionsCollapsed"
+            />
+          </div>
+        </div>
+      </template>
+      <div v-show="!conditionsCollapsed" class="conditions-content">
         <template v-if="hasConditions">
           <div class="condition-view-list">
             <template v-for="(item, idx) in conditionViewItems" :key="`${item.id}-${idx}`">
@@ -735,61 +958,28 @@ onBeforeUnmount(() => {
       </div>
     </el-card>
 
-    <el-card shadow="never">
+    <el-card id="actions-section" :class="['compact-section-card', { 'is-collapsed': actionsCollapsed }]" shadow="never">
       <template #header>
-        <div class="card-header-row">
-          <span class="card-title">监测情况</span>
-        </div>
-      </template>
-      <template v-if="detail?.strategy_run">
-        <el-descriptions :column="2" size="small" border>
-          <el-descriptions-item label="first_evaluated_at">
-            {{ formatIsoDateTime(detail.strategy_run.first_evaluated_at) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="evaluated_at">
-            {{ formatIsoDateTime(detail.strategy_run.evaluated_at) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="suggested_next_monitor_at">
-            {{ formatIsoDateTime(detail.strategy_run.suggested_next_monitor_at) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="updated_at">
-            {{ formatIsoDateTime(detail.strategy_run.updated_at) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="check_count">
-            {{ detail.strategy_run.check_count }}
-          </el-descriptions-item>
-          <el-descriptions-item label="condition_met">
-            {{ detail.strategy_run.condition_met ? 'true' : 'false' }}
-          </el-descriptions-item>
-          <el-descriptions-item label="last_outcome">
-            {{ detail.strategy_run.last_outcome }}
-          </el-descriptions-item>
-          <el-descriptions-item label="decision_reason">
-            {{ detail.strategy_run.decision_reason }}
-          </el-descriptions-item>
-        </el-descriptions>
-        <!-- Keep nested monitoring-end map visible for debugging condition data windows. -->
-        <details class="strategy-run-raw-details">
-          <summary>查看 last_monitoring_data_end_at</summary>
-          <pre class="json-box raw-json-box">{{ pretty(detail.strategy_run.last_monitoring_data_end_at) }}</pre>
-        </details>
-      </template>
-      <div v-else class="strategy-run-empty">
-        暂无 strategy_runs 记录（运行后自动生成）
-      </div>
-    </el-card>
-
-    <el-card id="actions-section" shadow="never">
-      <template #header>
-        <div class="card-header-row actions-header-row">
+        <div class="card-header-row section-header-row">
           <span class="card-title">后续动作</span>
-          <span class="card-tools actions-status">{{ followupStatusText }}</span>
-          <el-button class="actions-edit-btn" size="small" :icon="Operation" @click="goEditActions" :disabled="!detail?.editable">
-            设置后续动作
-          </el-button>
+          <span class="card-tools section-header-status">{{ followupStatusText }}</span>
+          <div class="section-header-actions">
+            <el-button size="small" :icon="List" @click="openTradeInstruction">交易指令</el-button>
+            <el-button v-if="detail?.editable" class="actions-edit-btn" size="small" :icon="Operation" @click="goEditActions">
+              设置后续动作
+            </el-button>
+            <el-button
+              class="section-toggle-btn"
+              text
+              :icon="actionsCollapsed ? CaretBottom : CaretTop"
+              :title="actionsCollapsed ? '展开后续动作' : '收起后续动作'"
+              :aria-label="actionsCollapsed ? '展开后续动作' : '收起后续动作'"
+              @click="actionsCollapsed = !actionsCollapsed"
+            />
+          </div>
         </div>
       </template>
-      <div class="actions-content">
+      <div v-show="!actionsCollapsed" class="actions-content">
         <template v-if="hasFollowupConfigured">
           <div class="actions-grid">
             <div class="action-sub-card">
@@ -1082,6 +1272,91 @@ onBeforeUnmount(() => {
   font-size: 24px;
 }
 
+.compact-section-card :deep(.el-card__header) {
+  padding: 2px 10px;
+}
+
+.compact-section-card.is-collapsed :deep(.el-card__body) {
+  padding: 0 10px 2px;
+}
+
+.section-header-row {
+  position: relative;
+  justify-content: flex-start;
+  min-height: 0;
+  line-height: 1.1;
+}
+
+.section-header-row .card-title {
+  position: relative;
+  z-index: 1;
+}
+
+.section-header-status {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 45%;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.section-header-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  position: relative;
+  z-index: 1;
+}
+
+.section-toggle-btn {
+  padding: 0;
+  min-height: 0;
+}
+
+.section-toggle-btn :deep(.el-icon) {
+  font-size: 20px;
+}
+
+.stop-char-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.condition-met-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.condition-met-observed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.condition-met-observed-line {
+  color: #9fb0c3;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.condition-met-extrema-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.condition-met-extrema-line {
+  color: #9fb0c3;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .detail-top {
   display: flex;
   flex-direction: column;
@@ -1094,40 +1369,6 @@ onBeforeUnmount(() => {
 
 .runtime-box {
   margin-top: 10px;
-}
-
-.conditions-header-row {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  gap: 12px;
-}
-
-.conditions-status {
-  justify-self: center;
-  text-align: center;
-  white-space: nowrap;
-}
-
-.conditions-edit-btn {
-  justify-self: end;
-}
-
-.actions-header-row {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  gap: 12px;
-}
-
-.actions-status {
-  justify-self: center;
-  text-align: center;
-  white-space: nowrap;
-}
-
-.actions-edit-btn {
-  justify-self: end;
 }
 
 .conditions-content {

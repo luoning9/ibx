@@ -33,8 +33,8 @@ function handleMenuSelect(index: string) {
         @select="handleMenuSelect"
       >
         <el-menu-item index="/strategies">策略列表</el-menu-item>
-        <el-menu-item index="/events">运行日志</el-menu-item>
         <el-menu-item index="/trade-instructions">交易指令</el-menu-item>
+        <el-menu-item index="/events">运行日志</el-menu-item>
         <el-menu-item index="/system-status">系统状态</el-menu-item>
       </el-menu>
     </el-header>

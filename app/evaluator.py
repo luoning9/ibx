@@ -520,6 +520,43 @@ def _parse_monitoring_end_map(raw: Any) -> dict[str, dict[str, str]]:
     return out
 
 
+def _parse_extrema_state_map(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
+    # strategy_runs.extrema_state_json shape:
+    # {condition_id: {contract_id: {since_activation_high/low, high_bar_at/low_bar_at, updated_at}}}
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    for condition_id, by_contract in data.items():
+        if not isinstance(condition_id, str) or not isinstance(by_contract, dict):
+            continue
+        normalized_contracts: dict[str, dict[str, Any]] = {}
+        for contract_id, payload in by_contract.items():
+            if not isinstance(contract_id, str) or not isinstance(payload, dict):
+                continue
+            normalized_payload: dict[str, Any] = {}
+            high = _to_float_or_none(payload.get("since_activation_high"))
+            low = _to_float_or_none(payload.get("since_activation_low"))
+            if high is not None:
+                normalized_payload["since_activation_high"] = high
+            if low is not None:
+                normalized_payload["since_activation_low"] = low
+            for key in ("high_bar_at", "low_bar_at", "updated_at"):
+                text = str(payload.get(key) or "").strip()
+                if text:
+                    normalized_payload[key] = text
+            if normalized_payload:
+                normalized_contracts[contract_id] = normalized_payload
+        if normalized_contracts:
+            out[condition_id] = normalized_contracts
+    return out
+
+
 def _set_monitoring_end_value(
     values: dict[str, dict[str, str]],
     *,
@@ -529,6 +566,30 @@ def _set_monitoring_end_value(
 ) -> None:
     by_contract = values.setdefault(condition_id, {})
     by_contract[str(contract_id)] = ts_iso
+
+
+def _set_extrema_state_value(
+    values: dict[str, dict[str, dict[str, Any]]],
+    *,
+    condition_id: str,
+    contract_id: int,
+    payload: dict[str, Any],
+) -> None:
+    normalized_payload: dict[str, Any] = {}
+    high = _to_float_or_none(payload.get("since_activation_high"))
+    low = _to_float_or_none(payload.get("since_activation_low"))
+    if high is not None:
+        normalized_payload["since_activation_high"] = high
+    if low is not None:
+        normalized_payload["since_activation_low"] = low
+    for key in ("high_bar_at", "low_bar_at", "updated_at"):
+        text = str(payload.get(key) or "").strip()
+        if text:
+            normalized_payload[key] = text
+    if not normalized_payload:
+        return
+    by_contract = values.setdefault(condition_id, {})
+    by_contract[str(contract_id)] = normalized_payload
 
 
 def _condition_id_hint(condition: dict[str, Any], fallback: str) -> str:
@@ -1052,6 +1113,7 @@ def persist_evaluation_result(
     evaluated_at: datetime | None,
     initial_last_monitoring_data_end_at: datetime | None,
     monitoring_end_updates: dict[tuple[str, int], datetime],
+    extrema_state_updates: dict[tuple[str, int], dict[str, Any]] | None,
     suggested_next_monitor_at: datetime | None,
     result: StrategyEvaluationResult,
 ) -> None:
@@ -1065,7 +1127,7 @@ def persist_evaluation_result(
     requirement_keys = _extract_requirement_keys(result.metrics)
     existing = conn.execute(
         """
-        SELECT last_monitoring_data_end_at, evaluated_at
+        SELECT last_monitoring_data_end_at, extrema_state_json, evaluated_at
         FROM strategy_runs
         WHERE strategy_id = ?
         """,
@@ -1123,7 +1185,27 @@ def persist_evaluation_result(
             "market_data",
         )
 
+    extrema_state_map: dict[str, dict[str, dict[str, Any]]] = {}
+    if existing is not None:
+        extrema_state_map = _parse_extrema_state_map(existing["extrema_state_json"])
+    for (condition_id, contract_id), update_payload in (extrema_state_updates or {}).items():
+        merged_payload: dict[str, Any] = {}
+        existing_by_contract = extrema_state_map.get(condition_id)
+        if existing_by_contract is not None:
+            existing_payload = existing_by_contract.get(str(contract_id))
+            if isinstance(existing_payload, dict):
+                merged_payload.update(existing_payload)
+        if isinstance(update_payload, dict):
+            merged_payload.update(update_payload)
+        _set_extrema_state_value(
+            extrema_state_map,
+            condition_id=condition_id,
+            contract_id=contract_id,
+            payload=merged_payload,
+        )
+
     monitoring_end_json = _dumps_json(monitoring_end_map)
+    extrema_state_json = _dumps_json(extrema_state_map)
     suggested_next_monitor_iso = (
         _to_iso_utc(suggested_next_monitor_at)
         if suggested_next_monitor_at is not None
@@ -1141,6 +1223,7 @@ def persist_evaluation_result(
             UPDATE strategy_runs
             SET evaluated_at = ?,
                 last_monitoring_data_end_at = ?,
+                extrema_state_json = ?,
                 suggested_next_monitor_at = ?,
                 condition_met = ?,
                 decision_reason = ?,
@@ -1153,6 +1236,7 @@ def persist_evaluation_result(
             (
                 stored_evaluated_at_iso,
                 monitoring_end_json,
+                extrema_state_json,
                 suggested_next_monitor_iso,
                 1 if result.condition_met else 0,
                 result.decision_reason,
@@ -1168,6 +1252,7 @@ def persist_evaluation_result(
             INSERT INTO strategy_runs (
                 strategy_id,
                 last_monitoring_data_end_at,
+                extrema_state_json,
                 suggested_next_monitor_at,
                 first_evaluated_at,
                 evaluated_at,
@@ -1178,11 +1263,12 @@ def persist_evaluation_result(
                 metrics_json,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
             (
                 strategy_id,
                 monitoring_end_json,
+                extrema_state_json,
                 suggested_next_monitor_iso,
                 stored_evaluated_at_iso,
                 stored_evaluated_at_iso,

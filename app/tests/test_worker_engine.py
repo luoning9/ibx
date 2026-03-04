@@ -905,6 +905,82 @@ def test_process_once_active_uses_market_data_provider_and_triggers(tmp_path) ->
             os.environ["IBX_DB_PATH"] = old_db_path
 
 
+def test_drawdown_metric_persists_extrema_and_evaluates_without_waiting(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_drawdown_extrema.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-DRAWDOWN",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "DRAWDOWN_PCT",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 0.5,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-DRAWDOWN",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [100.0, 102.0, 101.0]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    try:
+        engine.process_once("S-WORKER-DRAWDOWN", reason="unit_test")
+        with get_connection() as conn:
+            run_row = conn.execute(
+                """
+                SELECT decision_reason, extrema_state_json
+                FROM strategy_runs
+                WHERE strategy_id = ?
+                """,
+                ("S-WORKER-DRAWDOWN",),
+            ).fetchone()
+            assert run_row is not None
+            assert run_row["decision_reason"] == "conditions_not_met"
+            extrema_state = json.loads(run_row["extrema_state_json"])
+            assert float(extrema_state["c1"]["1"]["since_activation_high"]) == 102.0
+            assert float(extrema_state["c1"]["1"]["since_activation_low"]) == 100.0
+
+            state_row = conn.execute(
+                """
+                SELECT state
+                FROM condition_states
+                WHERE strategy_id = ? AND condition_id = ?
+                """,
+                ("S-WORKER-DRAWDOWN", "c1"),
+            ).fetchone()
+            assert state_row is not None
+            assert state_row["state"] == "FALSE"
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+
+
 def test_level_instant_true_uses_trigger_extreme_and_bar_start(tmp_path) -> None:
     db_path = tmp_path / "ibx_worker_level_instant_trigger_point.sqlite3"
     init_db(db_path=db_path)
@@ -3340,7 +3416,7 @@ def test_process_once_active_invalid_condition_moves_to_verify_failed(tmp_path) 
             os.environ["IBX_DB_PATH"] = old_db_path
 
 
-def test_gateway_not_work_event_is_throttled_by_runtime_state(tmp_path) -> None:
+def test_gateway_not_work_event_is_throttled_in_memory(tmp_path) -> None:
     db_path = tmp_path / "ibx_worker_gateway_throttle.sqlite3"
     init_db(db_path=db_path)
     _insert_strategy(
@@ -3392,17 +3468,7 @@ def test_gateway_not_work_event_is_throttled_by_runtime_state(tmp_path) -> None:
             ).fetchone()
             assert event_count_row is not None
             assert event_count_row["c"] == 1
-
-            throttle_row = conn.execute(
-                """
-                SELECT state_value
-                FROM strategy_runtime_states
-                WHERE strategy_id = ? AND state_key = 'event_throttle:GATEWAY_NOT_WORK'
-                """,
-                ("S-WORKER-GW-THROTTLE",),
-            ).fetchone()
-            assert throttle_row is not None
-            assert throttle_row["state_value"] is not None
+        assert ("S-WORKER-GW-THROTTLE", "GATEWAY_NOT_WORK") in engine._event_throttle_last_emitted_at
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)
@@ -3415,7 +3481,7 @@ def test_gateway_not_work_event_is_throttled_by_runtime_state(tmp_path) -> None:
             os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
 
 
-def test_waiting_for_market_data_event_is_throttled_by_runtime_state(tmp_path) -> None:
+def test_waiting_for_market_data_event_is_throttled_in_memory(tmp_path) -> None:
     db_path = tmp_path / "ibx_worker_waiting_throttle.sqlite3"
     init_db(db_path=db_path)
     _insert_strategy(
@@ -3467,17 +3533,7 @@ def test_waiting_for_market_data_event_is_throttled_by_runtime_state(tmp_path) -
             ).fetchone()
             assert event_count_row is not None
             assert event_count_row["c"] == 1
-
-            throttle_row = conn.execute(
-                """
-                SELECT state_value
-                FROM strategy_runtime_states
-                WHERE strategy_id = ? AND state_key = 'event_throttle:WAITING_FOR_MARKET_DATA'
-                """,
-                ("S-WORKER-WAIT-THROTTLE",),
-            ).fetchone()
-            assert throttle_row is not None
-            assert throttle_row["state_value"] is not None
+        assert ("S-WORKER-WAIT-THROTTLE", "WAITING_FOR_MARKET_DATA") in engine._event_throttle_last_emitted_at
     finally:
         if old_db_path is None:
             os.environ.pop("IBX_DB_PATH", None)

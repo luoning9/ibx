@@ -97,10 +97,14 @@ function openStrategyDetail(strategyId: string) {
   void router.push(`/strategies/${encodeURIComponent(normalized)}`)
 }
 
-function openTradeLogsByTradeId(tradeId: string) {
+function openTradeInstructionDetail(tradeId: string) {
   const normalized = (tradeId || '').trim().toUpperCase()
   if (!normalized) return
-  void router.push({ path: '/trade-logs', query: { trade_id: normalized } })
+  void router.push(`/trade-instructions/${encodeURIComponent(normalized)}`)
+}
+
+function openTradeLogsPage() {
+  void router.push('/trade-logs')
 }
 
 function parseDetailTokens(detail: string): DetailToken[] {
@@ -158,23 +162,26 @@ watch(totalRows, () => {
     <el-card shadow="never">
       <template #header>
         <div class="card-header-row">
-          <span class="card-title">
-            <template v-if="strategyIdFilter">
-              策略
-              <el-button
-                class="title-strategy-link"
-                text
-                size="small"
-                @click="openStrategyDetail(strategyIdFilter)"
-              >
-                {{ strategyIdFilter }}
-              </el-button>
-              的运行日志
-            </template>
-            <template v-else>
-              {{ pageTitle }}
-            </template>
-          </span>
+          <div class="title-with-link">
+            <span class="card-title">
+              <template v-if="strategyIdFilter">
+                策略
+                <el-button
+                  class="title-strategy-link"
+                  text
+                  size="small"
+                  @click="openStrategyDetail(strategyIdFilter)"
+                >
+                  {{ strategyIdFilter }}
+                </el-button>
+                的运行日志
+              </template>
+              <template v-else>
+                {{ pageTitle }}
+              </template>
+            </span>
+            <el-link type="primary" @click="openTradeLogsPage">查看交易日志</el-link>
+          </div>
           <el-space>
             <el-button v-if="strategyIdFilter" size="small" @click="clearStrategyFilter">所有日志</el-button>
             <el-select v-model="refreshMode" size="small" class="refresh-mode-select">
@@ -234,7 +241,7 @@ watch(totalRows, () => {
                 <el-link
                   v-if="token.kind === 'trade'"
                   type="primary"
-                  @click="openTradeLogsByTradeId(token.id || token.text)"
+                  @click="openTradeInstructionDetail(token.id || token.text)"
                 >
                   {{ token.text }}
                 </el-link>
@@ -271,6 +278,12 @@ watch(totalRows, () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.title-with-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .mb-12 {

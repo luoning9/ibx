@@ -61,6 +61,7 @@ CONDITION_METRICS_BY_TYPE: dict[str, set[ConditionMetric]] = {
 
 class Capabilities(BaseModel):
     can_activate: bool = False
+    can_stop: bool = False
     can_pause: bool = False
     can_resume: bool = False
     can_cancel: bool = False
@@ -69,6 +70,7 @@ class Capabilities(BaseModel):
 
 class CapabilityReasons(BaseModel):
     can_activate: str | None = None
+    can_stop: str | None = None
     can_pause: str | None = None
     can_resume: str | None = None
     can_cancel: str | None = None
@@ -245,6 +247,7 @@ class StrategyRunSummaryOut(BaseModel):
     last_outcome: str
     check_count: int
     last_monitoring_data_end_at: dict[str, dict[str, str]] = Field(default_factory=dict)
+    extrema_state: dict[str, dict[str, dict[str, Any]]] = Field(default_factory=dict)
     updated_at: datetime
 
 

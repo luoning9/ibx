@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { CloseBold } from '@element-plus/icons-vue'
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -9,9 +8,8 @@ import {
   fetchActiveTradeInstructions,
   fetchOtherOpenOrders,
   fetchRecentCompletedTradeInstructions,
-  fetchTradeInstructionOrders,
 } from '../api/services'
-import type { ActiveTradeInstruction, OtherOpenOrder, TradeOrder } from '../api/types'
+import type { ActiveTradeInstruction, OtherOpenOrder } from '../api/types'
 import { formatIsoDateTime } from '../utils/format'
 
 const router = useRouter()
@@ -22,12 +20,7 @@ const loading = ref(false)
 const error = ref('')
 const cancellingPermIds = ref<Set<number>>(new Set())
 const instructionDisplayMode = ref<'active_only' | 'recent_week_all'>('active_only')
-const orderRowsByTradeId = ref<Record<string, TradeOrder[]>>({})
-const orderLoadingByTradeId = ref<Record<string, boolean>>({})
-const orderErrorByTradeId = ref<Record<string, string>>({})
-const loadedTradeOrderIds = ref<Set<string>>(new Set())
 const TERMINAL_INSTRUCTION_STATUSES = new Set(['FILLED', 'CANCELLED', 'FAILED', 'EXPIRED'])
-const TERMINAL_ORDER_STATUSES = new Set(['FILLED', 'CANCELLED', 'FAILED', 'EXPIRED'])
 
 function toEpochMillis(value: string | null | undefined) {
   if (!value) return 0
@@ -78,10 +71,6 @@ async function loadTradeData() {
     activeRows.value = activeData
     completedRows.value = completedData
     otherOpenOrderRows.value = otherOpenOrders
-    orderRowsByTradeId.value = {}
-    orderLoadingByTradeId.value = {}
-    orderErrorByTradeId.value = {}
-    loadedTradeOrderIds.value = new Set()
   } catch (err) {
     error.value = `加载交易指令失败：${String(err)}`
   } finally {
@@ -93,75 +82,10 @@ function openStrategyDetail(strategyId: string) {
   router.push(`/strategies/${strategyId}`)
 }
 
-function openTradeLogsByTradeId(tradeId: string) {
+function openTradeInstructionDetail(tradeId: string) {
   const normalized = String(tradeId || '').trim()
   if (!normalized) return
-  router.push({ path: '/trade-logs', query: { trade_id: normalized } })
-}
-
-async function openTradeOrders(tradeId: string) {
-  const normalized = String(tradeId || '').trim()
-  if (!normalized) return
-  const hasLoaded = loadedTradeOrderIds.value.has(normalized)
-  if (hasLoaded) return
-  orderLoadingByTradeId.value = {
-    ...orderLoadingByTradeId.value,
-    [normalized]: true,
-  }
-  orderErrorByTradeId.value = {
-    ...orderErrorByTradeId.value,
-    [normalized]: '',
-  }
-  try {
-    const rows = await fetchTradeInstructionOrders(normalized)
-    orderRowsByTradeId.value = {
-      ...orderRowsByTradeId.value,
-      [normalized]: rows,
-    }
-    loadedTradeOrderIds.value = new Set([...loadedTradeOrderIds.value, normalized])
-  } catch (err) {
-    orderRowsByTradeId.value = {
-      ...orderRowsByTradeId.value,
-      [normalized]: [],
-    }
-    orderErrorByTradeId.value = {
-      ...orderErrorByTradeId.value,
-      [normalized]: `加载订单明细失败：${String(err)}`,
-    }
-  } finally {
-    orderLoadingByTradeId.value = {
-      ...orderLoadingByTradeId.value,
-      [normalized]: false,
-    }
-  }
-}
-
-function getTradeOrders(tradeId: string) {
-  const normalized = String(tradeId || '').trim()
-  return orderRowsByTradeId.value[normalized] || []
-}
-
-function isTradeOrderLoading(tradeId: string) {
-  const normalized = String(tradeId || '').trim()
-  return Boolean(orderLoadingByTradeId.value[normalized])
-}
-
-function tradeOrderError(tradeId: string) {
-  const normalized = String(tradeId || '').trim()
-  return orderErrorByTradeId.value[normalized] || ''
-}
-
-async function refreshTradeOrders(tradeId: string) {
-  const normalized = String(tradeId || '').trim()
-  if (!normalized) return
-  loadedTradeOrderIds.value.delete(normalized)
-  await openTradeOrders(normalized)
-}
-
-function onInstructionExpandChange(row: ActiveTradeInstruction, expandedRows: ActiveTradeInstruction[]) {
-  const expanded = expandedRows.some((item) => item.trade_id === row.trade_id)
-  if (!expanded) return
-  void openTradeOrders(row.trade_id)
+  router.push(`/trade-instructions/${encodeURIComponent(normalized)}`)
 }
 
 function formatQtyPair(quantity: number, filledQty: number) {
@@ -178,17 +102,6 @@ function canCancelActiveInstruction(row: ActiveTradeInstruction) {
   const permId = Number(row.perm_id)
   const normalizedStatus = String(row.status || '').trim().toUpperCase()
   return Number.isFinite(permId) && permId > 0 && !TERMINAL_INSTRUCTION_STATUSES.has(normalizedStatus)
-}
-
-function orderPermId(order: TradeOrder) {
-  const value = Number(order.ib_order_id)
-  if (!Number.isFinite(value) || value <= 0) return null
-  return value
-}
-
-function canCancelOrder(order: TradeOrder) {
-  const normalizedStatus = String(order.status || '').trim().toUpperCase()
-  return orderPermId(order) !== null && !TERMINAL_ORDER_STATUSES.has(normalizedStatus)
 }
 
 function instructionRowClassName({ row }: { row: ActiveTradeInstruction }) {
@@ -244,15 +157,6 @@ async function cancelOpenOrder(row: OtherOpenOrder) {
   await cancelByPermId(row.perm_id)
 }
 
-async function cancelTradeOrder(order: TradeOrder) {
-  const permId = orderPermId(order)
-  if (!permId) {
-    ElMessage.error('当前订单没有可用 permId，无法撤单')
-    return
-  }
-  await cancelByPermId(permId)
-}
-
 onMounted(loadTradeData)
 </script>
 
@@ -284,8 +188,6 @@ onMounted(loadTradeData)
         :data="instructionRows"
         size="small"
         :row-class-name="instructionRowClassName"
-        row-key="trade_id"
-        @expand-change="onInstructionExpandChange"
       >
         <el-table-column label="更新时间" width="170">
           <template #default="{ row }">{{ formatIsoDateTime(row.updated_at) }}</template>
@@ -293,7 +195,7 @@ onMounted(loadTradeData)
         <el-table-column label="策略/指令" width="210" class-name="strategy-id-col" label-class-name="strategy-id-header">
           <template #default="{ row }">
             <div class="trade-id-row">
-              <el-link class="trade-id-link" type="primary" @click="openTradeLogsByTradeId(row.trade_id)">
+              <el-link class="trade-id-link" type="primary" @click="openTradeInstructionDetail(row.trade_id)">
                 {{ row.trade_id }}
               </el-link>
             </div>
@@ -332,71 +234,6 @@ onMounted(loadTradeData)
               撤单
             </el-button>
             <span v-else>-</span>
-          </template>
-        </el-table-column>
-        <el-table-column type="expand" width="52" align="right">
-          <template #default="{ row }">
-            <div class="order-expand-wrap">
-              <div class="order-expand-content">
-                <div class="order-expand-header">
-                  <span class="order-expand-title">trade {{ row.trade_id }} 的订单列表</span>
-                  <el-button text size="small" @click="refreshTradeOrders(row.trade_id)">刷新</el-button>
-                </div>
-                <el-alert
-                  v-if="tradeOrderError(row.trade_id)"
-                  :title="tradeOrderError(row.trade_id)"
-                  type="error"
-                  show-icon
-                  :closable="false"
-                  class="mb-12"
-                />
-                <el-table
-                  v-loading="isTradeOrderLoading(row.trade_id)"
-                  :data="getTradeOrders(row.trade_id)"
-                  size="small"
-                  border
-                  :fit="false"
-                  class="order-detail-table"
-                >
-                  <el-table-column prop="sequence_no" label="顺序" width="72" />
-                  <el-table-column prop="leg_role" label="类型" width="120" />
-                  <el-table-column prop="status" label="状态" width="140" />
-                <el-table-column label="permId" width="130">
-                  <template #default="{ row: orderRow }">{{ orderPermId(orderRow) ?? '-' }}</template>
-                </el-table-column>
-                  <el-table-column label="数量/已成交" width="120">
-                    <template #default="{ row: orderRow }">{{ formatQtyPair(orderRow.qty, orderRow.filled_qty) }}</template>
-                  </el-table-column>
-                <el-table-column label="均价" width="120">
-                  <template #default="{ row: orderRow }">{{ orderRow.avg_fill_price ?? '-' }}</template>
-                </el-table-column>
-                <el-table-column label="操作" width="92" align="center">
-                  <template #default="{ row: orderRow }">
-                    <el-tooltip v-if="canCancelOrder(orderRow)" content="撤单" placement="top">
-                      <el-button
-                        class="order-cancel-icon-btn"
-                        size="small"
-                        type="danger"
-                        plain
-                        circle
-                        :icon="CloseBold"
-                        :loading="cancellingPermIds.has(orderPermId(orderRow) ?? -1)"
-                        :disabled="cancellingPermIds.has(orderPermId(orderRow) ?? -1)"
-                        @click="cancelTradeOrder(orderRow)"
-                      />
-                    </el-tooltip>
-                    <span v-else>-</span>
-                  </template>
-                </el-table-column>
-              </el-table>
-                <div
-                  v-if="!isTradeOrderLoading(row.trade_id) && !tradeOrderError(row.trade_id) && getTradeOrders(row.trade_id).length === 0"
-                  class="order-empty"
-                >
-                  暂无订单数据
-                </div>
-              </div>
-            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -486,45 +323,6 @@ onMounted(loadTradeData)
 
 .instruction-mode-select {
   width: 172px;
-}
-
-.order-expand-wrap {
-  padding: 6px 8px 10px 16px;
-  display: flex;
-  justify-content: flex-end;
-}
-
-.order-expand-content {
-  width: fit-content;
-  max-width: 100%;
-  margin-left: auto;
-}
-
-.order-expand-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.order-expand-title {
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.order-empty {
-  margin-top: 8px;
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-  text-align: right;
-}
-
-.order-detail-table {
-  margin-left: auto;
-}
-
-.order-cancel-icon-btn :deep(.el-icon) {
-  font-size: 14px;
 }
 
 :deep(.instruction-row--terminal > td.el-table__cell) {

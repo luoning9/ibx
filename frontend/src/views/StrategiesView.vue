@@ -4,7 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { activateStrategy, copyStrategy, deleteStrategy, fetchStrategies } from '../api/services'
+import { activateStrategy, copyStrategy, deleteStrategy, fetchStrategies, stopStrategy } from '../api/services'
 import type { StrategySummary } from '../api/types'
 import { formatIsoDateTime } from '../utils/format'
 
@@ -12,6 +12,7 @@ const rows = ref<StrategySummary[]>([])
 const loading = ref(false)
 const error = ref('')
 const activatingId = ref('')
+const stoppingId = ref('')
 const copyingId = ref('')
 const deleteEnabled = ref(false)
 const router = useRouter()
@@ -66,6 +67,19 @@ async function onActivate(row: StrategySummary) {
     ElMessage.error(`激活失败：${String(err)}`)
   } finally {
     activatingId.value = ''
+  }
+}
+
+async function onStop(row: StrategySummary) {
+  stoppingId.value = row.id
+  try {
+    await stopStrategy(row.id)
+    ElMessage.success(`已停止策略：${row.id}`)
+    await loadStrategies()
+  } catch (err) {
+    ElMessage.error(`停止失败：${String(err)}`)
+  } finally {
+    stoppingId.value = ''
   }
 }
 
@@ -134,7 +148,7 @@ onMounted(loadStrategies)
         <el-table-column label="最近更新" width="180">
           <template #default="{ row }">{{ formatIsoDateTime(row.updated_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="120">
+        <el-table-column label="操作" width="160">
           <template #default="{ row }">
             <el-space>
               <el-tooltip content="激活策略" placement="top">
@@ -149,6 +163,24 @@ onMounted(loadStrategies)
                   @click.stop="onActivate(row)"
                 >
                   <el-icon v-if="row.capabilities?.can_activate"><CaretRight /></el-icon>
+                </el-button>
+              </el-tooltip>
+              <el-tooltip
+                :content="row.capabilities?.can_stop ? '停止并回到待激活' : ''"
+                :disabled="!row.capabilities?.can_stop"
+                placement="top"
+              >
+                <el-button
+                  class="ops-icon-btn"
+                  size="small"
+                  circle
+                  :disabled="!row.capabilities?.can_stop"
+                  :loading="stoppingId === row.id"
+                  :title="row.capabilities?.can_stop ? '停止' : ''"
+                  :aria-label="row.capabilities?.can_stop ? '停止' : ''"
+                  @click.stop="onStop(row)"
+                >
+                  <span v-if="row.capabilities?.can_stop" class="stop-char-icon" aria-hidden="true">■</span>
                 </el-button>
               </el-tooltip>
               <el-tooltip content="复制策略" placement="top">
@@ -221,5 +253,10 @@ onMounted(loadStrategies)
 .ops-icon-btn.el-button.is-disabled:hover {
   border-color: var(--el-border-color-light);
   background-color: transparent;
+}
+
+.stop-char-icon {
+  font-size: 11px;
+  line-height: 1;
 }
 </style>

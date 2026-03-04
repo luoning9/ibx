@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS strategy_runs (
   -- One strategy keeps exactly one runtime summary row.
   strategy_id TEXT NOT NULL UNIQUE REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
   last_monitoring_data_end_at TEXT NOT NULL CHECK (json_valid(last_monitoring_data_end_at)),
+  extrema_state_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(extrema_state_json)),
   -- Scheduler hint for the next recommended monitoring cycle; NULL means "run normally".
   suggested_next_monitor_at TEXT,
   first_evaluated_at TEXT NOT NULL,
@@ -121,15 +122,6 @@ CREATE TABLE IF NOT EXISTS strategy_runs (
   check_count INTEGER NOT NULL DEFAULT 1 CHECK (check_count >= 1),
   metrics_json TEXT NOT NULL CHECK (json_valid(metrics_json)),
   updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS strategy_runtime_states (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  strategy_id TEXT NOT NULL REFERENCES strategies(id) ON UPDATE CASCADE ON DELETE CASCADE,
-  state_key TEXT NOT NULL,
-  state_value TEXT,
-  updated_at TEXT NOT NULL,
-  UNIQUE (strategy_id, state_key)
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -221,8 +213,6 @@ CREATE INDEX IF NOT EXISTS idx_condition_states_strategy
   ON condition_states (strategy_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_strategy_runs_evaluated_at
   ON strategy_runs (evaluated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_strategy_runtime_states_strategy_updated
-  ON strategy_runtime_states (strategy_id, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_orders_strategy_status_updated
   ON orders (strategy_id, status, updated_at DESC);

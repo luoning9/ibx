@@ -86,6 +86,10 @@ export async function pauseStrategy(strategyId: string) {
   await http.post(`/strategies/${strategyId}/pause`)
 }
 
+export async function stopStrategy(strategyId: string) {
+  await http.post(`/strategies/${strategyId}/stop`)
+}
+
 export async function resumeStrategy(strategyId: string) {
   await http.post(`/strategies/${strategyId}/resume`)
 }

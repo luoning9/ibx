@@ -971,7 +971,7 @@ def test_activate_does_not_verify_inline_when_market_mapping_invalid() -> None:
     assert detail.json()["status"] == "VERIFYING"
 
 
-def test_pause_resume_when_verifying() -> None:
+def test_pause_rejected_when_verifying() -> None:
     strategy_id = f"S-UT-{uuid4().hex[:4].upper()}"
     payload = {
         "id": strategy_id,
@@ -1011,19 +1011,92 @@ def test_pause_resume_when_verifying() -> None:
     detail = client.get(f"/v1/strategies/{strategy_id}")
     assert detail.status_code == 200
     assert detail.json()["status"] == "VERIFYING"
-    assert detail.json()["capabilities"]["can_pause"] is True
+    assert detail.json()["capabilities"]["can_pause"] is False
 
     paused = client.post(f"/v1/strategies/{strategy_id}/pause")
-    assert paused.status_code == 200
-    assert paused.json()["status"] == "PAUSED"
+    assert paused.status_code == 409
+    assert "only ACTIVE can pause" in paused.json()["detail"]
 
-    resumed = client.post(f"/v1/strategies/{strategy_id}/resume")
-    assert resumed.status_code == 200
-    assert resumed.json()["status"] == "VERIFYING"
 
-    detail_after = client.get(f"/v1/strategies/{strategy_id}")
-    assert detail_after.status_code == 200
-    assert detail_after.json()["status"] == "VERIFYING"
+def test_stop_resets_to_pending_activation() -> None:
+    strategy_id = f"S-UT-{uuid4().hex[:4].upper()}"
+    created = client.post("/v1/strategies", json=_ready_strategy_payload(strategy_id, "stop to pending"))
+    assert created.status_code == 200
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE strategies SET status = 'ACTIVE', activated_at = ?, logical_activated_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", strategy_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO strategy_runs (
+                strategy_id, last_monitoring_data_end_at, first_evaluated_at, evaluated_at,
+                condition_met, decision_reason, last_outcome, check_count, metrics_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                strategy_id,
+                '{"c1":{"1":"2026-01-01T00:00:00Z"}}',
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                0,
+                "waiting_for_market_data",
+                "waiting_for_market_data",
+                1,
+                "{}",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE condition_states
+            SET state = 'TRUE', last_value = 1.23, observed_bar_at = ?, last_evaluated_at = ?, updated_at = ?
+            WHERE strategy_id = ? AND condition_id = ?
+            """,
+            (
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                strategy_id,
+                "c1",
+            ),
+        )
+        conn.commit()
+
+    stopped = client.post(f"/v1/strategies/{strategy_id}/stop")
+    assert stopped.status_code == 200
+    body = stopped.json()
+    assert body["status"] == "PENDING_ACTIVATION"
+    assert body["message"] == "stopped"
+
+    detail = client.get(f"/v1/strategies/{strategy_id}")
+    assert detail.status_code == 200
+    detail_body = detail.json()
+    assert detail_body["status"] == "PENDING_ACTIVATION"
+    assert detail_body["activated_at"] is None
+    assert detail_body["logical_activated_at"] is None
+
+    with get_connection() as conn:
+        run_row = conn.execute(
+            "SELECT COUNT(1) AS c FROM strategy_runs WHERE strategy_id = ?",
+            (strategy_id,),
+        ).fetchone()
+        assert run_row is not None
+        assert run_row["c"] == 1
+        state_row = conn.execute(
+            """
+            SELECT state, last_value, observed_bar_at, last_evaluated_at
+            FROM condition_states
+            WHERE strategy_id = ? AND condition_id = ?
+            """,
+            (strategy_id, "c1"),
+        ).fetchone()
+        assert state_row is not None
+        assert state_row["state"] == "TRUE"
+        assert state_row["last_value"] == 1.23
+        assert state_row["observed_bar_at"] == "2026-01-01T00:00:00Z"
+        assert state_row["last_evaluated_at"] == "2026-01-01T00:00:00Z"
 
 
 def test_activate_enqueues_strategy_immediately(monkeypatch) -> None:

@@ -23,6 +23,18 @@ const tradeIdFilter = computed(() => {
   return String(raw || '').trim()
 })
 
+const strategyIdForFilteredTrade = computed(() => {
+  if (!tradeIdFilter.value) return ''
+  const strategyIds = Array.from(
+    new Set(
+      allRows.value
+        .map((row) => String(row.strategy_id || '').trim())
+        .filter((id) => Boolean(id)),
+    ),
+  )
+  if (strategyIds.length === 1) return strategyIds[0]
+  return ''
+})
 const pageTitle = computed(() =>
   tradeIdFilter.value ? `交易${tradeIdFilter.value}的交易日志` : '所有交易日志',
 )
@@ -123,7 +135,14 @@ onBeforeUnmount(() => {
     <el-card shadow="never">
       <template #header>
         <div class="card-header-row">
-          <span class="card-title">{{ pageTitle }}</span>
+          <span class="card-title">
+            {{ pageTitle }}
+            <template v-if="tradeIdFilter && strategyIdForFilteredTrade">
+              （<el-link type="primary" @click="openStrategyDetail(strategyIdForFilteredTrade)"
+                >策略 {{ strategyIdForFilteredTrade }}</el-link
+              >）
+            </template>
+          </span>
           <el-space>
             <el-button v-if="tradeIdFilter" size="small" @click="clearTradeFilter">所有日志</el-button>
             <el-select v-model="refreshMode" size="small" class="refresh-mode-select">
@@ -160,11 +179,6 @@ onBeforeUnmount(() => {
       <el-table v-loading="loading" :data="pagedRows" size="small">
         <el-table-column label="时间" width="180">
           <template #default="{ row }">{{ formatIsoDateTime(row.timestamp) }}</template>
-        </el-table-column>
-        <el-table-column label="strategy_id" width="140">
-          <template #default="{ row }">
-            <el-link type="primary" @click="openStrategyDetail(row.strategy_id)">{{ row.strategy_id }}</el-link>
-          </template>
         </el-table-column>
         <el-table-column v-if="!tradeIdFilter" label="trade_id" width="190">
           <template #default="{ row }">

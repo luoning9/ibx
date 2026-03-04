@@ -9,6 +9,7 @@ import StrategyEditorConditionsView from '../views/StrategyEditorConditionsView.
 import StrategiesView from '../views/StrategiesView.vue'
 import SystemStatusView from '../views/SystemStatusView.vue'
 import TradeLogsView from '../views/TradeLogsView.vue'
+import TradeInstructionDetailView from '../views/TradeInstructionDetailView.vue'
 import TradeInstructionsView from '../views/TradeInstructionsView.vue'
 
 const router = createRouter({
@@ -41,6 +42,11 @@ const router = createRouter({
       path: '/trade-instructions',
       name: 'trade-instructions',
       component: TradeInstructionsView,
+    },
+    {
+      path: '/trade-instructions/:tradeId',
+      name: 'trade-instruction-detail',
+      component: TradeInstructionDetailView,
     },
     { path: '/trade-logs', name: 'trade-logs', component: TradeLogsView },
   ],

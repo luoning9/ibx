@@ -34,6 +34,7 @@ export type StrategySummary = {
   upstream_strategy_id: string | null
   capabilities: {
     can_activate: boolean
+    can_stop: boolean
     can_pause: boolean
     can_resume: boolean
     can_cancel: boolean
@@ -43,6 +44,7 @@ export type StrategySummary = {
 
 export type CapabilityReasons = {
   can_activate: string | null
+  can_stop: string | null
   can_pause: string | null
   can_resume: string | null
   can_cancel: string | null
@@ -82,6 +84,7 @@ export type StrategyRunSummary = {
   last_outcome: string
   check_count: number
   last_monitoring_data_end_at: Record<string, Record<string, string>>
+  extrema_state: Record<string, Record<string, Record<string, unknown>>>
   updated_at: string
 }
 

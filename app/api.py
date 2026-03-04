@@ -210,6 +210,11 @@ def pause_strategy(strategy_id: str) -> ControlResponse:
     return store.pause(strategy_id)
 
 
+@router.post("/strategies/{strategy_id}/stop", response_model=ControlResponse)
+def stop_strategy(strategy_id: str) -> ControlResponse:
+    return store.stop(strategy_id)
+
+
 @router.post("/strategies/{strategy_id}/resume", response_model=ControlResponse)
 def resume_strategy(strategy_id: str) -> ControlResponse:
     result = store.resume(strategy_id)

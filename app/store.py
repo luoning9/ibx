@@ -64,7 +64,6 @@ CANCEL_OTHER_OPEN_ORDER_WAIT_TIMEOUT_SECONDS = 5.0
 EDITABLE_STATUSES: set[str] = {"PENDING_ACTIVATION", "PAUSED", "VERIFY_FAILED"}
 STOCK_TRADE_TYPES: set[str] = {"buy", "sell", "switch"}
 ACTIVE_STRATEGIES_SOURCE = "v_strategies_active"
-RUNTIME_KEY_PAUSED_FROM_STATUS = "paused_from_status"
 STRATEGY_LOCKED_ERROR_CODE = "STRATEGY_LOCKED"
 _LOGGER = logging.getLogger("ibx.store")
 NEXT_STRATEGY_ACTIVATION_MODES: set[str] = {
@@ -330,7 +329,11 @@ def _capabilities(
         can_activate = False
         activate_reason = "后续动作未配置"
 
-    can_pause = status in {"ACTIVE", "VERIFYING"}
+    can_stop, stop_reason = _stop_capability(
+        status=status,
+        has_active_trade_instruction=has_active_trade_instruction,
+    )
+    can_pause = status == "ACTIVE"
     can_resume = status == "PAUSED"
     can_cancel, cancel_reason = _cancel_capability(status=status)
     can_delete, delete_reason = _delete_capability(
@@ -341,6 +344,7 @@ def _capabilities(
 
     caps = Capabilities(
         can_activate=can_activate,
+        can_stop=can_stop,
         can_pause=can_pause,
         can_resume=can_resume,
         can_cancel=can_cancel,
@@ -348,7 +352,8 @@ def _capabilities(
     )
     reasons = CapabilityReasons(
         can_activate=activate_reason,
-        can_pause=None if can_pause else "仅 ACTIVE / VERIFYING 可暂停",
+        can_stop=stop_reason,
+        can_pause=None if can_pause else "仅 ACTIVE 可暂停",
         can_resume=None if can_resume else "仅 PAUSED 可恢复",
         can_cancel=cancel_reason,
         can_delete=delete_reason,
@@ -377,6 +382,25 @@ def _cancel_capability(*, status: str) -> tuple[bool, str | None]:
     if status in TERMINAL_STATUSES:
         return False, "终态策略不可取消"
     return True, None
+
+
+def _stop_capability(
+    *,
+    status: str,
+    has_active_trade_instruction: bool,
+) -> tuple[bool, str | None]:
+    normalized = str(status or "").strip().upper()
+    if normalized == "PENDING_ACTIVATION":
+        return False, "已是待激活状态"
+    if normalized == "ORDER_SUBMITTED":
+        return False, "ORDER_SUBMITTED 状态不可停止"
+    if normalized in TERMINAL_STATUSES or normalized == "CANCELLED":
+        return False, "终态策略不可停止"
+    if has_active_trade_instruction:
+        return False, "交易未终止，不可停止"
+    if normalized in {"ACTIVE", "PAUSED", "VERIFYING", "VERIFY_FAILED", "TRIGGERED"}:
+        return True, None
+    return False, f"{normalized or status} 状态不可停止"
 
 
 def _trigger_group_status(status: str, has_conditions: bool) -> TriggerGroupStatus:
@@ -706,6 +730,7 @@ class SQLiteStore:
                 last_outcome,
                 check_count,
                 last_monitoring_data_end_at,
+                extrema_state_json,
                 updated_at
             FROM strategy_runs
             WHERE strategy_id = ?
@@ -726,6 +751,16 @@ class SQLiteStore:
             except json.JSONDecodeError:
                 monitoring_end_map = {}
 
+        raw_extrema_state = row["extrema_state_json"]
+        extrema_state_map: dict[str, dict[str, dict[str, Any]]] = {}
+        if isinstance(raw_extrema_state, str) and raw_extrema_state.strip():
+            try:
+                payload = json.loads(raw_extrema_state)
+                if isinstance(payload, dict):
+                    extrema_state_map = payload
+            except json.JSONDecodeError:
+                extrema_state_map = {}
+
         return StrategyRunSummaryOut(
             first_evaluated_at=parse_iso(row["first_evaluated_at"]) or utcnow(),
             evaluated_at=parse_iso(row["evaluated_at"]) or utcnow(),
@@ -735,6 +770,7 @@ class SQLiteStore:
             last_outcome=row["last_outcome"],
             check_count=int(row["check_count"]),
             last_monitoring_data_end_at=monitoring_end_map,
+            extrema_state=extrema_state_map,
             updated_at=parse_iso(row["updated_at"]) or utcnow(),
         )
 
@@ -834,51 +870,6 @@ class SQLiteStore:
             VALUES (?, ?, ?, ?)
             """,
             (strategy_id, to_iso(ts or utcnow()), event_type, detail),
-        )
-
-    def _get_runtime_state(self, conn: sqlite3.Connection, strategy_id: str, state_key: str) -> str | None:
-        row = conn.execute(
-            """
-            SELECT state_value
-            FROM strategy_runtime_states
-            WHERE strategy_id = ? AND state_key = ?
-            """,
-            (strategy_id, state_key),
-        ).fetchone()
-        if row is None:
-            return None
-        state_value = row["state_value"]
-        if state_value is None:
-            return None
-        normalized = str(state_value).strip()
-        return normalized or None
-
-    def _set_runtime_state(
-        self,
-        conn: sqlite3.Connection,
-        strategy_id: str,
-        state_key: str,
-        state_value: str,
-        now: datetime,
-    ) -> None:
-        conn.execute(
-            """
-            INSERT INTO strategy_runtime_states (strategy_id, state_key, state_value, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(strategy_id, state_key) DO UPDATE SET
-                state_value = excluded.state_value,
-                updated_at = excluded.updated_at
-            """,
-            (strategy_id, state_key, state_value, to_iso(now)),
-        )
-
-    def _delete_runtime_state(self, conn: sqlite3.Connection, strategy_id: str, state_key: str) -> None:
-        conn.execute(
-            """
-            DELETE FROM strategy_runtime_states
-            WHERE strategy_id = ? AND state_key = ?
-            """,
-            (strategy_id, state_key),
         )
 
     def _reset_to_pending_after_config_change(
@@ -1498,30 +1489,54 @@ class SQLiteStore:
         with self._lock, self._conn() as conn:
             row = self._get_strategy_row(conn, strategy_id)
             _raise_if_strategy_locked(row=row, now=utcnow(), action="pause")
-            source_status = str(row["status"])
-            if source_status not in {"ACTIVE", "VERIFYING"}:
-                raise HTTPException(status_code=409, detail="only ACTIVE/VERIFYING can pause")
+            if row["status"] != "ACTIVE":
+                raise HTTPException(status_code=409, detail="only ACTIVE can pause")
             now = utcnow()
             conn.execute(
                 "UPDATE strategies SET status = 'PAUSED', updated_at = ?, version = version + 1 WHERE id = ?",
                 (to_iso(now), strategy_id),
             )
-            self._set_runtime_state(
-                conn,
-                strategy_id,
-                RUNTIME_KEY_PAUSED_FROM_STATUS,
-                source_status,
-                now,
-            )
-            detail = "策略已暂停"
-            if source_status != "ACTIVE":
-                detail = f"策略已暂停（来源状态：{source_status}）"
-            self._append_event(conn, strategy_id, "PAUSED", detail, now)
+            self._append_event(conn, strategy_id, "PAUSED", "策略已暂停", now)
             conn.commit()
             return ControlResponse(
                 strategy_id=strategy_id,
                 status="PAUSED",
                 message="paused",
+                updated_at=now,
+            )
+
+    def stop(self, strategy_id: str) -> ControlResponse:
+        with self._lock, self._conn() as conn:
+            row = self._get_strategy_row(conn, strategy_id)
+            _raise_if_strategy_locked(row=row, now=utcnow(), action="stop")
+            has_active_trade_instruction = self._has_active_trade_instruction(conn, strategy_id)
+            can_stop, stop_reason = _stop_capability(
+                status=str(row["status"] or ""),
+                has_active_trade_instruction=has_active_trade_instruction,
+            )
+            if not can_stop:
+                raise HTTPException(status_code=409, detail=stop_reason or "strategy cannot stop")
+            now = utcnow()
+            now_iso = to_iso(now)
+            conn.execute(
+                """
+                UPDATE strategies
+                SET status = 'PENDING_ACTIVATION',
+                    activated_at = NULL,
+                    logical_activated_at = NULL,
+                    expire_at = CASE WHEN expire_mode = 'relative' THEN NULL ELSE expire_at END,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE id = ?
+                """,
+                (now_iso, strategy_id),
+            )
+            self._append_event(conn, strategy_id, "STOPPED", "策略已停止并重置为待激活", now)
+            conn.commit()
+            return ControlResponse(
+                strategy_id=strategy_id,
+                status="PENDING_ACTIVATION",
+                message="stopped",
                 updated_at=now,
             )
 
@@ -1531,26 +1546,16 @@ class SQLiteStore:
             _raise_if_strategy_locked(row=row, now=utcnow(), action="resume")
             if row["status"] != "PAUSED":
                 raise HTTPException(status_code=409, detail="only PAUSED can resume")
-            source_status = self._get_runtime_state(
-                conn,
-                strategy_id,
-                RUNTIME_KEY_PAUSED_FROM_STATUS,
-            )
-            target_status: StrategyStatus = "VERIFYING" if source_status == "VERIFYING" else "ACTIVE"
             now = utcnow()
             conn.execute(
                 "UPDATE strategies SET status = ?, updated_at = ?, version = version + 1 WHERE id = ?",
-                (target_status, to_iso(now), strategy_id),
+                ("ACTIVE", to_iso(now), strategy_id),
             )
-            self._delete_runtime_state(conn, strategy_id, RUNTIME_KEY_PAUSED_FROM_STATUS)
-            detail = "策略已恢复"
-            if target_status == "VERIFYING":
-                detail = "策略已恢复到校验中"
-            self._append_event(conn, strategy_id, "RESUMED", detail, now)
+            self._append_event(conn, strategy_id, "RESUMED", "策略已恢复", now)
             conn.commit()
             return ControlResponse(
                 strategy_id=strategy_id,
-                status=target_status,
+                status="ACTIVE",
                 message="resumed",
                 updated_at=now,
             )

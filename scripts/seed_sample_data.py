@@ -423,7 +423,6 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
             # Reset all runtime rows first, then insert a clean sample dataset.
             cur.execute("DELETE FROM condition_states")
             cur.execute("DELETE FROM strategy_runs")
-            cur.execute("DELETE FROM strategy_runtime_states")
             cur.execute("DELETE FROM trade_logs")
             cur.execute("DELETE FROM trade_instructions")
             cur.execute("DELETE FROM orders")
@@ -441,9 +440,6 @@ def seed(db_path: str | None = None, *, clean_all: bool = True) -> None:
             )
             cur.execute(
                 "DELETE FROM strategy_runs WHERE strategy_id LIKE 'S-MP-%'"
-            )
-            cur.execute(
-                "DELETE FROM strategy_runtime_states WHERE strategy_id LIKE 'S-MP-%'"
             )
             cur.execute(
                 "DELETE FROM orders WHERE strategy_id LIKE 'S-MP-%' OR id LIKE 'T-SMP-%'"
