@@ -870,7 +870,7 @@ def test_process_once_active_uses_market_data_provider_and_triggers(tmp_path) ->
 
             state_row = conn.execute(
                 """
-                SELECT state, last_value
+                SELECT state, last_value, observed_bar_at
                 FROM condition_states
                 WHERE strategy_id = ? AND condition_id = ?
                 """,
@@ -879,6 +879,7 @@ def test_process_once_active_uses_market_data_provider_and_triggers(tmp_path) ->
             assert state_row is not None
             assert state_row["state"] == "TRUE"
             assert state_row["last_value"] is not None
+            assert state_row["observed_bar_at"] is not None
 
             strategy_row = conn.execute(
                 "SELECT status FROM strategies WHERE id = ?",
@@ -902,6 +903,387 @@ def test_process_once_active_uses_market_data_provider_and_triggers(tmp_path) ->
             os.environ.pop("IBX_DB_PATH", None)
         else:
             os.environ["IBX_DB_PATH"] = old_db_path
+
+
+def test_level_instant_true_uses_trigger_extreme_and_bar_start(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_level_instant_trigger_point.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-INSTANT-LEVEL",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-INSTANT-LEVEL",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [101.5, 100.2]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once("S-WORKER-MD-INSTANT-LEVEL", reason="unit_test")
+        assert len(provider.requests) > 0
+        req_end = provider.requests[-1].end_time.astimezone(UTC)
+        expected_trigger_bar_start = (req_end - timedelta(minutes=2)).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+
+        with get_connection() as conn:
+            state_row = conn.execute(
+                """
+                SELECT state, last_value, observed_bar_at
+                FROM condition_states
+                WHERE strategy_id = ? AND condition_id = ?
+                """,
+                ("S-WORKER-MD-INSTANT-LEVEL", "c1"),
+            ).fetchone()
+            assert state_row is not None
+            assert state_row["state"] == "TRUE"
+            assert float(state_row["last_value"]) == 101.5
+            assert state_row["observed_bar_at"] == expected_trigger_bar_start
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
+
+
+def test_cross_up_instant_true_uses_trigger_bar_start(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_cross_up_instant_trigger_point.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-INSTANT-CROSS-UP",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "CROSS_UP_INSTANT",
+                    "evaluation_window": "1m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 100.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-INSTANT-CROSS-UP",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [99.0, 101.0, 100.4]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once("S-WORKER-MD-INSTANT-CROSS-UP", reason="unit_test")
+        assert len(provider.requests) > 0
+        req_end = provider.requests[-1].end_time.astimezone(UTC)
+        # 3 bars: [end-3m, end-2m, end-1m], cross_up happens at second bar.
+        expected_trigger_bar_start = (req_end - timedelta(minutes=2)).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+
+        with get_connection() as conn:
+            state_row = conn.execute(
+                """
+                SELECT state, last_value, observed_bar_at
+                FROM condition_states
+                WHERE strategy_id = ? AND condition_id = ?
+                """,
+                ("S-WORKER-MD-INSTANT-CROSS-UP", "c1"),
+            ).fetchone()
+            assert state_row is not None
+            assert state_row["state"] == "TRUE"
+            assert float(state_row["last_value"]) == 101.0
+            assert state_row["observed_bar_at"] == expected_trigger_bar_start
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
+
+
+def test_level_confirm_true_uses_trigger_extreme_and_bar_start(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_level_confirm_trigger_point.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-CONFIRM-LEVEL",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "LEVEL_CONFIRM",
+                    "evaluation_window": "5m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 10.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-CONFIRM-LEVEL",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [9.5, 10.0, 10.4, 10.2, 10.1]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once("S-WORKER-MD-CONFIRM-LEVEL", reason="unit_test")
+        assert len(provider.requests) > 0
+        req_end = provider.requests[-1].end_time.astimezone(UTC)
+        expected_trigger_bar_start = (req_end - timedelta(minutes=3)).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+
+        with get_connection() as conn:
+            state_row = conn.execute(
+                """
+                SELECT state, last_value, observed_bar_at
+                FROM condition_states
+                WHERE strategy_id = ? AND condition_id = ?
+                """,
+                ("S-WORKER-MD-CONFIRM-LEVEL", "c1"),
+            ).fetchone()
+            assert state_row is not None
+            assert state_row["state"] == "TRUE"
+            assert float(state_row["last_value"]) == 10.4
+            assert state_row["observed_bar_at"] == expected_trigger_bar_start
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
+
+
+def test_cross_up_confirm_true_uses_trigger_bar_start(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_cross_up_confirm_trigger_point.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-CONFIRM-CROSS-UP",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "CROSS_UP_CONFIRM",
+                    "evaluation_window": "5m",
+                    "window_price_basis": "CLOSE",
+                    "operator": ">=",
+                    "value": 10.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-CONFIRM-CROSS-UP",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [9.0, 10.0, 10.2, 10.3, 10.4]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once("S-WORKER-MD-CONFIRM-CROSS-UP", reason="unit_test")
+        assert len(provider.requests) > 0
+        req_end = provider.requests[-1].end_time.astimezone(UTC)
+        expected_trigger_bar_start = (req_end - timedelta(minutes=4)).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+
+        with get_connection() as conn:
+            state_row = conn.execute(
+                """
+                SELECT state, last_value, observed_bar_at
+                FROM condition_states
+                WHERE strategy_id = ? AND condition_id = ?
+                """,
+                ("S-WORKER-MD-CONFIRM-CROSS-UP", "c1"),
+            ).fetchone()
+            assert state_row is not None
+            assert state_row["state"] == "TRUE"
+            assert float(state_row["last_value"]) == 10.0
+            assert state_row["observed_bar_at"] == expected_trigger_bar_start
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
+
+
+def test_cross_down_confirm_true_uses_trigger_bar_start(tmp_path) -> None:
+    db_path = tmp_path / "ibx_worker_cross_down_confirm_trigger_point.sqlite3"
+    init_db(db_path=db_path)
+    _insert_strategy(
+        "S-WORKER-MD-CONFIRM-CROSS-DOWN",
+        db_path=db_path,
+        status="ACTIVE",
+        conditions_json=json.dumps(
+            [
+                {
+                    "condition_id": "c1",
+                    "condition_type": "SINGLE_PRODUCT",
+                    "metric": "PRICE",
+                    "trigger_mode": "CROSS_DOWN_CONFIRM",
+                    "evaluation_window": "5m",
+                    "window_price_basis": "CLOSE",
+                    "operator": "<=",
+                    "value": 10.0,
+                    "product": "AAPL",
+                    "contract_id": 1,
+                }
+            ]
+        ),
+    )
+    _insert_symbol(
+        "S-WORKER-MD-CONFIRM-CROSS-DOWN",
+        db_path=db_path,
+        position=1,
+        code="AAPL",
+        contract_id=1,
+    )
+
+    provider = _FakeMarketDataProvider(closes_by_symbol={"AAPL": [11.0, 10.0, 9.8, 9.7, 9.6]})
+    engine = StrategyExecutionEngine(
+        enabled=False,
+        monitor_interval_seconds=60,
+        worker_count=1,
+        market_data_provider=provider,
+    )
+
+    old_db_path = os.getenv("IBX_DB_PATH")
+    old_gateway_ready = os.getenv("IBX_GATEWAY_READY")
+    os.environ["IBX_DB_PATH"] = str(db_path)
+    os.environ["IBX_GATEWAY_READY"] = "1"
+    try:
+        engine.process_once("S-WORKER-MD-CONFIRM-CROSS-DOWN", reason="unit_test")
+        assert len(provider.requests) > 0
+        req_end = provider.requests[-1].end_time.astimezone(UTC)
+        expected_trigger_bar_start = (req_end - timedelta(minutes=4)).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+
+        with get_connection() as conn:
+            state_row = conn.execute(
+                """
+                SELECT state, last_value, observed_bar_at
+                FROM condition_states
+                WHERE strategy_id = ? AND condition_id = ?
+                """,
+                ("S-WORKER-MD-CONFIRM-CROSS-DOWN", "c1"),
+            ).fetchone()
+            assert state_row is not None
+            assert state_row["state"] == "TRUE"
+            assert float(state_row["last_value"]) == 10.0
+            assert state_row["observed_bar_at"] == expected_trigger_bar_start
+    finally:
+        if old_db_path is None:
+            os.environ.pop("IBX_DB_PATH", None)
+        else:
+            os.environ["IBX_DB_PATH"] = old_db_path
+        if old_gateway_ready is None:
+            os.environ.pop("IBX_GATEWAY_READY", None)
+        else:
+            os.environ["IBX_GATEWAY_READY"] = old_gateway_ready
 
 
 def test_market_data_requirement_uses_per_key_last_monitoring_end_as_start_time(tmp_path) -> None:

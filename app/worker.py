@@ -254,6 +254,165 @@ def _bar_value_for_metric(metric: str, *, basis: str, bar: HistoricalBar) -> flo
     return _bar_price_value(bar, basis)
 
 
+def _metric_observed_value_for_worker(
+    *,
+    metric: str,
+    contract_values: dict[int, float],
+    first_contract_id: int,
+    second_contract_id: int | None,
+) -> float | None:
+    metric_key = metric.strip().upper()
+    primary = contract_values.get(first_contract_id)
+    if primary is None:
+        return None
+    if metric_key == "PRICE":
+        return primary
+    if metric_key in {"DRAWDOWN_PCT", "RALLY_PCT"}:
+        # Worker market-data path currently does not provide state_values extrema.
+        return None
+    if second_contract_id is None:
+        return None
+    secondary = contract_values.get(second_contract_id)
+    if secondary is None:
+        return None
+    if metric_key == "SPREAD":
+        return primary - secondary
+    if metric_key in {"VOLUME_RATIO", "AMOUNT_RATIO"}:
+        if secondary <= 0:
+            return None
+        return primary / secondary
+    return None
+
+
+def _select_trigger_point(
+    *,
+    metric: str,
+    operator: str,
+    trigger_mode: str,
+    threshold: float | None,
+    effective_window_points: int,
+    basis: str,
+    require_time_alignment: bool,
+    primary_contract_id: int,
+    secondary_contract_id: int | None,
+    bars_by_contract: dict[int, list[HistoricalBar]],
+) -> tuple[float | None, datetime | None]:
+    mode = trigger_mode.strip().upper()
+    supported_modes = {
+        "LEVEL_INSTANT",
+        "LEVEL_CONFIRM",
+        "CROSS_UP_INSTANT",
+        "CROSS_UP_CONFIRM",
+        "CROSS_DOWN_INSTANT",
+        "CROSS_DOWN_CONFIRM",
+    }
+    if mode not in supported_modes:
+        return None, None
+    if threshold is None:
+        return None, None
+
+    primary_bars = bars_by_contract.get(primary_contract_id)
+    if not primary_bars:
+        return None, None
+    secondary_bars = (
+        bars_by_contract.get(secondary_contract_id)
+        if secondary_contract_id is not None
+        else None
+    )
+
+    observed_points: list[tuple[float, datetime]] = []
+    if require_time_alignment and secondary_contract_id is not None and secondary_bars:
+        aligned_points = min(len(primary_bars), len(secondary_bars))
+        for idx in range(aligned_points):
+            primary_bar = primary_bars[-aligned_points + idx]
+            secondary_bar = secondary_bars[-aligned_points + idx]
+            primary_value = _bar_value_for_metric(metric, basis=basis, bar=primary_bar)
+            secondary_value = _bar_value_for_metric(metric, basis=basis, bar=secondary_bar)
+            if primary_value is None or secondary_value is None:
+                continue
+            observed_value = _metric_observed_value_for_worker(
+                metric=metric,
+                contract_values={
+                    primary_contract_id: primary_value,
+                    secondary_contract_id: secondary_value,
+                },
+                first_contract_id=primary_contract_id,
+                second_contract_id=secondary_contract_id,
+            )
+            if observed_value is None:
+                continue
+            point_at = max(_to_utc(primary_bar.ts), _to_utc(secondary_bar.ts))
+            observed_points.append((observed_value, point_at))
+    else:
+        aligned_points = len(primary_bars)
+        if secondary_contract_id is not None and secondary_bars:
+            aligned_points = min(aligned_points, len(secondary_bars))
+        for idx in range(aligned_points):
+            primary_bar = primary_bars[-aligned_points + idx]
+            primary_value = _bar_value_for_metric(metric, basis=basis, bar=primary_bar)
+            if primary_value is None:
+                continue
+            contract_values: dict[int, float] = {primary_contract_id: primary_value}
+            sample_times: list[datetime] = [_to_utc(primary_bar.ts)]
+            if secondary_contract_id is not None and secondary_bars is not None:
+                secondary_bar = secondary_bars[-aligned_points + idx]
+                secondary_value = _bar_value_for_metric(metric, basis=basis, bar=secondary_bar)
+                if secondary_value is None:
+                    continue
+                contract_values[secondary_contract_id] = secondary_value
+                sample_times.append(_to_utc(secondary_bar.ts))
+            observed_value = _metric_observed_value_for_worker(
+                metric=metric,
+                contract_values=contract_values,
+                first_contract_id=primary_contract_id,
+                second_contract_id=secondary_contract_id,
+            )
+            if observed_value is None:
+                continue
+            observed_points.append((observed_value, max(sample_times)))
+
+    if not observed_points:
+        return None, None
+
+    if mode.endswith("_CONFIRM"):
+        window_points = max(1, int(effective_window_points))
+        if len(observed_points) > window_points:
+            observed_points = observed_points[-window_points:]
+        if not observed_points:
+            return None, None
+
+    if mode in {"LEVEL_INSTANT", "LEVEL_CONFIRM"}:
+        if operator == ">=":
+            candidates = [item for item in observed_points if item[0] >= threshold]
+            if not candidates:
+                return None, None
+            selected_value, selected_bar_at = max(candidates, key=lambda item: item[0])
+            return selected_value, selected_bar_at
+        if operator == "<=":
+            candidates = [item for item in observed_points if item[0] <= threshold]
+            if not candidates:
+                return None, None
+            selected_value, selected_bar_at = min(candidates, key=lambda item: item[0])
+            return selected_value, selected_bar_at
+        return None, None
+
+    cross_candidates: list[tuple[float, datetime]] = []
+    for prev, curr in zip(observed_points, observed_points[1:]):
+        if mode in {"CROSS_UP_INSTANT", "CROSS_UP_CONFIRM"}:
+            if prev[0] < threshold <= curr[0]:
+                cross_candidates.append(curr)
+        else:
+            if prev[0] > threshold >= curr[0]:
+                cross_candidates.append(curr)
+    if not cross_candidates:
+        return None, None
+    if mode in {"CROSS_UP_INSTANT", "CROSS_UP_CONFIRM"}:
+        selected_value, selected_bar_at = max(cross_candidates, key=lambda item: item[0])
+        return selected_value, selected_bar_at
+    selected_value, selected_bar_at = min(cross_candidates, key=lambda item: item[0])
+    return selected_value, selected_bar_at
+
+
 def _latest_non_partial_bar_end_time(
     bars: list[HistoricalBar],
     *,
@@ -1448,6 +1607,8 @@ class StrategyExecutionEngine:
             condition_summary["status"] = "prepared"
 
             condition_monitoring_end_updates: dict[tuple[str, int], datetime] = {}
+            condition_latest_bar_by_contract: dict[int, datetime] = {}
+            condition_bars_by_contract: dict[int, list[HistoricalBar]] = {}
             condition_has_new_data = False
             condition_contract_ids: list[int] = []
             for contract_index, contract_req in enumerate(prepared.requirement.contracts):
@@ -1540,12 +1701,14 @@ class StrategyExecutionEngine:
                     fetch_cache[cache_key] = bars
 
                 contract_summary["bars"] = len(bars)
+                condition_bars_by_contract[contract_id] = list(bars)
                 latest_non_partial_bar = _latest_non_partial_bar_end_time(
                     bars,
                     bar_delta=bar_delta,
                     now=now,
                 )
                 if latest_non_partial_bar is not None:
+                    condition_latest_bar_by_contract[contract_id] = latest_non_partial_bar
                     contract_summary["last_non_partial_bar_at"] = _to_iso_utc(latest_non_partial_bar)
                     if latest_non_partial_bar > recorded_last_end_at:
                         condition_has_new_data = True
@@ -1644,11 +1807,59 @@ class StrategyExecutionEngine:
                 condition_outcomes.append("TRUE")
             else:
                 condition_outcomes.append("FALSE")
+            condition_last_value = condition_result.observed_value
+            condition_observed_bar_at: datetime | None = None
+            if condition_latest_bar_by_contract:
+                if prepared.requirement.require_time_alignment and len(condition_latest_bar_by_contract) > 1:
+                    condition_observed_bar_at = min(condition_latest_bar_by_contract.values())
+                else:
+                    primary_contract_id = (
+                        prepared.requirement.contracts[0].contract_id
+                        if prepared.requirement.contracts
+                        else None
+                    )
+                    if primary_contract_id is not None:
+                        condition_observed_bar_at = condition_latest_bar_by_contract.get(primary_contract_id)
+                    if condition_observed_bar_at is None:
+                        condition_observed_bar_at = max(condition_latest_bar_by_contract.values())
+            if condition_result.state == "TRUE":
+                primary_contract_id = (
+                    prepared.requirement.contracts[0].contract_id
+                    if prepared.requirement.contracts
+                    else None
+                )
+                secondary_contract_id = (
+                    prepared.requirement.contracts[1].contract_id
+                    if len(prepared.requirement.contracts) > 1
+                    else None
+                )
+                if primary_contract_id is not None:
+                    trigger_value, trigger_bar_at = _select_trigger_point(
+                        metric=prepared.metric,
+                        operator=prepared.operator,
+                        trigger_mode=prepared.trigger_mode,
+                        threshold=prepared.threshold,
+                        effective_window_points=(
+                            prepared.requirement.contracts[0].effective_window_points
+                            if prepared.requirement.contracts
+                            else 1
+                        ),
+                        basis=basis,
+                        require_time_alignment=prepared.requirement.require_time_alignment,
+                        primary_contract_id=primary_contract_id,
+                        secondary_contract_id=secondary_contract_id,
+                        bars_by_contract=condition_bars_by_contract,
+                    )
+                    if trigger_value is not None:
+                        condition_last_value = trigger_value
+                    if trigger_bar_at is not None:
+                        condition_observed_bar_at = trigger_bar_at
             condition_states.append(
                 ConditionEvaluationState(
                     condition_id=prepared.condition_id,
                     state=condition_result.state,
-                    last_value=condition_result.observed_value,
+                    last_value=condition_last_value,
+                    observed_bar_at=condition_observed_bar_at,
                     last_evaluated_at=now,
                 )
             )

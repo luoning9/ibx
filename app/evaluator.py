@@ -47,6 +47,7 @@ class ConditionEvaluationState:
     condition_id: str
     state: str
     last_value: float | None = None
+    observed_bar_at: datetime | None = None
     last_evaluated_at: datetime | None = None
 
 
@@ -86,6 +87,8 @@ class PreparedCondition:
     evaluation_window: str
     operator: str
     threshold: float | None
+    confirm_consecutive: int
+    confirm_ratio: float
     requirement: ConditionDataRequirement
 
 
@@ -274,6 +277,67 @@ def _evaluate_condition(operator: str, threshold: float | None, observed_value: 
     if operator == "<=":
         return observed_value <= threshold
     return False
+
+
+def _max_true_streak(values: list[bool]) -> int:
+    streak = 0
+    max_streak = 0
+    for value in values:
+        if value:
+            streak += 1
+            if streak > max_streak:
+                max_streak = streak
+        else:
+            streak = 0
+    return max_streak
+
+
+def _window_series(observed_series: list[float], effective_window_points: int) -> list[float]:
+    points = max(1, int(effective_window_points))
+    if len(observed_series) <= points:
+        return list(observed_series)
+    return observed_series[-points:]
+
+
+def _passes_window_confirmation(
+    *,
+    observed_series: list[float],
+    operator: str,
+    threshold: float | None,
+    effective_window_points: int,
+    confirm_consecutive: int,
+    confirm_ratio: float,
+) -> bool:
+    if threshold is None:
+        return False
+    window_values = _window_series(observed_series, effective_window_points)
+    if not window_values:
+        return False
+    matched = [_evaluate_condition(operator, threshold, sample) for sample in window_values]
+    matched_count = sum(1 for item in matched if item)
+    ratio = matched_count / float(max(1, int(effective_window_points)))
+    return (
+        _max_true_streak(matched) >= max(1, int(confirm_consecutive))
+        and ratio >= float(confirm_ratio)
+    )
+
+
+def _has_cross_in_window(
+    *,
+    observed_series: list[float],
+    threshold: float | None,
+    trigger_mode: str,
+    effective_window_points: int,
+) -> bool:
+    if threshold is None:
+        return False
+    window_values = _window_series(observed_series, effective_window_points)
+    if len(window_values) < 2:
+        return False
+    mode = trigger_mode.strip().upper()
+    if mode.startswith("CROSS_UP"):
+        return any(prev < threshold <= curr for prev, curr in zip(window_values, window_values[1:]))
+    return any(prev > threshold >= curr for prev, curr in zip(window_values, window_values[1:]))
 
 
 def _resolve_condition_id(condition: dict[str, Any]) -> str:
@@ -614,6 +678,8 @@ def _prepare_condition(condition: dict[str, Any]) -> PreparedCondition:
         evaluation_window=policy.evaluation_window,
         operator=operator,
         threshold=threshold,
+        confirm_consecutive=policy.confirm_consecutive,
+        confirm_ratio=policy.confirm_ratio,
         requirement=requirement,
     )
 
@@ -713,7 +779,27 @@ class ConditionEvaluator:
         observed_value = observed_series[-1]
 
         mode = self.prepared.trigger_mode
-        if mode.startswith("CROSS_"):
+        effective_window_points = requirement.contracts[0].effective_window_points
+        if mode in {"LEVEL_CONFIRM", "CROSS_UP_CONFIRM", "CROSS_DOWN_CONFIRM"}:
+            window_confirmed = _passes_window_confirmation(
+                observed_series=observed_series,
+                operator=self.prepared.operator,
+                threshold=self.prepared.threshold,
+                effective_window_points=effective_window_points,
+                confirm_consecutive=self.prepared.confirm_consecutive,
+                confirm_ratio=self.prepared.confirm_ratio,
+            )
+            if mode.startswith("CROSS_"):
+                cross_happened = _has_cross_in_window(
+                    observed_series=observed_series,
+                    threshold=self.prepared.threshold,
+                    trigger_mode=mode,
+                    effective_window_points=effective_window_points,
+                )
+                passed = window_confirmed and cross_happened
+            else:
+                passed = window_confirmed
+        elif mode.startswith("CROSS_"):
             if len(observed_series) < 2 or self.prepared.threshold is None:
                 return ConditionEvaluationResult(
                     state="WAITING",
@@ -1109,6 +1195,11 @@ def persist_evaluation_result(
         )
 
     for state in result.condition_states:
+        state_observed_bar_at_iso = (
+            _to_iso_utc(_to_utc(state.observed_bar_at))
+            if state.observed_bar_at is not None
+            else None
+        )
         state_last_evaluated_at_iso = (
             _to_iso_utc(_to_utc(state.last_evaluated_at))
             if state.last_evaluated_at is not None
@@ -1117,12 +1208,17 @@ def persist_evaluation_result(
         cursor = conn.execute(
             """
             UPDATE condition_states
-            SET state = ?, last_value = ?, last_evaluated_at = COALESCE(?, last_evaluated_at), updated_at = ?
+            SET state = ?,
+                last_value = ?,
+                observed_bar_at = COALESCE(?, observed_bar_at),
+                last_evaluated_at = COALESCE(?, last_evaluated_at),
+                updated_at = ?
             WHERE strategy_id = ? AND condition_id = ?
             """,
             (
                 state.state,
                 state.last_value,
+                state_observed_bar_at_iso,
                 state_last_evaluated_at_iso,
                 updated_at_iso,
                 strategy_id,
@@ -1134,14 +1230,15 @@ def persist_evaluation_result(
         conn.execute(
             """
             INSERT INTO condition_states (
-                strategy_id, condition_id, state, last_value, last_evaluated_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                strategy_id, condition_id, state, last_value, observed_bar_at, last_evaluated_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 strategy_id,
                 state.condition_id,
                 state.state,
                 state.last_value,
+                state_observed_bar_at_iso,
                 state_last_evaluated_at_iso,
                 updated_at_iso,
             ),

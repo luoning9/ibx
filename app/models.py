@@ -225,6 +225,7 @@ class ConditionRuntimeItem(BaseModel):
     condition_id: str
     state: ConditionState
     last_value: float | None = None
+    observed_bar_at: datetime | None = None
     last_evaluated_at: datetime | None = None
 
 

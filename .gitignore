@@ -212,3 +212,7 @@ data/*
 !data/logs/
 data/logs/*
 !data/logs/.gitkeep
+
+# Gateway local runtime/config data (must not be versioned)
+gateway/config/
+gateway/data/

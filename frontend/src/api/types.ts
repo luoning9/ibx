@@ -56,6 +56,7 @@ export type ConditionRuntimeItem = {
   condition_id: string
   state: ConditionState
   last_value: number | null
+  observed_bar_at: string | null
   last_evaluated_at: string | null
 }
 

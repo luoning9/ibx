@@ -238,6 +238,9 @@ const conditionViewItems = computed<ConditionViewItem[]>(() => {
     if (triggerMode) meta.push(triggerMode)
     if (evalWindow) meta.push(`window: ${evalWindow}`)
     if (priceBasis) meta.push(`price_basis: ${priceBasis}`)
+    if (runtime?.last_value != null) meta.push(`observed_value: ${runtime.last_value}`)
+    if (runtime?.observed_bar_at) meta.push(`observed_bar_at: ${formatIsoDateTime(runtime.observed_bar_at)}`)
+    if (runtime?.last_evaluated_at) meta.push(`last_evaluated_at: ${formatIsoDateTime(runtime.last_evaluated_at)}`)
 
     return {
       id,
@@ -722,6 +725,9 @@ onBeforeUnmount(() => {
           <details class="conditions-raw-details">
             <summary>查看原始条件 JSON</summary>
             <pre class="json-box raw-json-box">{{ pretty(detail?.conditions_json ?? []) }}</pre>
+          </details>
+          <details class="conditions-raw-details">
+            <summary>查看条件运行时 JSON（含 observed_bar_at）</summary>
             <pre class="json-box raw-json-box runtime-box">{{ pretty(detail?.conditions_runtime ?? []) }}</pre>
           </details>
         </template>

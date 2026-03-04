@@ -548,7 +548,7 @@ class SQLiteStore:
     ) -> list[ConditionRuntimeItem]:
         rows = conn.execute(
             """
-            SELECT condition_id, state, last_value, last_evaluated_at
+            SELECT condition_id, state, last_value, observed_bar_at, last_evaluated_at
             FROM condition_states
             WHERE strategy_id = ?
             """,
@@ -565,6 +565,7 @@ class SQLiteStore:
                         condition_id=cid,
                         state=hit["state"],
                         last_value=hit["last_value"],
+                        observed_bar_at=parse_iso(hit["observed_bar_at"]),
                         last_evaluated_at=parse_iso(hit["last_evaluated_at"]),
                     )
                 )

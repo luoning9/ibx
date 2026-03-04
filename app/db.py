@@ -193,6 +193,7 @@ def _rebuild_strategies_without_upstream_fk(conn: sqlite3.Connection) -> None:
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     strategy_columns = _table_columns(conn, "strategies")
     strategy_symbol_columns = _table_columns(conn, "strategy_symbols")
+    condition_state_columns = _table_columns(conn, "condition_states")
     order_columns = _table_columns(conn, "orders")
     if "market" not in strategy_columns:
         conn.execute(
@@ -324,6 +325,22 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             """
             ALTER TABLE strategy_symbols
             ADD COLUMN contract_id INTEGER
+            """
+        )
+    if "observed_bar_at" not in condition_state_columns:
+        conn.execute(
+            """
+            ALTER TABLE condition_states
+            ADD COLUMN observed_bar_at TEXT
+            """
+        )
+        condition_state_columns = _table_columns(conn, "condition_states")
+    if "last_bar_at" in condition_state_columns and "observed_bar_at" in condition_state_columns:
+        conn.execute(
+            """
+            UPDATE condition_states
+            SET observed_bar_at = COALESCE(observed_bar_at, last_bar_at)
+            WHERE last_bar_at IS NOT NULL
             """
         )
     if "trade_id" not in order_columns:

@@ -268,6 +268,175 @@ def test_condition_evaluator_cross_up_instant_uses_all_adjacent_points() -> None
     assert failed.state == "FALSE"
 
 
+def test_condition_evaluator_level_confirm_requires_consecutive_and_ratio() -> None:
+    evaluator = ConditionEvaluator(
+        {
+            "condition_id": "c1",
+            "condition_type": "SINGLE_PRODUCT",
+            "metric": "PRICE",
+            "trigger_mode": "LEVEL_CONFIRM",
+            "evaluation_window": "5m",
+            "operator": ">=",
+            "value": 10,
+            "product": "AAPL",
+            "contract_id": 265598,
+        }
+    )
+    evaluator.prepare()
+
+    prepared = evaluator.prepared
+    assert prepared is not None
+    contract_id = prepared.requirement.contracts[0].contract_id
+    assert contract_id is not None
+
+    # ratio met (4/5) but consecutive(4) not met.
+    no_consecutive = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [10.0, 9.0, 10.0, 10.0, 10.0]},
+            state_values={},
+        )
+    )
+    # consecutive met but ratio(0.8) not met.
+    no_ratio = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [10.0, 10.0, 10.0, 9.0, 9.0]},
+            state_values={},
+        )
+    )
+    # both consecutive and ratio are met.
+    passed = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [9.0, 10.0, 10.0, 10.0, 10.0]},
+            state_values={},
+        )
+    )
+
+    assert no_consecutive.state == "FALSE"
+    assert no_ratio.state == "FALSE"
+    assert passed.state == "TRUE"
+
+
+def test_condition_evaluator_level_confirm_uses_recent_window_only() -> None:
+    evaluator = ConditionEvaluator(
+        {
+            "condition_id": "c1",
+            "condition_type": "SINGLE_PRODUCT",
+            "metric": "PRICE",
+            "trigger_mode": "LEVEL_CONFIRM",
+            "evaluation_window": "5m",
+            "operator": ">=",
+            "value": 10,
+            "product": "AAPL",
+            "contract_id": 265598,
+        }
+    )
+    evaluator.prepare()
+
+    prepared = evaluator.prepared
+    assert prepared is not None
+    contract_id = prepared.requirement.contracts[0].contract_id
+    assert contract_id is not None
+
+    # Earlier window satisfies, but the latest 5 points do not.
+    result = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [10.0, 10.1, 10.2, 10.3, 10.4, 9.0, 9.1, 9.2, 9.3, 9.4]},
+            state_values={},
+        )
+    )
+    assert result.state == "FALSE"
+
+
+def test_condition_evaluator_cross_up_confirm_requires_confirm_and_cross() -> None:
+    evaluator = ConditionEvaluator(
+        {
+            "condition_id": "c1",
+            "condition_type": "SINGLE_PRODUCT",
+            "metric": "PRICE",
+            "trigger_mode": "CROSS_UP_CONFIRM",
+            "evaluation_window": "5m",
+            "operator": ">=",
+            "value": 10,
+            "product": "AAPL",
+            "contract_id": 265598,
+        }
+    )
+    evaluator.prepare()
+
+    prepared = evaluator.prepared
+    assert prepared is not None
+    contract_id = prepared.requirement.contracts[0].contract_id
+    assert contract_id is not None
+
+    cross_without_confirm = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [9.0, 11.0, 9.0, 11.0, 9.0]},
+            state_values={},
+        )
+    )
+    confirm_without_cross = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [10.2, 10.3, 10.4, 10.5, 10.6]},
+            state_values={},
+        )
+    )
+    passed = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [9.0, 10.0, 10.2, 10.4, 10.6]},
+            state_values={},
+        )
+    )
+
+    assert cross_without_confirm.state == "FALSE"
+    assert confirm_without_cross.state == "FALSE"
+    assert passed.state == "TRUE"
+
+
+def test_condition_evaluator_cross_down_confirm_requires_confirm_and_cross() -> None:
+    evaluator = ConditionEvaluator(
+        {
+            "condition_id": "c1",
+            "condition_type": "SINGLE_PRODUCT",
+            "metric": "PRICE",
+            "trigger_mode": "CROSS_DOWN_CONFIRM",
+            "evaluation_window": "5m",
+            "operator": "<=",
+            "value": 10,
+            "product": "AAPL",
+            "contract_id": 265598,
+        }
+    )
+    evaluator.prepare()
+
+    prepared = evaluator.prepared
+    assert prepared is not None
+    contract_id = prepared.requirement.contracts[0].contract_id
+    assert contract_id is not None
+
+    cross_without_confirm = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [11.0, 9.0, 11.0, 9.0, 11.0]},
+            state_values={},
+        )
+    )
+    confirm_without_cross = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [9.8, 9.7, 9.6, 9.5, 9.4]},
+            state_values={},
+        )
+    )
+    passed = evaluator.evaluate(
+        ConditionEvaluationInput(
+            values_by_contract={contract_id: [11.0, 10.0, 9.8, 9.7, 9.6]},
+            state_values={},
+        )
+    )
+
+    assert cross_without_confirm.state == "FALSE"
+    assert confirm_without_cross.state == "FALSE"
+    assert passed.state == "TRUE"
+
+
 def test_condition_evaluator_metric_specific_requirements() -> None:
     spread_evaluator = ConditionEvaluator(
         {

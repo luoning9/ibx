@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS condition_states (
   state TEXT NOT NULL
     CHECK (state IN ("TRUE", "FALSE", "WAITING", "NOT_EVALUATED")),
   last_value REAL,
+  observed_bar_at TEXT,
   last_evaluated_at TEXT,
   updated_at TEXT NOT NULL,
   UNIQUE (strategy_id, condition_id)
